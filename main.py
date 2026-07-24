@@ -1,0 +1,554 @@
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3
+import os
+import email_service
+import secrets
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import pandas as pd
+import joblib
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+# ==========================================
+# 1. AUTHENTICATION & DATABASE CONFIGURATION
+# ==========================================
+DB_FILE = 'auth.db'
+
+# To add a new super admin in the future, simply append their email to this list.
+SUPER_ADMINS = [
+    'superadmin.main.01@gmail.com'
+]
+# For prototype purposes, Super Admins use this password (now loaded from env).
+SUPER_ADMIN_PASSWORD = os.getenv('SUPER_ADMIN_PASSWORD', 'superadminpass')
+
+def init_db():
+    """Initializes the SQLite database and creates the Users table if it doesn't exist."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT,
+            role TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Initialize DB on startup
+if not os.path.exists(DB_FILE):
+    print("Initializing Auth Database...")
+    init_db()
+else:
+    init_db()
+
+def check_and_add_columns():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(Users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'name' not in columns:
+        cursor.execute("ALTER TABLE Users ADD COLUMN name TEXT")
+    if 'emp_id' not in columns:
+        cursor.execute("ALTER TABLE Users ADD COLUMN emp_id TEXT")
+    if 'reset_token' not in columns:
+        cursor.execute("ALTER TABLE Users ADD COLUMN reset_token TEXT")
+    if 'reset_expiry' not in columns:
+        cursor.execute("ALTER TABLE Users ADD COLUMN reset_expiry DATETIME")
+        
+    conn.commit()
+    conn.close()
+
+check_and_add_columns()
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ==========================================
+# 2. MACHINE LEARNING CONFIGURATION
+# ==========================================
+print("Loading ensemble model artifacts...")
+try:
+    artifacts = joblib.load("ensemble_ai_model.pkl")
+    xgb_model = artifacts['xgboost_model']
+    iso_forest = artifacts['isolation_forest']
+    oc_svm = artifacts['one_class_svm']
+    explainer = artifacts['shap_explainer']
+    encoders = artifacts['encoders']
+    scaler = artifacts['scaler']
+    features = artifacts['features']
+    print("Model artifacts loaded successfully.")
+except Exception as e:
+    print(f"Error loading model artifacts: {e}")
+
+exchange_rates = {
+    'INR': 1.0,
+    'USD': 83.50,
+    'EUR': 90.20,
+    'GBP': 105.00,
+    'SGD': 61.30
+}
+
+
+# ==========================================
+# 3. STATIC FILE ROUTING (FRONTEND)
+# ==========================================
+@app.route('/<path:filename>')
+def serve_static(filename):
+    # Security: Only allow serving specific safe extensions to prevent directory traversal
+    allowed_extensions = {'.html', '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.json'}
+    ext = os.path.splitext(filename)[1].lower()
+    
+    if ext in allowed_extensions and os.path.exists(filename):
+        return send_from_directory('.', filename)
+    return "Not Found or Access Denied", 404
+
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+
+# ==========================================
+# 4. MACHINE LEARNING API ROUTES
+# ==========================================
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    try:
+        data = request.json
+        
+        # Extract inputs
+        role = data.get('Role')
+        department = data.get('Department')
+        req_type = data.get('Request_Type')
+        destination = data.get('Destination')
+        amount = data.get('Amount')
+        currency = data.get('Currency')
+
+        # Normalize Amount to INR
+        rate = exchange_rates.get(currency, 1.0)
+        normalized_inr = amount * rate
+
+        # Prepare DataFrame for preprocessing
+        input_data = pd.DataFrame({
+            'Role': [role],
+            'Department': [department],
+            'Request_Type': [req_type],
+            'Destination': [destination],
+            'Amount_INR': [normalized_inr]
+        })
+
+        is_unknown_category = False
+
+        # Map categorical text fields with OOV fallback
+        for col in ['Role', 'Department', 'Request_Type', 'Destination']:
+            if input_data[col].iloc[0] in encoders[col].classes_:
+                input_data[col] = encoders[col].transform(input_data[col])
+            else:
+                is_unknown_category = True
+                input_data[col] = 0  # Safe fallback to 0
+
+        # Scale the normalized amount
+        input_data['Amount_INR'] = scaler.transform(input_data[['Amount_INR']])
+
+        # Reorder columns to match feature order used in training
+        X_input = input_data[features]
+
+        # XGBoost Probabilities
+        xgb_prob = float(xgb_model.predict_proba(X_input)[0][1])
+        confidence_pct = round(xgb_prob * 100, 1)
+        
+        # Anomaly Detection
+        iso_pred = int(iso_forest.predict(X_input)[0])
+        svm_pred = int(oc_svm.predict(X_input)[0])
+        is_severe_anomaly = (iso_pred == -1) or (svm_pred == -1)
+        
+        # SHAP Explainability
+        shap_values = explainer.shap_values(X_input)
+        shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
+
+        # Decision Routing Logic (Confidence Based Triage)
+        if is_unknown_category:
+            status = "ESCALATED_UNKNOWN"
+            message = "Unrecognized category detected (Out-Of-Vocabulary). Manual review required."
+        elif is_severe_anomaly:
+            status = "ESCALATED_ANOMALY"
+            message = "Unusual data distribution detected by Anomaly Detectors. Flagged as anomaly."
+        elif xgb_prob > 0.8:
+            status = "APPROVED"
+            message = "Auto-Approved based on high confidence."
+        elif xgb_prob < 0.2:
+            status = "ESCALATED_POLICY"  
+            message = "Auto-Rejected based on low confidence. Manual review / policy enforcement required."
+        else:
+            status = "ESCALATED_MANUAL_REVIEW"
+            message = "Marginal confidence score. Sent to HR for manual review (Grey Area)."
+
+        return jsonify({
+            'status': status,
+            'message': message,
+            'confidence': confidence_pct,
+            'normalized_inr': normalized_inr,
+            'shap_explanations': shap_impact
+        })
+
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'ESCALATED_SYSTEM_ERROR',
+            'message': 'An internal system error occurred during AI processing.'
+        }), 500
+
+
+# ==========================================
+# 5. AUTHENTICATION API ROUTES
+# ==========================================
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+
+    if email in SUPER_ADMINS:
+        if password == SUPER_ADMIN_PASSWORD:
+            return jsonify({
+                'status': 'SUCCESS',
+                'role': 'SuperAdmin',
+                'message': 'Welcome, Super Admin.',
+                'redirect': 'super_admin.html'
+            })
+        else:
+            return jsonify({'error': 'Invalid Super Admin password'}), 401
+
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM Users WHERE email = ?', (email,)).fetchone()
+    conn.close()
+
+    if not user:
+        return jsonify({'error': 'User not found. Please request access first.'}), 404
+
+    user_status = user['status']
+    
+    if user_status == 'Pending':
+        return jsonify({'status': 'PENDING', 'message': 'Your account is still pending administrator approval.'}), 403
+    elif user_status == 'Rejected':
+        return jsonify({'status': 'REJECTED', 'message': 'Your access request was rejected.'}), 403
+    elif user_status == 'Approved_Awaiting_Password':
+        return jsonify({'status': 'SETUP_REQUIRED', 'message': 'You have been approved! Please set up your password.'}), 200
+    elif user_status == 'Active':
+        if not password:
+            return jsonify({'error': 'Password required.'}), 400
+            
+        if check_password_hash(user['password_hash'], password):
+            redirect_page = 'admin.html' if user['role'] == 'Admin' else 'user.html'
+            return jsonify({
+                'status': 'SUCCESS',
+                'role': user['role'],
+                'message': 'Login successful.',
+                'redirect': redirect_page
+            })
+        else:
+            return jsonify({'error': 'Invalid password'}), 401
+    
+    return jsonify({'error': 'Unknown status'}), 500
+
+
+@app.route('/api/auth/request_access', methods=['POST'])
+def request_access():
+    data = request.json
+    email = data.get('email')
+    role = data.get('role', 'User')
+
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+        
+    if role not in ['User', 'Admin']:
+        return jsonify({'error': 'Invalid role requested.'}), 400
+
+    if email in SUPER_ADMINS:
+        return jsonify({'error': 'This email is reserved for Super Admins.'}), 400
+
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'INSERT INTO Users (email, role, status) VALUES (?, ?, ?)',
+            (email, role, 'Pending')
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Email already exists or is pending.'}), 409
+    finally:
+        conn.close()
+
+    if role == 'Admin':
+        for sa_email in SUPER_ADMINS:
+            email_service.sendAdminRegistrationNotification(sa_email, email)
+    else:
+        conn = get_db_connection()
+        active_admins = conn.execute("SELECT email FROM Users WHERE role = 'Admin' AND status = 'Active'").fetchall()
+        conn.close()
+        
+        admin_emails = [a['email'] for a in active_admins]
+        all_notifiers = list(set(SUPER_ADMINS + admin_emails))
+        
+        for notify_email in all_notifiers:
+            email_service.sendUserRegistrationNotification(notify_email, email, role)
+
+    return jsonify({'status': 'SUCCESS', 'message': 'Access request submitted successfully. Awaiting approval.'})
+
+
+@app.route('/api/auth/setup_password', methods=['POST'])
+def setup_password():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required'}), 400
+
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM Users WHERE email = ?', (email,)).fetchone()
+    
+    if not user:
+        conn.close()
+        return jsonify({'error': 'User not found'}), 404
+        
+    if user['status'] != 'Approved_Awaiting_Password':
+        conn.close()
+        return jsonify({'error': 'User is not authorized to set a password at this time.'}), 403
+
+    hashed_pw = generate_password_hash(password)
+    
+    conn.execute(
+        'UPDATE Users SET password_hash = ?, status = ? WHERE email = ?',
+        (hashed_pw, 'Active', email)
+    )
+    conn.commit()
+    conn.close()
+
+    name = email.split('@')[0]
+    email_service.sendWelcomeEmail(email, name)
+
+    redirect_page = 'admin.html' if user['role'] == 'Admin' else 'user.html'
+    return jsonify({
+        'status': 'SUCCESS', 
+        'message': 'Password set successfully. Account is now active.',
+        'redirect': redirect_page
+    })
+
+@app.route('/api/auth/pending_users', methods=['GET'])
+def get_pending_users():
+    conn = get_db_connection()
+    users = conn.execute('SELECT id, email, role, status, created_at FROM Users WHERE status = "Pending"').fetchall()
+    conn.close()
+    
+    users_list = [dict(u) for u in users]
+    return jsonify(users_list)
+
+@app.route('/api/auth/users', methods=['GET'])
+def get_all_users():
+    conn = get_db_connection()
+    users = conn.execute('SELECT id, email, name, role, status, created_at FROM Users').fetchall()
+    conn.close()
+    
+    users_list = [dict(u) for u in users]
+    return jsonify(users_list)
+
+@app.route('/api/auth/delete_user', methods=['POST'])
+def delete_user():
+    data = request.json
+    email = data.get('email')
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.execute('DELETE FROM Users WHERE email = ?', (email,))
+    conn.commit()
+    conn.close()
+    
+    if cursor.rowcount > 0:
+        return jsonify({'status': 'SUCCESS', 'message': f'User {email} deleted successfully.'})
+    else:
+        return jsonify({'status': 'ERROR', 'message': f'User {email} not found.'}), 404
+
+@app.route('/api/auth/approve_user', methods=['POST'])
+def approve_user():
+    data = request.json
+    email = data.get('email')
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.execute(
+        'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending"',
+        ('Approved_Awaiting_Password', email)
+    )
+    conn.commit()
+    
+    if cursor.rowcount > 0:
+        user = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
+        if user:
+            name = email.split('@')[0]
+            if user['role'] == 'Admin':
+                email_service.sendAdminApprovedEmail(email, name)
+            else:
+                email_service.sendUserApprovedEmail(email, name)
+                
+    conn.close()
+    
+    return jsonify({'status': 'SUCCESS', 'message': f'User {email} approved. Awaiting password setup.'})
+
+@app.route('/api/auth/reject_user', methods=['POST'])
+def reject_user():
+    data = request.json
+    email = data.get('email')
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.execute(
+        'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending"',
+        ('Rejected', email)
+    )
+    conn.commit()
+    
+    if cursor.rowcount > 0:
+        user = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
+        if user:
+            name = email.split('@')[0]
+            if user['role'] == 'Admin':
+                email_service.sendAdminRejectedEmail(email, name)
+            else:
+                email_service.sendUserRejectedEmail(email, name)
+                
+    conn.close()
+    
+    return jsonify({'status': 'SUCCESS', 'message': f'User {email} rejected.'})
+
+@app.route('/api/auth/get_profile', methods=['GET'])
+def get_profile():
+    email = request.args.get('email')
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+        
+    conn = get_db_connection()
+    user = conn.execute('SELECT name, emp_id, role, created_at FROM Users WHERE email = ?', (email,)).fetchone()
+    conn.close()
+    
+    if user:
+        return jsonify(dict(user))
+    return jsonify({'error': 'User not found'}), 404
+
+@app.route('/api/auth/update_profile', methods=['POST'])
+def update_profile():
+    data = request.json
+    email = data.get('email')
+    name = data.get('name')
+    emp_id = data.get('emp_id')
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+        
+    conn = get_db_connection()
+    conn.execute('UPDATE Users SET name = ?, emp_id = ? WHERE email = ?', (name, emp_id, email))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'status': 'SUCCESS', 'message': 'Profile updated successfully.'})
+
+@app.route('/api/auth/request_password_reset', methods=['POST'])
+def request_password_reset():
+    data = request.json
+    email = data.get('email')
+    
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+        
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM Users WHERE email = ?', (email,)).fetchone()
+    
+    if not user:
+        conn.close()
+        return jsonify({'error': 'User not found'}), 404
+        
+    token = secrets.token_urlsafe(32)
+    expiry = (datetime.utcnow() + timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
+    
+    conn.execute('UPDATE Users SET reset_token = ?, reset_expiry = ? WHERE email = ?', (token, expiry, email))
+    conn.commit()
+    conn.close()
+    
+    # Generate dynamic links based on the request host
+    host_url = request.host_url.rstrip('/')
+    reset_link = f"{host_url}/index.html?reset_token={token}"
+    reject_link = f"{host_url}/api/auth/reject_reset?token={token}"
+    
+    email_service.sendPasswordResetEmail(email, reset_link, reject_link)
+    
+    return jsonify({'status': 'SUCCESS', 'message': 'Password reset request generated and email sent.'})
+
+@app.route('/api/auth/reset_password', methods=['POST'])
+def reset_password():
+    data = request.json
+    token = data.get('token')
+    new_password = data.get('password')
+    
+    if not token or not new_password:
+        return jsonify({'error': 'Token and password are required'}), 400
+        
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM Users WHERE reset_token = ?', (token,)).fetchone()
+    
+    if not user:
+        conn.close()
+        return jsonify({'error': 'Invalid or expired token'}), 400
+        
+    # Check expiry
+    expiry_dt = datetime.strptime(user['reset_expiry'], '%Y-%m-%d %H:%M:%S')
+    if datetime.utcnow() > expiry_dt:
+        conn.close()
+        return jsonify({'error': 'Reset token has expired'}), 400
+        
+    hashed_pw = generate_password_hash(new_password, method='pbkdf2:sha256')
+    
+    conn.execute('UPDATE Users SET password_hash = ?, reset_token = NULL, reset_expiry = NULL WHERE id = ?', (hashed_pw, user['id']))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'status': 'SUCCESS', 'message': 'Password has been reset successfully.'})
+
+@app.route('/api/auth/reject_reset', methods=['GET'])
+def reject_reset():
+    token = request.args.get('token')
+    if not token:
+        return "Invalid token", 400
+        
+    conn = get_db_connection()
+    conn.execute('UPDATE Users SET reset_token = NULL, reset_expiry = NULL WHERE reset_token = ?', (token,))
+    conn.commit()
+    conn.close()
+    
+    return "<h3>Password Reset Request Cancelled</h3><p>Your password reset request has been safely invalidated. You can now close this tab.</p>", 200
+
+
+if __name__ == '__main__':
+    print("Starting Unified AAMS Application on Port 5000...")
+    app.run(port=5000, debug=False)

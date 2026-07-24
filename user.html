@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Employee Portal - AI Approval</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  
+  <!-- DataTables Requirements -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/jquery.dataTables.min.css">
+  <link rel="stylesheet" href="https://cdn.datatables.net/buttons/2.4.2/css/buttons.dataTables.min.css">
+  <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.2/js/dataTables.buttons.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.1.53/pdfmake.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.1.53/vfs_fonts.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.html5.min.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.print.min.js"></script>
+
+  <!-- React -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    function EmployeePortal() {
+      const [view, setView] = useState('pending');
+      const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'user@gmail.com'});
+      const [userRequests, setUserRequests] = useState([]);
+
+      const loadData = () => {
+        const saved = JSON.parse(localStorage.getItem('ams_requests') || '[]');
+        // Filter requests to only show ones created by this user (or legacy ones without an email for testing)
+        const myRequests = saved.filter(r => r.email === user.email || !r.email);
+        setUserRequests(myRequests);
+      };
+
+      useEffect(() => {
+        loadData();
+        const interval = setInterval(loadData, 2000);
+        return () => clearInterval(interval);
+      }, []);
+
+      const pendingCount = userRequests.filter(r => r.status === 'Pending').length;
+      const approvedCount = userRequests.filter(r => r.status === 'Approved').length;
+      const rejectedCount = userRequests.filter(r => r.status === 'Rejected').length;
+
+      const handleLogout = () => {
+        Swal.fire({
+          title: 'Confirm Logout',
+          text: "Are you sure you want to log out?",
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonColor: '#0056b3',
+          cancelButtonColor: '#6c757d',
+          confirmButtonText: 'Yes, log me out'
+        }).then((result) => {
+          if (result.isConfirmed) {
+            localStorage.removeItem('ams_user');
+            window.location.href = 'index.html';
+          }
+        });
+      };
+
+      return (
+        <div className="app-container">
+          <div className="sidebar">
+            <div className="sidebar-header">
+              <span style={{color: 'black'}}>ML</span>
+            </div>
+            <div className="sidebar-user">
+              <div className="avatar-circle">
+                {user.email.charAt(0).toUpperCase()}
+              </div>
+              <div className="email">{user.email}</div>
+              <span className="badge" style={{background: 'var(--success)'}}>Employee</span>
+            </div>
+            <div className="nav-label">Navigation</div>
+            <ul className="nav-menu">
+              <li>
+                <button className={view === 'pending' ? 'active' : ''} onClick={() => setView('pending')}>
+                  <i className="fas fa-clock"></i> Pending
+                  <span className="count warning">{pendingCount}</span>
+                </button>
+              </li>
+              <li>
+                <button className={view === 'approved' ? 'active' : ''} onClick={() => setView('approved')}>
+                  <i className="fas fa-check-circle"></i> Approved
+                  <span className="count success">{approvedCount}</span>
+                </button>
+              </li>
+              <li>
+                <button className={view === 'rejected' ? 'active' : ''} onClick={() => setView('rejected')}>
+                  <i className="fas fa-times-circle"></i> Disapproved
+                  <span className="count secondary">{rejectedCount}</span>
+                </button>
+              </li>
+              <li>
+                <button className={view === 'profile' ? 'active' : ''} onClick={() => setView('profile')}>
+                  <i className="fas fa-user-circle"></i> Profile
+                </button>
+              </li>
+            </ul>
+          </div>
+          
+          <div className="main-content">
+            <div className="top-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+              <h2>
+                {view === 'pending' && <><i className="fas fa-clock"></i> Pending Requests</>}
+                {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
+                {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
+                {view === 'new' && <><i className="fas fa-plus-circle"></i> Submit Expense</>}
+                {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
+              </h2>
+              <div style={{display: 'flex', alignItems: 'center', gap: '20px'}}>
+                 <div className="user-welcome">Welcome, {user.email}</div>
+                 {view !== 'new' && (
+                    <button className="btn btn-primary" onClick={() => setView('new')} style={{padding: '8px 15px'}}>
+                      <i className="fas fa-plus"></i> Add New
+                    </button>
+                 )}
+              </div>
+            </div>
+
+            {view === 'new' ? (
+              <NewRequestForm user={user} setView={setView} refresh={loadData} />
+            ) : view === 'profile' ? (
+              <ProfileView user={user} />
+            ) : (
+              <UserTableView 
+                requests={userRequests} 
+                currentStatus={view === 'pending' ? 'Pending' : view === 'approved' ? 'Approved' : 'Rejected'} 
+                pendingCount={pendingCount}
+                approvedCount={approvedCount}
+                rejectedCount={rejectedCount}
+              />
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function UserTableView({ requests, currentStatus, pendingCount, approvedCount, rejectedCount }) {
+      const tableRef = useRef(null);
+      const filteredRequests = requests.filter(r => r.status === currentStatus);
+      const tableKey = currentStatus + "_" + JSON.stringify(filteredRequests);
+
+      useEffect(() => {
+        if (!tableRef.current) return;
+        
+        const dt = $(tableRef.current).DataTable({
+          dom: 'Bfrtip',
+          buttons: [
+            { extend: 'csv', text: '<i class="fas fa-file-csv"></i> CSV', className: 'btn btn-primary' },
+            { extend: 'pdf', text: '<i class="fas fa-file-pdf"></i> PDF', className: 'btn btn-primary' },
+            { extend: 'print', text: '<i class="fas fa-print"></i> Print', className: 'btn btn-primary' }
+          ],
+          pageLength: 10,
+          order: [[0, 'desc']] // Sort by ID descending
+        });
+
+        return () => {
+           dt.destroy();
+        };
+      }, [tableKey]);
+
+      const getStatusBadge = (status) => {
+        if(status === 'Pending') return <span className="status-badge status-pending">Pending</span>;
+        if(status === 'Approved') return <span className="status-badge status-approved">Approved</span>;
+        if(status === 'Rejected') return <span className="status-badge status-rejected">Disapproved</span>;
+      };
+
+      return (
+        <div>
+          <div className="stats-grid-3">
+            <div className="stat-card yellow">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-clock"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{pendingCount}</div>
+                <div className="stat-label">TOTAL PENDING</div>
+              </div>
+            </div>
+            <div className="stat-card green">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-check-circle"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{approvedCount}</div>
+                <div className="stat-label">APPROVED</div>
+              </div>
+            </div>
+            <div className="stat-card red">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-times-circle"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{rejectedCount}</div>
+                <div className="stat-label">DISAPPROVED</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="table-card" style={{marginTop: '20px'}}>
+            <div className="filters-row" style={{marginBottom: '20px', paddingBottom: '20px', borderBottom: '2px solid var(--bg-light)'}}>
+              <h4 style={{color: 'var(--navy-primary)'}}><i className="fas fa-filter"></i> Filters</h4>
+            </div>
+
+            <div key={tableKey} style={{overflowX: 'auto'}}>
+              <table ref={tableRef} className="display">
+                <thead>
+                  <tr style={{background: 'var(--navy-dark)', color: 'white'}}>
+                    <th>ID</th>
+                    <th>Employee</th>
+                    <th>Department</th>
+                    <th>Expense Type</th>
+                    <th>Destination</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRequests.map(req => (
+                    <tr key={req.id}>
+                      <td><strong>{req.id}</strong></td>
+                      <td>
+                        <div style={{fontWeight: 'bold'}}>{req.empName || req.email || 'Unknown'}</div>
+                        <div style={{fontSize: '11px', color: '#666'}}>{req.empId || 'N/A'}</div>
+                      </td>
+                      <td>{req.department}</td>
+                      <td>{req.reqType}</td>
+                      <td>{req.destination}</td>
+                      <td>{req.amount} {req.currency}</td>
+                      <td>{getStatusBadge(req.status)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function NewRequestForm({ user, setView, refresh }) {
+      const [loading, setLoading] = useState(false);
+      const [formData, setFormData] = useState({
+        empName: user.email.split('@')[0],
+        empId: 'EMP_' + Math.floor(Math.random() * 9000 + 1000), 
+        role: '', 
+        department: '',
+        reqType: 'Hotel Booking', 
+        destination: 'Mumbai', 
+        currency: 'INR', 
+        amount: 5000
+      });
+
+      const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        const payload = {
+          Role: formData.role, Department: formData.department,
+          Request_Type: formData.reqType, Destination: formData.destination,
+          Currency: formData.currency, Amount: parseFloat(formData.amount)
+        };
+        try {
+          const response = await fetch('/api/predict', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const result = await response.json();
+          if (response.ok) {
+            const reqId = `REQ_${Math.floor(Math.random() * 10000)}`;
+            const saved = JSON.parse(localStorage.getItem('ams_requests') || '[]');
+            
+            if (result.status === "APPROVED") {
+              // Auto-approved by AI
+              const newReq = { ...formData, email: user.email, id: reqId, reason: result.message, status: 'Approved', shap: result.shap_explanations, confidence: result.confidence };
+              localStorage.setItem('ams_requests', JSON.stringify([newReq, ...saved]));
+              Swal.fire({ icon: 'success', title: 'Auto-Approved!', text: 'Your request was approved instantly by the AI.' }).then(() => {
+                  refresh();
+                  setView('approved');
+              });
+            } else {
+              // Escalated for review
+              const newReq = { ...formData, email: user.email, id: reqId, reason: result.message, status: 'Pending', shap: result.shap_explanations, confidence: result.confidence };
+              localStorage.setItem('ams_requests', JSON.stringify([newReq, ...saved]));
+              Swal.fire({ icon: 'warning', title: 'Sent for Manual Review', text: 'This request requires HR approval.' }).then(() => {
+                  refresh();
+                  setView('pending');
+              });
+            }
+          } else {
+            Swal.fire({ icon: 'error', title: 'API Error', text: result.error });
+          }
+        } catch (error) {
+          Swal.fire({ icon: 'error', title: 'Connection Failed', text: 'Is your Python server.py running on port 5000?' });
+        }
+        setLoading(false);
+      };
+
+      return (
+        <div>
+          <div className="dash-banner">
+            <div className="dash-banner-left">
+              <div className="dash-banner-icon"><i className="fas fa-paper-plane"></i></div>
+              <div>
+                <h3>Submit Expense</h3>
+                <p>Submit your expense and travel requests here. Our Isolation Forest AI will process them instantly.</p>
+              </div>
+            </div>
+          </div>
+          
+          <div style={{background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)'}}>
+            <button className="btn btn-secondary" onClick={() => setView('pending')} style={{marginBottom: '20px'}}>
+              <i className="fas fa-arrow-left"></i> Back to Dashboard
+            </button>
+            <h3 style={{color: 'var(--navy-primary)', marginBottom: '20px'}}><i className="fas fa-edit"></i> Request Form</h3>
+            <form onSubmit={handleSubmit}>
+              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px'}}>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee Name</label>
+                  <input type="text" name="empName" value={formData.empName} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee ID</label>
+                  <input type="text" name="empId" value={formData.empId} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Job Role</label>
+                  <input type="text" name="role" value={formData.role} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g. Data Scientist" />
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Department</label>
+                  <input type="text" name="department" value={formData.department} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g. IT" />
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Expense Type</label>
+                  <input type="text" name="reqType" value={formData.reqType} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Destination</label>
+                  <input type="text" name="destination" value={formData.destination} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Currency</label>
+                  <select name="currency" value={formData.currency} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}}>
+                    <option value="INR">INR (₹)</option>
+                    <option value="USD">USD ($)</option>
+                    <option value="EUR">EUR (€)</option>
+                    <option value="GBP">GBP (£)</option>
+                    <option value="SGD">SGD (S$)</option>
+                  </select>
+                </div>
+                <div className="form-group" style={{margin: 0}}>
+                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Amount</label>
+                  <input type="number" name="amount" value={formData.amount} onChange={handleChange} required min="1" style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                </div>
+              </div>
+              <button type="submit" className="btn btn-primary" style={{width: '100%', padding: '15px'}} disabled={loading}>
+                {loading ? <span><i className="fas fa-spinner fa-spin"></i> AI is analyzing...</span> : <span><i className="fas fa-robot"></i> Submit to AI Agent</span>}
+              </button>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    function ProfileView({ user }) {
+      const [loading, setLoading] = useState(false);
+      const [profileData, setProfileData] = useState({ name: '', emp_id: '' });
+
+      useEffect(() => {
+        fetch(`/api/auth/get_profile?email=${user.email}`)
+          .then(res => res.json())
+          .then(data => {
+            if(!data.error) {
+              setProfileData({ name: data.name || '', emp_id: data.emp_id || '' });
+            }
+          });
+      }, [user.email]);
+
+      const handleChange = (e) => setProfileData({ ...profileData, [e.target.name]: e.target.value });
+
+      const handleUpdate = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        try {
+          const res = await fetch('/api/auth/update_profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id })
+          });
+          const data = await res.json();
+          if(res.ok) {
+             Swal.fire('Updated!', data.message, 'success');
+          } else {
+             Swal.fire('Error', data.error, 'error');
+          }
+        } catch(err) {
+          Swal.fire('Error', 'Connection failed', 'error');
+        }
+        setLoading(false);
+      };
+
+      const handleResetPassword = () => {
+        Swal.fire({
+          title: 'Reset Password',
+          text: 'Are you sure want to Reset Your Password?',
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonText: 'Yes, reset it'
+        }).then(async (result) => {
+          if(result.isConfirmed) {
+            Swal.fire({ title: 'Sending...', didOpen: () => { Swal.showLoading() } });
+            try {
+              const res = await fetch('/api/auth/request_password_reset', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: user.email })
+              });
+              const data = await res.json();
+              if (res.ok) {
+                 Swal.fire('Notification Sent', 'A Notification Email is Sent to your Email to confirm, please check Your Inbox Or Spam Box', 'success')
+                 .then(() => {
+                    localStorage.removeItem('ams_user');
+                    window.location.href = 'index.html';
+                 });
+              } else {
+                 Swal.fire('Error', data.error, 'error');
+              }
+            } catch(e) {
+               Swal.fire('Error', 'Network error', 'error');
+            }
+          }
+        });
+      };
+
+      return (
+        <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
+          <h3 style={{color: 'var(--navy-primary)', marginBottom: '20px'}}><i className="fas fa-user-circle"></i> User Profile</h3>
+          
+          <form onSubmit={handleUpdate} style={{maxWidth: '500px', marginBottom: '40px'}}>
+            <div className="form-group">
+              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Email Address (Read Only)</label>
+              <input type="email" value={user.email} disabled style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px', background: '#f5f5f5'}} />
+            </div>
+            <div className="form-group">
+              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Full Name / Username</label>
+              <input type="text" name="name" value={profileData.name} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., John Doe" />
+            </div>
+            <div className="form-group">
+              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee ID</label>
+              <input type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., EMP_1234" />
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={loading} style={{padding: '10px 20px', borderRadius: '4px', border: 'none', background: 'var(--navy-primary)', color: 'white', cursor: 'pointer'}}>
+               {loading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-save"></i>} Update Profile
+            </button>
+          </form>
+
+          <hr style={{border: '0', borderTop: '1px solid #eee', marginBottom: '30px'}} />
+
+          <h4 style={{color: '#dc3545', marginBottom: '15px'}}><i className="fas fa-shield-alt"></i> Security</h4>
+          <p style={{fontSize: '13px', color: '#666', marginBottom: '15px'}}>Need to update your password? Request a secure password reset link to your email.</p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <button type="button" onClick={handleResetPassword} className="btn btn-danger" style={{background: '#dc3545', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+              <i className="fas fa-key"></i> Reset Password
+            </button>
+            <button type="button" onClick={() => {
+                Swal.fire({
+                  title: 'Are you sure?',
+                  text: 'You will be logged out of your session',
+                  icon: 'warning',
+                  showCancelButton: true,
+                  confirmButtonText: 'Yes, logout'
+                }).then((result) => {
+                  if(result.isConfirmed) {
+                    localStorage.removeItem('ams_user');
+                    window.location.href = 'index.html';
+                  }
+                });
+            }} className="btn btn-secondary" style={{background: '#6c757d', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+              <i className="fas fa-sign-out-alt"></i> Logout
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<EmployeePortal />);
+  </script>
+  <script>
+    document.addEventListener('mousemove', function(e) {
+      document.body.style.setProperty('--mouse-x', e.clientX + 'px');
+      document.body.style.setProperty('--mouse-y', e.clientY + 'px');
+    });
+  </script>
+</body>
+</html>

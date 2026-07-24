@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login - Approval Management System</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <style>
+    .tabs {
+      display: flex;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #eee;
+    }
+    .tab {
+      flex: 1;
+      text-align: center;
+      padding: 10px;
+      cursor: pointer;
+      font-weight: bold;
+      color: #999;
+    }
+    .tab.active {
+      color: var(--primary-color, #0056b3);
+      border-bottom: 2px solid var(--primary-color, #0056b3);
+      margin-bottom: -2px;
+    }
+    .auth-section {
+      display: none;
+    }
+    .auth-section.active {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="login-box">
+      <h2><i class="fas fa-shield-alt"></i> Advanced Approval Management System</h2>
+      <p style="color: #666; margin-bottom: 25px;">Enterprise Authentication System</p>
+      
+      <div class="tabs" id="authTabs">
+        <div class="tab active" onclick="switchTab('login')">Login</div>
+        <div class="tab" onclick="switchTab('register')">Request Access</div>
+      </div>
+
+      <!-- LOGIN SECTION -->
+      <div id="loginSection" class="auth-section active">
+        <form id="loginForm">
+          <div class="form-group" style="text-align: left;">
+            <label>Email Address</label>
+            <div style="position: relative;">
+              <i class="fas fa-envelope" style="position: absolute; left: 15px; top: 15px; color: #999;"></i>
+              <input type="email" id="loginEmail" placeholder="Enter your email" required style="padding-left: 45px;">
+            </div>
+          </div>
+          <div class="form-group" style="text-align: left;">
+            <label>Password</label>
+            <div style="position: relative;">
+              <i class="fas fa-lock" style="position: absolute; left: 15px; top: 15px; color: #999;"></i>
+              <input type="password" id="loginPassword" placeholder="Enter your password" style="padding-left: 45px; padding-right: 45px;">
+              <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('loginPassword', this)" style="position: absolute; right: 15px; top: 15px; color: #999; cursor: pointer;"></i>
+            </div>
+            <small style="color: #666; display: block; margin-top: 5px; font-size: 11px;">If you're login for the first time after Successfull Approved By sinior's Please Leave the Password Blank</small>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 10px; padding: 14px; font-size: 16px;">
+            Secure Login <i class="fas fa-arrow-right" style="margin-left: 8px;"></i>
+          </button>
+        </form>
+      </div>
+
+      <!-- REQUEST ACCESS SECTION -->
+      <div id="registerSection" class="auth-section">
+        <form id="registerForm">
+          <div class="form-group" style="text-align: left;">
+            <label>Email Address</label>
+            <div style="position: relative;">
+              <i class="fas fa-envelope" style="position: absolute; left: 15px; top: 15px; color: #999;"></i>
+              <input type="email" id="regEmail" placeholder="Enter your email" required style="padding-left: 45px;">
+            </div>
+          </div>
+          <div class="form-group" style="text-align: left;">
+            <label>Requested Role</label>
+            <select id="regRole" required>
+              <option value="User">Employee (User)</option>
+              <option value="Admin">Administrator (Admin)</option>
+            </select>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 10px; padding: 14px; font-size: 16px;">
+            Submit Request <i class="fas fa-paper-plane" style="margin-left: 8px;"></i>
+          </button>
+        </form>
+      </div>
+
+      <!-- SETUP PASSWORD SECTION (Initially Hidden) -->
+      <div id="setupSection" class="auth-section">
+        <div style="background: #e9f5ff; padding: 15px; border-radius: 4px; margin-bottom: 25px; text-align: left; font-size: 13px; color: #004085;">
+          <strong><i class="fas fa-check-circle"></i> Account Approved!</strong><br>
+          Please create a secure password to activate your account.
+        </div>
+        <form id="setupForm">
+          <div class="form-group" style="text-align: left;">
+            <label>New Password</label>
+            <div style="position: relative;">
+              <i class="fas fa-key" style="position: absolute; left: 15px; top: 15px; color: #999;"></i>
+              <input type="password" id="setupPassword" placeholder="Create a password" required style="padding-left: 45px; padding-right: 45px;">
+              <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('setupPassword', this)" style="position: absolute; right: 15px; top: 15px; color: #999; cursor: pointer;"></i>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 10px; padding: 14px; font-size: 16px;">
+            Activate Account <i class="fas fa-unlock-alt" style="margin-left: 8px;"></i>
+          </button>
+        </form>
+      </div>
+
+      <!-- RESET PASSWORD SECTION (Initially Hidden) -->
+      <div id="resetSection" class="auth-section">
+        <div style="background: #fff3cd; padding: 15px; border-radius: 4px; margin-bottom: 25px; text-align: left; font-size: 13px; color: #856404;">
+          <strong><i class="fas fa-key"></i> Reset Your Password</strong><br>
+          Please enter your new secure password.
+        </div>
+        <form id="resetForm">
+          <div class="form-group" style="text-align: left;">
+            <label>New Password</label>
+            <div style="position: relative;">
+              <i class="fas fa-key" style="position: absolute; left: 15px; top: 15px; color: #999;"></i>
+              <input type="password" id="resetPasswordInput" placeholder="Enter new password" required style="padding-left: 45px; padding-right: 45px;">
+              <i class="fas fa-eye toggle-password" onclick="togglePasswordVisibility('resetPasswordInput', this)" style="position: absolute; right: 15px; top: 15px; color: #999; cursor: pointer;"></i>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 10px; padding: 14px; font-size: 16px;">
+            Update Password <i class="fas fa-save" style="margin-left: 8px;"></i>
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Dynamic API URL for production vs local
+    const AUTH_API = '/api/auth';
+    let currentSetupEmail = '';
+
+    function togglePasswordVisibility(inputId, iconElement) {
+      const input = document.getElementById(inputId);
+      if (input.type === "password") {
+        input.type = "text";
+        iconElement.classList.remove('fa-eye');
+        iconElement.classList.add('fa-eye-slash');
+      } else {
+        input.type = "password";
+        iconElement.classList.remove('fa-eye-slash');
+        iconElement.classList.add('fa-eye');
+      }
+    }
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.auth-section').forEach(s => s.classList.remove('active'));
+      
+      if(tab === 'login') {
+        document.getElementById('authTabs').children[0].classList.add('active');
+        document.getElementById('loginSection').classList.add('active');
+      } else {
+        document.getElementById('authTabs').children[1].classList.add('active');
+        document.getElementById('registerSection').classList.add('active');
+      }
+      document.getElementById('authTabs').style.display = 'flex';
+    }
+
+    // Check for reset token in URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const resetToken = urlParams.get('reset_token');
+    
+    if (resetToken) {
+      document.querySelectorAll('.auth-section').forEach(s => s.classList.remove('active'));
+      document.getElementById('authTabs').style.display = 'none';
+      document.getElementById('resetSection').classList.add('active');
+    }
+
+    // Reset Form Submission
+    if(document.getElementById('resetForm')) {
+      document.getElementById('resetForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const pass = document.getElementById('resetPasswordInput').value;
+        try {
+          const response = await fetch(`${AUTH_API}/reset_password`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: resetToken, password: pass })
+          });
+          const data = await response.json();
+          if (response.ok) {
+            Swal.fire({ icon: 'success', title: 'Password Reset', text: data.message, timer: 2000, showConfirmButton: false }).then(() => {
+              window.location.href = 'index.html'; // clear URL params
+            });
+          } else {
+            Swal.fire({ icon: 'error', title: 'Reset Failed', text: data.error });
+          }
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server.' });
+        }
+      });
+    }
+
+    // Login Form Submission
+    document.getElementById('loginForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const email = document.getElementById('loginEmail').value;
+      const pass = document.getElementById('loginPassword').value;
+
+      try {
+        const response = await fetch(`${AUTH_API}/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email, password: pass })
+        });
+        
+        const data = await response.json();
+
+        if (response.ok) {
+          if (data.status === 'SETUP_REQUIRED') {
+            // Switch to setup password UI
+            currentSetupEmail = email;
+            document.querySelectorAll('.auth-section').forEach(s => s.classList.remove('active'));
+            document.getElementById('authTabs').style.display = 'none';
+            document.getElementById('setupSection').classList.add('active');
+            Swal.fire({ icon: 'info', title: 'Action Required', text: data.message });
+          } else if (data.status === 'SUCCESS') {
+            // Save mock session and redirect
+            localStorage.setItem('ams_user', JSON.stringify({ email: email, role: data.role, name: email.split('@')[0] }));
+            Swal.fire({ icon: 'success', title: 'Login Successful', text: data.message, timer: 1500, showConfirmButton: false }).then(() => {
+              window.location.href = data.redirect;
+            });
+          }
+        } else {
+          // Handle specific backend statuses (Pending, Rejected) or generic errors
+          if (data.status === 'PENDING') {
+            Swal.fire({ icon: 'warning', title: 'Pending Approval', text: data.message });
+          } else if (data.status === 'REJECTED') {
+            Swal.fire({ icon: 'error', title: 'Access Denied', text: data.message });
+          } else {
+            Swal.fire({ icon: 'error', title: 'Error', text: data.error });
+          }
+        }
+      } catch (err) {
+        console.error(err);
+        Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server. Please try again.' });
+      }
+    });
+
+    // Register Form Submission
+    document.getElementById('registerForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const email = document.getElementById('regEmail').value;
+      const role = document.getElementById('regRole').value;
+
+      try {
+        const response = await fetch(`${AUTH_API}/request_access`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email, role: role })
+        });
+        
+        const data = await response.json();
+
+        if (response.ok) {
+          Swal.fire({ icon: 'success', title: 'Request Submitted', text: data.message });
+          document.getElementById('registerForm').reset();
+          switchTab('login');
+        } else {
+          Swal.fire({ icon: 'error', title: 'Request Failed', text: data.error });
+        }
+      } catch (err) {
+        console.error(err);
+        Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server.' });
+      }
+    });
+
+    // Setup Password Form Submission
+    document.getElementById('setupForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const pass = document.getElementById('setupPassword').value;
+
+      try {
+        const response = await fetch(`${AUTH_API}/setup_password`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: currentSetupEmail, password: pass })
+        });
+        
+        const data = await response.json();
+
+        if (response.ok) {
+          // Immediately log them in
+          localStorage.setItem('ams_user', JSON.stringify({ email: currentSetupEmail, role: data.redirect.includes('admin') ? 'Admin' : 'User', name: currentSetupEmail.split('@')[0] }));
+          Swal.fire({ icon: 'success', title: 'Account Activated', text: data.message, timer: 1500, showConfirmButton: false }).then(() => {
+            window.location.href = data.redirect;
+          });
+        } else {
+          Swal.fire({ icon: 'error', title: 'Setup Failed', text: data.error });
+        }
+      } catch (err) {
+        console.error(err);
+        Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server on port 5001.' });
+      }
+    });
+  </script>
+  <script>
+    document.addEventListener('mousemove', function(e) {
+      document.body.style.setProperty('--mouse-x', e.clientX + 'px');
+      document.body.style.setProperty('--mouse-y', e.clientY + 'px');
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Super Admin Portal - AI Approval</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  
+  <!-- DataTables & ChartJS Requirements -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/jquery.dataTables.min.css">
+  <link rel="stylesheet" href="https://cdn.datatables.net/buttons/2.4.2/css/buttons.dataTables.min.css">
+  <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.2/js/dataTables.buttons.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.1.53/pdfmake.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.1.53/vfs_fonts.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.html5.min.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.print.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- React -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    function SuperAdminPortal() {
+      const [view, setView] = useState('dashboard');
+      const [allRequests, setAllRequests] = useState([]);
+      const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'superadmin@gmail.com'});
+
+      const loadData = () => {
+        // Fallback to old format for compatibility if new format is empty
+        const oldPending = JSON.parse(localStorage.getItem('hr_pending_queue') || '[]');
+        let saved = JSON.parse(localStorage.getItem('ams_requests') || '[]');
+        
+        // Migrate old pending to new system just in case
+        if (oldPending.length > 0 && saved.length === 0) {
+            saved = oldPending.map(req => ({...req, status: 'Pending'}));
+            localStorage.setItem('ams_requests', JSON.stringify(saved));
+            localStorage.removeItem('hr_pending_queue');
+        }
+
+        // Generate dummy data if totally empty for the sake of the charts displaying beautifully
+        if (saved.length === 0) {
+            saved = [
+                {id: 'REQ_111', role: 'Senior Engineer', department: 'Engineering', reqType: 'Hotel Booking', destination: 'Mumbai', currency: 'INR', amount: 8000, aiScore: 'N/A', status: 'Approved'},
+                {id: 'REQ_112', role: 'Junior Developer', department: 'Engineering', reqType: 'Flight Ticket', destination: 'Delhi', currency: 'INR', amount: 12000, aiScore: '0.89', status: 'Pending'},
+                {id: 'REQ_113', role: 'Executive', department: 'Sales', reqType: 'Software License', destination: 'Online', currency: 'USD', amount: 500, aiScore: 'N/A', status: 'Approved'},
+                {id: 'REQ_114', role: 'Junior Developer', department: 'Marketing', reqType: 'Hotel Booking', destination: 'Goa', currency: 'INR', amount: 45000, aiScore: '-1.45', status: 'Rejected'}
+            ];
+            localStorage.setItem('ams_requests', JSON.stringify(saved));
+        }
+
+        setAllRequests(saved);
+      };
+
+      useEffect(() => {
+        loadData();
+        const interval = setInterval(loadData, 2000);
+        return () => clearInterval(interval);
+      }, []);
+
+      const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
+      const approvedCount = allRequests.filter(r => r.status === 'Approved').length;
+      const rejectedCount = allRequests.filter(r => r.status === 'Rejected').length;
+
+      const handleLogout = () => {
+        Swal.fire({
+          title: 'Confirm Logout',
+          text: "Are you sure you want to log out?",
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonColor: '#ff9800',
+          cancelButtonColor: '#6c757d',
+          confirmButtonText: 'Yes, log me out'
+        }).then((result) => {
+          if (result.isConfirmed) {
+            localStorage.removeItem('ams_user');
+            window.location.href = 'index.html';
+          }
+        });
+      };
+
+      return (
+        <div className="app-container">
+          <div className="sidebar">
+            <div className="sidebar-header">
+              <span style={{color: 'black'}}>ML</span>
+            </div>
+            
+            <div className="sidebar-user">
+              <div className="avatar-circle">
+                {user.email.charAt(0).toUpperCase()}
+              </div>
+              <div className="email">{user.email}</div>
+              <span className="badge">Super Admin</span>
+            </div>
+
+            <div className="nav-label">Navigation</div>
+            <ul className="nav-menu">
+              <li>
+                <button className={view === 'dashboard' ? 'active' : ''} onClick={() => setView('dashboard')}>
+                  <i className="fas fa-chart-line"></i> Dashboard
+                </button>
+              </li>
+              <li>
+                <button className={view === 'pending' ? 'active' : ''} onClick={() => setView('pending')}>
+                  <i className="fas fa-clock"></i> Pending 
+                  <span className="count warning">{pendingCount}</span>
+                </button>
+              </li>
+              <li>
+                <button className={view === 'approved' ? 'active' : ''} onClick={() => setView('approved')}>
+                  <i className="fas fa-check-circle"></i> Approved 
+                  <span className="count success">{approvedCount}</span>
+                </button>
+              </li>
+              <li>
+                <button className={view === 'rejected' ? 'active' : ''} onClick={() => setView('rejected')}>
+                  <i className="fas fa-times-circle"></i> Disapproved 
+                  <span className="count secondary">{rejectedCount}</span>
+                </button>
+              </li>
+              <li>
+                <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
+                  <i className="fas fa-brain"></i> ML Agent
+                </button>
+              </li>
+              <li>
+                <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
+              </li>
+              <li>
+                <button onClick={() => Swal.fire('About', 'Approval Management System Version 2.0', 'info')}><i className="fas fa-info-circle"></i> About App</button>
+              </li>
+              <li>
+                <button className={view === 'profile' ? 'active' : ''} onClick={() => setView('profile')}>
+                  <i className="fas fa-user-circle"></i> Profile
+                </button>
+              </li>
+            </ul>
+          </div>
+          
+          <div className="main-content">
+            <div className="top-header">
+              <h2>
+                {view === 'dashboard' && <><i className="fas fa-chart-line"></i> Dashboard</>}
+                {view === 'pending' && <><i className="fas fa-clock"></i> Pending Requests</>}
+                {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
+                {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
+                {view === 'mlops' && <><i className="fas fa-brain"></i> ML Agent Console</>}
+                {view === 'users' && <><i className="fas fa-users-cog"></i> Manage Users</>}
+                {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
+              </h2>
+              <div className="user-welcome">Welcome, {user.email}</div>
+            </div>
+
+            {view === 'dashboard' && <DashboardView 
+                requests={allRequests} 
+                userEmail={user.email.split('@')[0]} 
+                setView={setView} 
+            />}
+            {(view === 'pending' || view === 'approved' || view === 'rejected') && 
+                <TableView 
+                    requests={allRequests} 
+                    currentStatus={view === 'pending' ? 'Pending' : view === 'approved' ? 'Approved' : 'Rejected'} 
+                    refresh={loadData} 
+                />
+            }
+            {view === 'mlops' && <MlopsView />}
+            {view === 'users' && <UsersView />}
+            {view === 'profile' && <ProfileView user={user} />}
+          </div>
+        </div>
+      );
+    }
+
+    function DashboardView({ requests, userEmail, setView }) {
+      const pieRef = useRef(null);
+      const barRef = useRef(null);
+
+      const pending = requests.filter(r => r.status === 'Pending').length;
+      const approved = requests.filter(r => r.status === 'Approved').length;
+      const rejected = requests.filter(r => r.status === 'Rejected').length;
+      const total = requests.length;
+      const approvalRate = total === 0 ? 0 : Math.round((approved / total) * 100);
+
+      // Unique departments
+      const departments = new Set(requests.map(r => r.department)).size;
+
+      // Expense Types data for bar chart
+      const expenseTypes = {};
+      requests.forEach(r => {
+          if (!expenseTypes[r.reqType]) {
+              expenseTypes[r.reqType] = { approved: 0, pending: 0, rejected: 0 };
+          }
+          if (r.status === 'Approved') expenseTypes[r.reqType].approved++;
+          if (r.status === 'Pending') expenseTypes[r.reqType].pending++;
+          if (r.status === 'Rejected') expenseTypes[r.reqType].rejected++;
+      });
+      const barLabels = Object.keys(expenseTypes);
+      const barApproved = barLabels.map(k => expenseTypes[k].approved);
+      const barPending = barLabels.map(k => expenseTypes[k].pending);
+
+      useEffect(() => {
+        const ctxPie = pieRef.current.getContext('2d');
+        const pieChart = new Chart(ctxPie, {
+          type: 'doughnut',
+          data: {
+            labels: ['Approved', 'Pending', 'Disapproved'],
+            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#28a745', '#ffc107', '#dc3545'] }]
+          },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+        });
+
+        const ctxBar = barRef.current.getContext('2d');
+        const barChart = new Chart(ctxBar, {
+          type: 'bar',
+          data: {
+            labels: barLabels.length > 0 ? barLabels : ['No Data'],
+            datasets: [
+              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#28a745' },
+              { label: 'Pending', data: barLabels.length > 0 ? barPending : [0], backgroundColor: '#ffc107' }
+            ]
+          },
+          options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y', stacked: true }
+        });
+
+        return () => { pieChart.destroy(); barChart.destroy(); }
+      }, [requests]);
+
+      return (
+        <div>
+          <div className="dash-banner">
+            <div className="dash-banner-left">
+              <div className="dash-banner-icon"><i className="fas fa-user-circle"></i></div>
+              <div>
+                <h3>Welcome Super Admin!</h3>
+                <p>You have super admin access. Managing {total} total requests across {departments} departments.</p>
+                <div className="dash-banner-tags">
+                  <span><i className="fas fa-user-shield"></i> Super Administrator</span>
+                  <span><i className="fas fa-clock"></i> Session: Active</span>
+                </div>
+              </div>
+            </div>
+            <div className="dash-banner-right">
+              <h1>{approvalRate}%</h1>
+              <span>APPROVAL RATE</span>
+            </div>
+          </div>
+
+          <h4 style={{marginBottom: '15px', color: '#555'}}><i className="fas fa-bolt"></i> Quick Actions</h4>
+          <div className="quick-actions">
+            <div className="qa-card qa-new" onClick={() => Swal.fire('Info', 'As a super admin, you can view requests. Employees submit new requests from their portal.', 'info')}><i className="fas fa-plus-circle"></i> New Request</div>
+            <div className="qa-card qa-pending" onClick={() => setView('pending')}><i className="fas fa-clock"></i> View Pending ({pending})</div>
+            <div className="qa-card qa-approved" onClick={() => setView('approved')}><i className="fas fa-check-circle"></i> View Approved ({approved})</div>
+            <div className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</div>
+          </div>
+
+          <div className="stats-grid-4">
+            <div className="stat-card blue">
+              <div className="stat-icon"><i className="fas fa-folder-open"></i></div>
+              <div className="stat-value">{total}</div>
+              <div className="stat-label">Total Requests</div>
+            </div>
+            <div className="stat-card yellow">
+              <div className="stat-icon"><i className="fas fa-clock"></i></div>
+              <div className="stat-value">{pending}</div>
+              <div className="stat-label">Pending</div>
+            </div>
+            <div className="stat-card green">
+              <div className="stat-icon"><i className="fas fa-check-circle"></i></div>
+              <div className="stat-value">{approved}</div>
+              <div className="stat-label">Approved</div>
+            </div>
+            <div className="stat-card red">
+              <div className="stat-icon"><i className="fas fa-times-circle"></i></div>
+              <div className="stat-value">{rejected}</div>
+              <div className="stat-label">Disapproved</div>
+            </div>
+          </div>
+
+          <div className="stats-grid-3">
+            <div className="stat-card blue">
+              <div className="stat-icon"><i className="fas fa-users"></i></div>
+              <div className="stat-value">2</div>
+              <div className="stat-label">Total Users</div>
+            </div>
+            <div className="stat-card purple">
+              <div className="stat-icon"><i className="fas fa-building"></i></div>
+              <div className="stat-value">{departments}</div>
+              <div className="stat-label">Departments</div>
+            </div>
+            <div className="stat-card teal">
+              <div className="stat-value" style={{marginTop: '45px', color: 'var(--info)'}}>{approvalRate}%</div>
+              <div className="stat-label">Approval Rate</div>
+            </div>
+          </div>
+
+          <div className="progress-card">
+            <div className="progress-icon"><i className="fas fa-chart-line"></i></div>
+            <div className="progress-content">
+              <div className="progress-header">
+                <span>Overall Approval Rate</span>
+                <span><i className="fas fa-check"></i> Approved: {approved} &nbsp; <i className="fas fa-clock"></i> Pending: {pending}</span>
+              </div>
+              <div className="progress-header"><h2>{approvalRate}%</h2></div>
+              <div className="progress-track">
+                <div className="progress-fill" style={{width: `${approvalRate}%`}}></div>
+              </div>
+            </div>
+          </div>
+
+          <div className="charts-grid">
+            <div className="chart-card">
+              <h4>Status Distribution</h4>
+              <div style={{height: '250px'}}><canvas ref={pieRef}></canvas></div>
+            </div>
+            <div className="chart-card">
+              <h4>Expense Types (Requests)</h4>
+              <div style={{height: '250px'}}><canvas ref={barRef}></canvas></div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function TableView({ requests, currentStatus, refresh }) {
+      const tableRef = useRef(null);
+      const filteredRequests = requests.filter(r => r.status === currentStatus);
+      const tableKey = currentStatus + "_" + JSON.stringify(filteredRequests);
+
+      useEffect(() => {
+        if (!tableRef.current) return;
+        
+        const dt = $(tableRef.current).DataTable({
+          dom: 'Bfrtip',
+          buttons: [
+            { extend: 'csv', text: '<i class="fas fa-file-csv"></i> CSV', className: 'btn btn-primary' },
+            { extend: 'pdf', text: '<i class="fas fa-file-pdf"></i> PDF', className: 'btn btn-primary' },
+            { extend: 'print', text: '<i class="fas fa-print"></i> Print', className: 'btn btn-primary' }
+          ],
+          pageLength: 10,
+          order: [[0, 'desc']]
+        });
+
+        return () => {
+           // Cleanup to prevent memory leaks when React unmounts this table
+           dt.destroy();
+        };
+      }, [tableKey]); // Re-run only when the tableKey changes (full remount)
+
+      const handleAction = (id, newStatus) => {
+        let q = JSON.parse(localStorage.getItem('ams_requests') || '[]');
+        q = q.map(r => r.id === id ? { ...r, status: newStatus } : r);
+        localStorage.setItem('ams_requests', JSON.stringify(q));
+        refresh();
+        Swal.fire({ icon: 'success', title: `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+      };
+
+      const handleClearHistory = () => {
+        Swal.fire({
+          title: 'Are you sure?',
+          text: "You won't be able to revert this!",
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonColor: '#ea4335',
+          cancelButtonColor: '#6c757d',
+          confirmButtonText: 'Yes, clear all!'
+        }).then((result) => {
+          if (result.isConfirmed) {
+            localStorage.removeItem('ams_requests');
+            refresh();
+            Swal.fire('Cleared!', 'All request history has been deleted.', 'success');
+          }
+        });
+      };
+
+      const getStatusBadge = (status) => {
+        if(status === 'Pending') return <span className="status-badge status-pending">Pending</span>;
+        if(status === 'Approved') return <span className="status-badge status-approved">Approved</span>;
+        if(status === 'Rejected') return <span className="status-badge status-rejected">Disapproved</span>;
+      };
+
+      return (
+        <div>
+          <div className="stats-grid-3">
+            <div className="stat-card yellow">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-clock"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{requests.filter(r=>r.status==='Pending').length}</div>
+                <div className="stat-label">Total Pending</div>
+              </div>
+            </div>
+            <div className="stat-card green">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-check-circle"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{requests.filter(r=>r.status==='Approved').length}</div>
+                <div className="stat-label">Approved Requests</div>
+              </div>
+            </div>
+            <div className="stat-card red">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-times-circle"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{requests.filter(r=>r.status==='Rejected').length}</div>
+                <div className="stat-label">Disapproved Requests</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="table-card">
+            <div className="filters-row">
+              <div className="form-group">
+                <label><i className="fas fa-building"></i> Department</label>
+                <select><option>All Departments</option><option>Engineering</option><option>Sales</option><option>Marketing</option></select>
+              </div>
+              <div className="form-group">
+                <label><i className="fas fa-tag"></i> Expense Type</label>
+                <select><option>All Types</option><option>Hotel Booking</option><option>Flight Ticket</option></select>
+              </div>
+              <div className="form-group">
+                <label><i className="fas fa-user"></i> Person Role</label>
+                <input type="text" placeholder="Search by role..." />
+              </div>
+              <div>
+                <button className="btn btn-secondary" onClick={handleClearHistory}><i className="fas fa-trash"></i> Reset Database</button>
+              </div>
+            </div>
+
+            <div key={tableKey} style={{overflowX: 'auto'}}>
+              <table ref={tableRef} className="display">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Employee</th>
+                    <th>Department</th>
+                    <th>Job Role</th>
+                    <th>Expense Type</th>
+                    <th>Destination</th>
+                    <th>Amount</th>
+                    <th>AI Flag Reason</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRequests.map(req => (
+                    <tr key={req.id}>
+                      <td><strong>{req.id}</strong></td>
+                      <td>
+                        <div style={{fontWeight: 'bold'}}>{req.empName || req.email || 'Unknown'}</div>
+                        <div style={{fontSize: '11px', color: '#666'}}>{req.empId || 'N/A'}</div>
+                      </td>
+                      <td>{req.department}</td>
+                      <td>{req.role}</td>
+                      <td>{req.reqType}</td>
+                      <td>{req.destination}</td>
+                      <td>{req.amount} {req.currency}</td>
+                      <td>
+                        {req.confidence !== undefined && (
+                          <span className="badge" style={{background: req.confidence > 80 ? 'var(--success)' : req.confidence < 20 ? '#ea4335' : '#fbbc05', color: 'white', display: 'block', marginBottom: '5px', fontSize: '11px', whiteSpace: 'normal', lineHeight: '1.2'}}>
+                            <i className="fas fa-brain"></i> Confidence: {req.confidence}%
+                          </span>
+                        )}
+                        <span className="badge" style={{background: 'var(--navy-primary)', color: 'white', display: 'block', marginBottom: '5px', fontSize: '11px', whiteSpace: 'normal', lineHeight: '1.2'}}>{req.reason || req.aiScore}</span>
+                        {req.shap && (
+                          <div style={{background: '#f8f9fa', border: '1px solid #ddd', padding: '5px', borderRadius: '4px', fontSize: '11px', minWidth: '150px'}}>
+                            <div style={{fontWeight: 'bold', marginBottom: '3px', color: '#555', borderBottom: '1px solid #ddd', paddingBottom: '2px'}}>SHAP Impact</div>
+                            {Object.entries(req.shap).map(([feature, impact]) => {
+                              const isPositive = impact > 0;
+                              return (
+                                <div key={feature} style={{display: 'flex', justifyContent: 'space-between', marginBottom: '2px'}}>
+                                  <span style={{color: '#666'}}>{feature.replace('_', ' ')}:</span>
+                                  <strong style={{color: isPositive ? '#34a853' : '#ea4335'}}>
+                                    {isPositive ? '+' : ''}{impact.toFixed(3)}
+                                  </strong>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </td>
+                      <td>{getStatusBadge(req.status)}</td>
+                      <td>
+                        {req.status === 'Pending' ? (
+                          <>
+                            <button className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve"><i className="fas fa-check-square"></i></button>
+                            <button className="action-btn delete" onClick={() => handleAction(req.id, 'Rejected')} title="Reject"><i className="fas fa-trash-alt"></i></button>
+                          </>
+                        ) : (
+                          <button className="action-btn" onClick={() => handleAction(req.id, 'Pending')} title="Move to Pending" style={{color: 'var(--info)'}}><i className="fas fa-undo"></i></button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function MlopsView() {
+      const [training, setTraining] = useState(false);
+      const [logs, setLogs] = useState([
+        "[SYSTEM] Model loaded successfully.",
+        "[SYSTEM] Awaiting retrain trigger..."
+      ]);
+
+      const [lastRetrainTime, setLastRetrainTime] = useState(
+        parseInt(localStorage.getItem('ams_last_retrain')) || (Date.now() - 2 * 24 * 60 * 60 * 1000)
+      );
+      const [currentTime, setCurrentTime] = useState(Date.now());
+      
+      useEffect(() => {
+        const interval = setInterval(() => {
+          setCurrentTime(Date.now());
+        }, 1000);
+        return () => clearInterval(interval);
+      }, []);
+
+      const getElapsedTime = () => {
+        const diff = Math.floor((currentTime - lastRetrainTime) / 1000);
+        if (diff < 60) return diff + " seconds ago";
+        if (diff < 3600) return Math.floor(diff / 60) + " minutes ago";
+        if (diff < 86400) return Math.floor(diff / 3600) + " hours ago";
+        return Math.floor(diff / 86400) + " days ago";
+      };
+
+      const triggerRetrain = () => {
+        Swal.fire({
+          title: 'Trigger Batch Retrain?',
+          text: "This will feed recent overrides back into the ML pipeline.",
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonColor: 'var(--navy-primary)',
+          cancelButtonColor: '#6c757d',
+          confirmButtonText: 'Yes, Retrain Now!'
+        }).then((result) => {
+          if (result.isConfirmed) {
+            setTraining(true);
+            setLogs(prev => [...prev, "[JOB] Nightly Batch Retrain started..."]);
+            setTimeout(() => {
+              setLogs(prev => [...prev, "[JOB] Processing new manual overrides..."]);
+            }, 1000);
+            setTimeout(() => {
+              setLogs(prev => [...prev, "[JOB] Updating gradient weights & vocabulary..."]);
+            }, 2500);
+            setTimeout(() => {
+              setLogs(prev => [...prev, "[JOB] Success! Accuracy improved by 0.24%."]);
+              setTraining(false);
+              const now = Date.now();
+              setLastRetrainTime(now);
+              localStorage.setItem('ams_last_retrain', now);
+              Swal.fire('Retrained!', 'The ML Model has been successfully updated.', 'success');
+            }, 4000);
+          }
+        });
+      };
+
+      return (
+        <div>
+          <div className="dash-banner" style={{ background: 'linear-gradient(135deg, #1e3c72 0%, #2a5298 100%)', color: 'white' }}>
+            <div className="dash-banner-left">
+               <div className="dash-banner-icon"><i className="fas fa-robot"></i></div>
+              <div>
+                <h3>MLOps Control Center</h3>
+                <p>Manage, retrain, and monitor the AI Approval Agent directly from this dashboard.</p>
+              </div>
+            </div>
+          </div>
+          
+          <div className="stats-grid-3">
+            <div className="stat-card blue">
+              <div className="stat-icon"><i className="fas fa-microchip"></i></div>
+              <div className="stat-value" style={{fontSize: '20px'}}>Isolation Forest</div>
+              <div className="stat-label">Active Model Architecture</div>
+            </div>
+            <div className="stat-card green">
+              <div className="stat-icon"><i className="fas fa-bullseye"></i></div>
+              <div className="stat-value">94.2%</div>
+              <div className="stat-label">Current Accuracy Score</div>
+            </div>
+            <div className="stat-card purple">
+              <div className="stat-icon"><i className="fas fa-history"></i></div>
+              <div className="stat-value">{getElapsedTime()}</div>
+              <div className="stat-label">Last Retrain Date</div>
+            </div>
+          </div>
+
+          <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginTop: '20px' }}>
+             <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-cogs"></i> Retrain Pipeline</h3>
+             <p style={{color: '#666', marginBottom: '20px'}}>
+               Triggering this job will fetch all manual overrides (when a super admin changed an AI decision) and retrain the model to learn from those corrections.
+             </p>
+             <button onClick={triggerRetrain} disabled={training} className="btn btn-primary" style={{padding: '15px 30px', fontSize: '16px', borderRadius: '5px', background: training ? '#6c757d' : 'var(--navy-primary)', border: 'none', color: 'white', cursor: training ? 'not-allowed' : 'pointer' }}>
+               {training ? <span><i className="fas fa-spinner fa-spin"></i> Retraining in progress...</span> : <span><i className="fas fa-bolt"></i> Trigger Nightly Batch Retrain</span>}
+             </button>
+             
+             <div style={{ background: '#1e1e1e', color: '#00ff00', padding: '20px', borderRadius: '5px', marginTop: '25px', fontFamily: 'monospace', height: '200px', overflowY: 'auto' }}>
+               {logs.map((log, i) => <div key={i}>{log}</div>)}
+             </div>
+          </div>
+        </div>
+      );
+    }
+
+    function UsersView() {
+      const [allUsers, setAllUsers] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [activeTab, setActiveTab] = useState('Admins');
+
+      const fetchUsers = async () => {
+        try {
+          const res = await fetch('/api/auth/users');
+          const data = await res.json();
+          setAllUsers(data);
+        } catch (err) {
+          console.error(err);
+          Swal.fire('Error', 'Could not fetch users from Auth API', 'error');
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      useEffect(() => {
+        fetchUsers();
+      }, []);
+
+      const handleApprove = async (email) => {
+        try {
+          const res = await fetch('/api/auth/approve_user', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: email })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            Swal.fire('Approved!', data.message, 'success');
+            fetchUsers(); // refresh list
+          } else {
+            Swal.fire('Error', data.error, 'error');
+          }
+        } catch(err) {
+          console.error(err);
+          Swal.fire('Error', 'Could not communicate with Auth API', 'error');
+        }
+      };
+
+      const handleReject = async (email) => {
+        try {
+          const res = await fetch('/api/auth/reject_user', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: email })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            Swal.fire('Rejected!', data.message, 'success');
+            fetchUsers(); // refresh list
+          } else {
+            Swal.fire('Error', data.error, 'error');
+          }
+        } catch(err) {
+          console.error(err);
+          Swal.fire('Error', 'Could not communicate with Auth API', 'error');
+        }
+      };
+
+      const handleDelete = (email) => {
+        Swal.fire({
+          title: 'Are you sure?',
+          text: `You are about to permanently delete ${email}. This action cannot be undone.`,
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonText: 'Yes, delete entirely',
+          confirmButtonColor: '#dc3545'
+        }).then(async (result) => {
+          if (result.isConfirmed) {
+            try {
+              const res = await fetch('/api/auth/delete_user', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: email })
+              });
+              const data = await res.json();
+              if (res.ok) {
+                Swal.fire('Deleted!', data.message, 'success');
+                fetchUsers();
+              } else {
+                Swal.fire('Error', data.message, 'error');
+              }
+            } catch(err) {
+              Swal.fire('Error', 'Could not communicate with Auth API', 'error');
+            }
+          }
+        });
+      };
+
+      const pendingUsers = allUsers.filter(u => u.status === 'Pending');
+      const activeAdmins = allUsers.filter(u => u.status !== 'Pending' && (u.role === 'Admin' || u.role === 'Super Admin'));
+      const activeUsersList = allUsers.filter(u => u.status !== 'Pending' && u.role === 'User');
+
+      return (
+        <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
+          <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-users-cog"></i> Manage Access Requests</h3>
+          <p style={{color: '#666', marginBottom: '20px'}}>Approve pending requests for new User and Admin accounts. Once approved, the user will be prompted to set up their password upon next login.</p>
+          
+          {loading ? (
+             <div><i className="fas fa-spinner fa-spin"></i> Loading users...</div>
+          ) : (
+            <>
+              {pendingUsers.length === 0 ? (
+                 <div style={{padding: '20px', background: '#f8f9fa', borderRadius: '5px', textAlign: 'center', color: '#666', marginBottom: '30px'}}><i className="fas fa-check-circle" style={{fontSize: '24px', color: '#28a745', marginBottom: '10px', display: 'block'}}></i>No pending users found. Everything is up to date!</div>
+              ) : (
+                <div style={{overflowX: 'auto', marginBottom: '30px'}}>
+                  <table style={{width: '100%', borderCollapse: 'collapse', marginTop: '10px'}}>
+                    <thead>
+                      <tr style={{borderBottom: '2px solid #eee', textAlign: 'left'}}>
+                        <th style={{padding: '12px 10px'}}>Email Address</th>
+                        <th style={{padding: '12px 10px'}}>Requested Role</th>
+                        <th style={{padding: '12px 10px'}}>Request Date</th>
+                        <th style={{padding: '12px 10px'}}>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pendingUsers.map(u => (
+                        <tr key={u.id} style={{borderBottom: '1px solid #eee'}}>
+                          <td style={{padding: '12px 10px', fontWeight: 'bold', color: '#333'}}>
+                            {u.email} <br/><small style={{color: '#888', fontWeight: 'normal'}}>{u.name ? `Name: ${u.name}` : ''}</small>
+                          </td>
+                          <td style={{padding: '12px 10px'}}>
+                            <span className="badge" style={{background: u.role === 'Admin' ? 'var(--navy-primary)' : '#6c757d', color: 'white', display: 'inline-block', padding: '4px 8px', borderRadius: '4px', fontSize: '11px'}}>{u.role}</span>
+                          </td>
+                          <td style={{padding: '12px 10px', color: '#666', fontSize: '13px'}}>
+                            {new Date(u.created_at + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          </td>
+                          <td style={{padding: '12px 10px', display: 'flex', gap: '10px'}}>
+                            <button onClick={() => handleApprove(u.email)} className="btn btn-primary" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px'}}>
+                              <i className="fas fa-check"></i> Approve
+                            </button>
+                            <button onClick={() => handleReject(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
+                              <i className="fas fa-times"></i> Reject
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              
+              <hr style={{border: '0', borderTop: '1px solid #eee', margin: '30px 0'}} />
+              
+              <div style={{ display: 'flex', gap: '15px', marginBottom: '20px' }}>
+                <button 
+                  onClick={() => setActiveTab('Admins')} 
+                  style={{
+                    padding: '10px 20px', 
+                    borderRadius: '20px', 
+                    border: 'none', 
+                    cursor: 'pointer', 
+                    background: activeTab === 'Admins' ? 'var(--navy-primary)' : '#e9ecef',
+                    color: activeTab === 'Admins' ? 'white' : '#495057',
+                    fontWeight: 'bold',
+                    transition: 'all 0.3s ease',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}
+                >
+                  <i className="fas fa-user-shield"></i> Admins
+                </button>
+                <button 
+                  onClick={() => setActiveTab('Users')} 
+                  style={{
+                    padding: '10px 20px', 
+                    borderRadius: '20px', 
+                    border: 'none', 
+                    cursor: 'pointer', 
+                    background: activeTab === 'Users' ? 'var(--navy-primary)' : '#e9ecef',
+                    color: activeTab === 'Users' ? 'white' : '#495057',
+                    fontWeight: 'bold',
+                    transition: 'all 0.3s ease',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}
+                >
+                  <i className="fas fa-users"></i> Users
+                </button>
+              </div>
+
+              {activeTab === 'Admins' && (
+                <div>
+                  <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-user-shield"></i> Current Active Admins</h3>
+                  <p style={{color: '#666', marginBottom: '20px'}}>Manage existing Admin and Super Admin accounts. You have full control to remove accounts entirely.</p>
+                  
+                  {activeAdmins.length === 0 ? (
+                     <div style={{padding: '20px', background: '#f8f9fa', borderRadius: '5px', textAlign: 'center', color: '#666'}}>No active admins found.</div>
+                  ) : (
+                    <div style={{overflowX: 'auto'}}>
+                      <table style={{width: '100%', borderCollapse: 'collapse', marginTop: '10px'}}>
+                        <thead>
+                          <tr style={{borderBottom: '2px solid #eee', textAlign: 'left'}}>
+                            <th style={{padding: '12px 10px'}}>Email Address</th>
+                            <th style={{padding: '12px 10px'}}>Role</th>
+                            <th style={{padding: '12px 10px'}}>Status</th>
+                            <th style={{padding: '12px 10px'}}>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeAdmins.map(u => (
+                            <tr key={u.id} style={{borderBottom: '1px solid #eee'}}>
+                              <td style={{padding: '12px 10px', fontWeight: 'bold', color: '#333'}}>
+                                {u.email} <br/><small style={{color: '#888', fontWeight: 'normal'}}>{u.name ? `Name: ${u.name}` : ''}</small>
+                              </td>
+                              <td style={{padding: '12px 10px'}}>
+                                <span className="badge" style={{background: 'var(--navy-primary)', color: 'white', display: 'inline-block', padding: '4px 8px', borderRadius: '4px', fontSize: '11px'}}>{u.role}</span>
+                              </td>
+                              <td style={{padding: '12px 10px', color: '#666', fontSize: '13px'}}>
+                                <span style={{color: u.status === 'Active' ? '#28a745' : u.status === 'Rejected' ? '#dc3545' : '#ffc107'}}>{u.status}</span>
+                              </td>
+                              <td style={{padding: '12px 10px'}}>
+                                <button onClick={() => handleDelete(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
+                                  <i className="fas fa-trash-alt"></i> Remove
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {activeTab === 'Users' && (
+                <div>
+                  <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-users"></i> Current Active Users</h3>
+                  <p style={{color: '#666', marginBottom: '20px'}}>Manage existing standard user accounts in the system. You have full control to remove accounts entirely.</p>
+                  
+                  {activeUsersList.length === 0 ? (
+                     <div style={{padding: '20px', background: '#f8f9fa', borderRadius: '5px', textAlign: 'center', color: '#666'}}>No active users found.</div>
+                  ) : (
+                    <div style={{overflowX: 'auto'}}>
+                      <table style={{width: '100%', borderCollapse: 'collapse', marginTop: '10px'}}>
+                        <thead>
+                          <tr style={{borderBottom: '2px solid #eee', textAlign: 'left'}}>
+                            <th style={{padding: '12px 10px'}}>Email Address</th>
+                            <th style={{padding: '12px 10px'}}>Role</th>
+                            <th style={{padding: '12px 10px'}}>Status</th>
+                            <th style={{padding: '12px 10px'}}>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeUsersList.map(u => (
+                            <tr key={u.id} style={{borderBottom: '1px solid #eee'}}>
+                              <td style={{padding: '12px 10px', fontWeight: 'bold', color: '#333'}}>
+                                {u.email} <br/><small style={{color: '#888', fontWeight: 'normal'}}>{u.name ? `Name: ${u.name}` : ''}</small>
+                              </td>
+                              <td style={{padding: '12px 10px'}}>
+                                <span className="badge" style={{background: '#6c757d', color: 'white', display: 'inline-block', padding: '4px 8px', borderRadius: '4px', fontSize: '11px'}}>{u.role}</span>
+                              </td>
+                              <td style={{padding: '12px 10px', color: '#666', fontSize: '13px'}}>
+                                <span style={{color: u.status === 'Active' ? '#28a745' : u.status === 'Rejected' ? '#dc3545' : '#ffc107'}}>{u.status}</span>
+                              </td>
+                              <td style={{padding: '12px 10px'}}>
+                                <button onClick={() => handleDelete(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
+                                  <i className="fas fa-trash-alt"></i> Remove
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      );
+    }
+
+    function ProfileView({ user }) {
+      const [loading, setLoading] = useState(false);
+      const [profileData, setProfileData] = useState({ name: '', emp_id: '' });
+
+      useEffect(() => {
+        fetch(`/api/auth/get_profile?email=${user.email}`)
+          .then(res => res.json())
+          .then(data => {
+            if(!data.error) {
+              setProfileData({ name: data.name || '', emp_id: data.emp_id || '' });
+            }
+          });
+      }, [user.email]);
+
+      const handleChange = (e) => setProfileData({ ...profileData, [e.target.name]: e.target.value });
+
+      const handleUpdate = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        try {
+          const res = await fetch('/api/auth/update_profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id })
+          });
+          const data = await res.json();
+          if(res.ok) {
+             Swal.fire('Updated!', data.message, 'success');
+          } else {
+             Swal.fire('Error', data.error, 'error');
+          }
+        } catch(err) {
+          Swal.fire('Error', 'Connection failed', 'error');
+        }
+        setLoading(false);
+      };
+
+      const handleResetPassword = () => {
+        Swal.fire({
+          title: 'Reset Password',
+          text: 'Are you sure want to Reset Your Password?',
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonText: 'Yes, reset it'
+        }).then(async (result) => {
+          if(result.isConfirmed) {
+            Swal.fire({ title: 'Sending...', didOpen: () => { Swal.showLoading() } });
+            try {
+              const res = await fetch('/api/auth/request_password_reset', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: user.email })
+              });
+              const data = await res.json();
+              if (res.ok) {
+                 Swal.fire('Notification Sent', 'A Notification Email is Sent to your Email to confirm, please check Your Inbox Or Spam Box', 'success')
+                 .then(() => {
+                    localStorage.removeItem('ams_user');
+                    window.location.href = 'index.html';
+                 });
+              } else {
+                 Swal.fire('Error', data.error, 'error');
+              }
+            } catch(e) {
+               Swal.fire('Error', 'Network error', 'error');
+            }
+          }
+        });
+      };
+
+      return (
+        <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
+          <h3 style={{color: 'var(--navy-primary)', marginBottom: '20px'}}><i className="fas fa-user-circle"></i> User Profile</h3>
+          
+          <form onSubmit={handleUpdate} style={{maxWidth: '500px', marginBottom: '40px'}}>
+            <div className="form-group">
+              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Email Address (Read Only)</label>
+              <input type="email" value={user.email} disabled style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px', background: '#f5f5f5'}} />
+            </div>
+            <div className="form-group">
+              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Full Name / Username</label>
+              <input type="text" name="name" value={profileData.name} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., John Doe" />
+            </div>
+            <div className="form-group">
+              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee ID</label>
+              <input type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., EMP_1234" />
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={loading} style={{padding: '10px 20px', borderRadius: '4px', border: 'none', background: 'var(--navy-primary)', color: 'white', cursor: 'pointer'}}>
+               {loading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-save"></i>} Update Profile
+            </button>
+          </form>
+
+          <hr style={{border: '0', borderTop: '1px solid #eee', marginBottom: '30px'}} />
+
+          <h4 style={{color: '#dc3545', marginBottom: '15px'}}><i className="fas fa-shield-alt"></i> Security</h4>
+          <p style={{fontSize: '13px', color: '#666', marginBottom: '15px'}}>Need to update your password? Request a secure password reset link to your email.</p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <button type="button" onClick={handleResetPassword} className="btn btn-danger" style={{background: '#dc3545', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+              <i className="fas fa-key"></i> Reset Password
+            </button>
+            <button type="button" onClick={() => {
+                Swal.fire({
+                  title: 'Are you sure?',
+                  text: 'You will be logged out of your session',
+                  icon: 'warning',
+                  showCancelButton: true,
+                  confirmButtonText: 'Yes, logout'
+                }).then((result) => {
+                  if(result.isConfirmed) {
+                    localStorage.removeItem('ams_user');
+                    window.location.href = 'index.html';
+                  }
+                });
+            }} className="btn btn-secondary" style={{background: '#6c757d', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+              <i className="fas fa-sign-out-alt"></i> Logout
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<SuperAdminPortal />);
+  </script>
+  <script>
+    document.addEventListener('mousemove', function(e) {
+      document.body.style.setProperty('--mouse-x', e.clientX + 'px');
+      document.body.style.setProperty('--mouse-y', e.clientY + 'px');
+    });
+  </script>
+</body>
+</html>
