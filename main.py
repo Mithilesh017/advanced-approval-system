@@ -27,31 +27,74 @@ SUPER_ADMINS = [
 # For prototype purposes, Super Admins use this password (now loaded from env).
 SUPER_ADMIN_PASSWORD = os.getenv('SUPER_ADMIN_PASSWORD', 'superadminpass')
 
+class PostgresWrapper:
+    def __init__(self, conn):
+        self.conn = conn
+        
+    def execute(self, query, params=()):
+        import psycopg2.extras
+        # Convert SQLite ? placeholders to PostgreSQL %s
+        query = query.replace('?', '%s')
+        # PostgreSQL requires single quotes for strings
+        query = query.replace('"Pending"', "'Pending'")
+        
+        cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute(query, params)
+        return cursor
+        
+    def commit(self):
+        self.conn.commit()
+        
+    def close(self):
+        self.conn.close()
+
 def init_db():
-    """Initializes the SQLite database and creates the Users table if it doesn't exist."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT,
-            role TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    if DATABASE_URL:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Users (
+                id SERIAL PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
+                name TEXT,
+                emp_id TEXT,
+                reset_token TEXT,
+                reset_expiry TIMESTAMP,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
 
 # Initialize DB on startup
-if not os.path.exists(DB_FILE):
-    print("Initializing Auth Database...")
-    init_db()
-else:
-    init_db()
+print("Initializing Auth Database...")
+init_db()
 
 def check_and_add_columns():
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    if DATABASE_URL:
+        return # Postgres init handles all columns
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(Users)")
@@ -72,9 +115,15 @@ def check_and_add_columns():
 check_and_add_columns()
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    if DATABASE_URL:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        return PostgresWrapper(conn)
+    else:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 
 # ==========================================

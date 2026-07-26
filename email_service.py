@@ -17,7 +17,7 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
 SMTP_USERNAME = os.getenv('SMTP_USERNAME', '')
 SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '')
 FROM_EMAIL = os.getenv('FROM_EMAIL', SMTP_USERNAME)
-FROM_NAME = os.getenv('FROM_NAME', 'AMS Support')
+FROM_NAME = os.getenv('FROM_NAME', 'AAMS Support')
 
 # Setup Logging
 logger = logging.getLogger('EmailService')
@@ -117,7 +117,7 @@ def _get_base_template(content):
             </div>
             <div style="margin-top: 20px; font-size: 12px; color: #777; text-align: center;">
                 <p>Generated on: {get_ist_time()} (IST)</p>
-                <p>&copy; {datetime.now().year} AMS. All rights reserved.</p>
+                <p>&copy; {datetime.now().year} AAMS. All rights reserved.</p>
             </div>
         </body>
     </html>
