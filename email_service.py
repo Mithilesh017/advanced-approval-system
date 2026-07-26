@@ -64,10 +64,9 @@ def _send_email_task(to_email, subject, html_content):
         return False
 
 def _send_email_async(to_email, subject, html_content):
-    """Sends email in a background thread to prevent blocking the main application."""
-    thread = threading.Thread(target=_send_email_task, args=(to_email, subject, html_content))
-    thread.daemon = True
-    thread.start()
+    """Sends email synchronously to ensure Render/Gunicorn doesn't kill the thread."""
+    logger.info(f"Attempting to send email to {to_email} synchronously...")
+    return _send_email_task(to_email, subject, html_content)
 
 def _get_base_template(content):
     return f"""
