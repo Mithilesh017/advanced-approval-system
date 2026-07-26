@@ -52,10 +52,19 @@ def _send_email_task(to_email, subject, html_content):
         part = MIMEText(html_content, "html")
         msg.attach(part)
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        logger.info(f"Connecting to {SMTP_HOST}:{SMTP_PORT}...")
+        
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=5)
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+            server.quit()
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5)
             server.starttls()
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+            server.quit()
             
         logger.info(f"Email Sent | Recipient: {to_email} | Subject: {subject} | Timestamp: {get_ist_time()} | Status: Success | Delivery Result: OK")
         return True
@@ -64,9 +73,11 @@ def _send_email_task(to_email, subject, html_content):
         return False
 
 def _send_email_async(to_email, subject, html_content):
-    """Sends email synchronously to ensure Render/Gunicorn doesn't kill the thread."""
-    logger.info(f"Attempting to send email to {to_email} synchronously...")
-    return _send_email_task(to_email, subject, html_content)
+    """Sends email in a background thread to prevent blocking the main application."""
+    logger.info(f"Queuing background email to {to_email}...")
+    thread = threading.Thread(target=_send_email_task, args=(to_email, subject, html_content))
+    thread.daemon = False # Make it non-daemon so it finishes sending even if request ends
+    thread.start()
 
 def _get_base_template(content):
     return f"""
