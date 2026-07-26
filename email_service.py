@@ -39,6 +39,32 @@ def get_ist_time():
         return datetime.now().strftime('%I:%M %p, %b %d, %Y')
 
 def _send_email_task(to_email, subject, html_content):
+    SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
+    
+    if SENDGRID_API_KEY:
+        import urllib.request
+        import json
+        logger.info("Connecting to SendGrid HTTP API (Bypassing SMTP Firewall)...")
+        try:
+            url = "https://api.sendgrid.com/v3/mail/send"
+            data = {
+                "personalizations": [{"to": [{"email": to_email}]}],
+                "from": {"email": FROM_EMAIL, "name": FROM_NAME},
+                "subject": subject,
+                "content": [{"type": "text/html", "value": html_content}]
+            }
+            req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={
+                'Authorization': f'Bearer {SENDGRID_API_KEY}',
+                'Content-Type': 'application/json'
+            })
+            urllib.request.urlopen(req)
+            logger.info(f"Email Sent via SendGrid | Recipient: {to_email} | Subject: {subject} | Timestamp: {get_ist_time()} | Status: Success")
+            return True
+        except Exception as e:
+            logger.error(f"SendGrid Error | Recipient: {to_email} | Subject: {subject} | Timestamp: {get_ist_time()} | Status: Error | Result: {str(e)}")
+            return False
+
+    # Fallback to standard SMTP (for Localhost)
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         logger.warning(f"Email Sent (Mock) | Recipient: {to_email} | Subject: {subject} | Timestamp: {get_ist_time()} | Status: Failed | Reason: SMTP credentials missing")
         return False
