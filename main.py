@@ -20,9 +20,10 @@ app = Flask(__name__)
 # Security configuration
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32))
 app.config['JWT_TOKEN_LOCATION'] = ['cookies']
-app.config['JWT_COOKIE_SECURE'] = False # Set to True in production (HTTPS)
-app.config['JWT_COOKIE_CSRF_PROTECT'] = False # For ease of integration with current frontend
-app.config['JWT_ACCESS_COOKIE_PATH'] = '/'
+app.config['JWT_COOKIE_SECURE'] = os.getenv('ENVIRONMENT', 'development') == 'production' # True in production (HTTPS)
+app.config['JWT_COOKIE_CSRF_PROTECT'] = False # Natively mitigated below via SameSite
+app.config['JWT_COOKIE_SAMESITE'] = 'Strict' # Natively mitigate CSRF for same-origin frontends
+app.config['JWT_ACCESS_COOKIE_PATH'] = '/api/'
 
 jwt = JWTManager(app)
 
@@ -33,7 +34,9 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-CORS(app, supports_credentials=True)
+# Lock down CORS to only support specific origins
+allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5000').split(',')
+CORS(app, supports_credentials=True, origins=allowed_origins)
 
 def require_role(role):
     def wrapper(fn):
@@ -56,8 +59,10 @@ DB_FILE = 'auth.db'
 SUPER_ADMINS = [
     'superadmin.main.01@gmail.com'
 ]
-# For prototype purposes, Super Admins use this password (now loaded from env).
-SUPER_ADMIN_PASSWORD = os.getenv('SUPER_ADMIN_PASSWORD', 'superadminpass')
+# Super Admin password MUST be provided in environment variables for security.
+SUPER_ADMIN_PASSWORD = os.getenv('SUPER_ADMIN_PASSWORD')
+if not SUPER_ADMIN_PASSWORD:
+    raise ValueError("CRITICAL SECURITY ERROR: SUPER_ADMIN_PASSWORD environment variable is not set. Refusing to start.")
 
 class PostgresWrapper:
     def __init__(self, conn):
@@ -358,6 +363,7 @@ def login():
 
 
 @app.route('/api/auth/request_access', methods=['POST'])
+@limiter.limit("5 per hour")
 def request_access():
     data = request.json
     email = data.get('email')
