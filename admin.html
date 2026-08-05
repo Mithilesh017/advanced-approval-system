@@ -620,11 +620,20 @@
         try {
           const res = await fetch('/api/auth/users');
           const data = await res.json();
-          // ONLY display 'User' role so standard Admins cannot manage other Admins/Super Admins
-          setAllUsers(data.filter(u => u.role === 'User'));
+          if (Array.isArray(data)) {
+            setAllUsers(data.filter(u => u.role === 'User'));
+          } else {
+            if (res.status === 401 || res.status === 403 || data.msg) {
+               Swal.fire('Session Expired', 'Please log in again to manage users.', 'warning').then(() => { window.location.href = 'index.html'; });
+            } else {
+               Swal.fire('Error', data.error || data.msg || 'Could not fetch users from Auth API', 'error');
+            }
+            setAllUsers([]);
+          }
         } catch (err) {
           console.error(err);
           Swal.fire('Error', 'Could not fetch users from Auth API', 'error');
+          setAllUsers([]);
         } finally {
           setLoading(false);
         }
