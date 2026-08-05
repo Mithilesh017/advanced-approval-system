@@ -9,11 +9,43 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import joblib
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, set_access_cookies, unset_jwt_cookies
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from functools import wraps
 
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+# Security configuration
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32))
+app.config['JWT_TOKEN_LOCATION'] = ['cookies']
+app.config['JWT_COOKIE_SECURE'] = False # Set to True in production (HTTPS)
+app.config['JWT_COOKIE_CSRF_PROTECT'] = False # For ease of integration with current frontend
+app.config['JWT_ACCESS_COOKIE_PATH'] = '/'
+
+jwt = JWTManager(app)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+CORS(app, supports_credentials=True)
+
+def require_role(role):
+    def wrapper(fn):
+        @wraps(fn)
+        @jwt_required()
+        def decorator(*args, **kwargs):
+            current_user = get_jwt_identity()
+            if current_user.get('role') != role and current_user.get('role') != 'SuperAdmin':
+                return jsonify({"error": "Insufficient permissions"}), 403
+            return fn(*args, **kwargs)
+        return decorator
+    return wrapper
 
 # ==========================================
 # 1. AUTHENTICATION & DATABASE CONFIGURATION
@@ -174,6 +206,7 @@ def index():
 # 4. MACHINE LEARNING API ROUTES
 # ==========================================
 @app.route('/api/predict', methods=['POST'])
+@limiter.limit("20 per minute")
 def predict():
     try:
         data = request.json
@@ -265,6 +298,7 @@ def predict():
 # 5. AUTHENTICATION API ROUTES
 # ==========================================
 @app.route('/api/auth/login', methods=['POST'])
+@limiter.limit("5 per minute")
 def login():
     data = request.json
     email = data.get('email')
@@ -275,12 +309,15 @@ def login():
 
     if email in SUPER_ADMINS:
         if password == SUPER_ADMIN_PASSWORD:
-            return jsonify({
+            resp = jsonify({
                 'status': 'SUCCESS',
                 'role': 'SuperAdmin',
                 'message': 'Welcome, Super Admin.',
                 'redirect': 'super_admin.html'
             })
+            access_token = create_access_token(identity={'email': email, 'role': 'SuperAdmin'})
+            set_access_cookies(resp, access_token)
+            return resp
         else:
             return jsonify({'error': 'Invalid Super Admin password'}), 401
 
@@ -305,12 +342,15 @@ def login():
             
         if check_password_hash(user['password_hash'], password):
             redirect_page = 'admin.html' if user['role'] == 'Admin' else 'user.html'
-            return jsonify({
+            resp = jsonify({
                 'status': 'SUCCESS',
                 'role': user['role'],
                 'message': 'Login successful.',
                 'redirect': redirect_page
             })
+            access_token = create_access_token(identity={'email': user['email'], 'role': user['role']})
+            set_access_cookies(resp, access_token)
+            return resp
         else:
             return jsonify({'error': 'Invalid password'}), 401
     
@@ -401,6 +441,7 @@ def setup_password():
     })
 
 @app.route('/api/auth/pending_users', methods=['GET'])
+@require_role('Admin')
 def get_pending_users():
     conn = get_db_connection()
     users = conn.execute('SELECT id, email, role, status, created_at FROM Users WHERE status = "Pending"').fetchall()
@@ -410,6 +451,7 @@ def get_pending_users():
     return jsonify(users_list)
 
 @app.route('/api/auth/users', methods=['GET'])
+@require_role('Admin')
 def get_all_users():
     conn = get_db_connection()
     users = conn.execute('SELECT id, email, name, role, status, created_at FROM Users').fetchall()
@@ -419,6 +461,7 @@ def get_all_users():
     return jsonify(users_list)
 
 @app.route('/api/auth/delete_user', methods=['POST'])
+@require_role('Admin')
 def delete_user():
     data = request.json
     email = data.get('email')
@@ -437,6 +480,7 @@ def delete_user():
         return jsonify({'status': 'ERROR', 'message': f'User {email} not found.'}), 404
 
 @app.route('/api/auth/approve_user', methods=['POST'])
+@require_role('Admin')
 def approve_user():
     data = request.json
     email = data.get('email')
@@ -465,6 +509,7 @@ def approve_user():
     return jsonify({'status': 'SUCCESS', 'message': f'User {email} approved. Awaiting password setup.'})
 
 @app.route('/api/auth/reject_user', methods=['POST'])
+@require_role('Admin')
 def reject_user():
     data = request.json
     email = data.get('email')
@@ -493,6 +538,7 @@ def reject_user():
     return jsonify({'status': 'SUCCESS', 'message': f'User {email} rejected.'})
 
 @app.route('/api/auth/get_profile', methods=['GET'])
+@jwt_required()
 def get_profile():
     email = request.args.get('email')
     if not email:
@@ -507,6 +553,7 @@ def get_profile():
     return jsonify({'error': 'User not found'}), 404
 
 @app.route('/api/auth/update_profile', methods=['POST'])
+@jwt_required()
 def update_profile():
     data = request.json
     email = data.get('email')
@@ -524,6 +571,7 @@ def update_profile():
     return jsonify({'status': 'SUCCESS', 'message': 'Profile updated successfully.'})
 
 @app.route('/api/auth/request_password_reset', methods=['POST'])
+@limiter.limit("3 per hour")
 def request_password_reset():
     data = request.json
     email = data.get('email')
@@ -536,7 +584,8 @@ def request_password_reset():
     
     if not user:
         conn.close()
-        return jsonify({'error': 'User not found'}), 404
+        # Prevent user enumeration
+        return jsonify({'status': 'SUCCESS', 'message': 'If the email exists, a password reset request has been generated.'}), 200
         
     token = secrets.token_urlsafe(32)
     expiry = (datetime.utcnow() + timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
@@ -552,7 +601,7 @@ def request_password_reset():
     
     email_service.sendPasswordResetEmail(email, reset_link, reject_link)
     
-    return jsonify({'status': 'SUCCESS', 'message': 'Password reset request generated and email sent.'})
+    return jsonify({'status': 'SUCCESS', 'message': 'If the email exists, a password reset request has been generated.'})
 
 @app.route('/api/auth/reset_password', methods=['POST'])
 def reset_password():
@@ -596,6 +645,13 @@ def reject_reset():
     conn.close()
     
     return "<h3>Password Reset Request Cancelled</h3><p>Your password reset request has been safely invalidated. You can now close this tab.</p>", 200
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    resp = jsonify({'status': 'SUCCESS', 'message': 'Logged out successfully.'})
+    unset_jwt_cookies(resp)
+    return resp
 
 
 if __name__ == '__main__':
