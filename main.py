@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import joblib
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, set_access_cookies, unset_jwt_cookies
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, set_access_cookies, unset_jwt_cookies, get_jwt
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
@@ -49,13 +49,20 @@ def log_request_cookies():
         print(f"[DEBUG Cookie Check] Cookies parsed: {list(request.cookies.keys())}")
         print(f"[DEBUG Cookie Check] Cookie Header: {request.headers.get('Cookie', 'None')}")
 
+@app.after_request
+def log_response_errors(response):
+    if request.path.startswith('/api/auth') and response.status_code >= 400:
+        print(f"[DEBUG Auth Error] Status: {response.status_code}")
+        print(f"[DEBUG Auth Error] Payload: {response.get_data(as_text=True)}")
+    return response
+
 def require_role(role):
     def wrapper(fn):
         @wraps(fn)
         @jwt_required()
         def decorator(*args, **kwargs):
-            current_user = get_jwt_identity()
-            if current_user.get('role') != role and current_user.get('role') != 'SuperAdmin':
+            claims = get_jwt()
+            if claims.get('role') != role and claims.get('role') != 'SuperAdmin':
                 return jsonify({"error": "Insufficient permissions"}), 403
             return fn(*args, **kwargs)
         return decorator
@@ -331,7 +338,7 @@ def login():
                 'message': 'Welcome, Super Admin.',
                 'redirect': 'super_admin.html'
             })
-            access_token = create_access_token(identity={'email': email, 'role': 'SuperAdmin'})
+            access_token = create_access_token(identity=str(email), additional_claims={'role': 'SuperAdmin'})
             set_access_cookies(resp, access_token)
             return resp
         else:
@@ -364,7 +371,7 @@ def login():
                 'message': 'Login successful.',
                 'redirect': redirect_page
             })
-            access_token = create_access_token(identity={'email': user['email'], 'role': user['role']})
+            access_token = create_access_token(identity=str(user['email']), additional_claims={'role': user['role']})
             set_access_cookies(resp, access_token)
             return resp
         else:
