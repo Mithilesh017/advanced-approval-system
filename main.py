@@ -42,6 +42,13 @@ limiter = Limiter(
 allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5000').split(',')
 CORS(app, supports_credentials=True, origins=allowed_origins)
 
+@app.before_request
+def log_request_cookies():
+    if request.path.startswith('/api/auth'):
+        print(f"[DEBUG Cookie Check] Path: {request.path}")
+        print(f"[DEBUG Cookie Check] Cookies parsed: {list(request.cookies.keys())}")
+        print(f"[DEBUG Cookie Check] Cookie Header: {request.headers.get('Cookie', 'None')}")
+
 def require_role(role):
     def wrapper(fn):
         @wraps(fn)
@@ -469,6 +476,13 @@ def get_all_users():
     
     users_list = [dict(u) for u in users]
     return jsonify(users_list)
+@app.route('/api/auth/debug_cookie', methods=['GET'])
+def debug_cookie():
+    return jsonify({
+        "cookies_received": list(request.cookies.keys()),
+        "cookie_header": request.headers.get('Cookie', 'None'),
+        "jwt_config_name": app.config.get('JWT_ACCESS_COOKIE_NAME')
+    })
 
 @app.route('/api/auth/delete_user', methods=['POST'])
 @require_role('Admin')
