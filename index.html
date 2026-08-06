@@ -214,7 +214,8 @@
         const response = await fetch(`${AUTH_API}/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: email, password: pass })
+          body: JSON.stringify({ email: email, password: pass }),
+          credentials: 'include'
         });
         
         const data = await response.json();

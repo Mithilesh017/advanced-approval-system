@@ -619,7 +619,7 @@
 
       const fetchUsers = async () => {
         try {
-          const res = await fetch('/api/auth/users');
+          const res = await fetch('/api/auth/users', { credentials: 'include' });
           const data = await res.json();
           if (Array.isArray(data)) {
             setAllUsers(data);
@@ -649,7 +649,8 @@
           const res = await fetch('/api/auth/approve_user', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email })
+            body: JSON.stringify({ email: email }),
+            credentials: 'include'
           });
           const data = await res.json();
           if (res.ok) {
@@ -669,7 +670,8 @@
           const res = await fetch('/api/auth/reject_user', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email })
+            body: JSON.stringify({ email: email }),
+            credentials: 'include'
           });
           const data = await res.json();
           if (res.ok) {
@@ -698,7 +700,8 @@
               const res = await fetch('/api/auth/delete_user', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: email })
+                body: JSON.stringify({ email: email }),
+                credentials: 'include'
               });
               const data = await res.json();
               if (res.ok) {
@@ -906,7 +909,7 @@
       const [profileData, setProfileData] = useState({ name: '', emp_id: '' });
 
       useEffect(() => {
-        fetch(`/api/auth/get_profile?email=${user.email}`)
+        fetch(`/api/auth/get_profile?email=${user.email}`, { credentials: 'include' })
           .then(res => res.json())
           .then(data => {
             if(!data.error) {
@@ -924,7 +927,8 @@
           const res = await fetch('/api/auth/update_profile', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id })
+            body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id }),
+            credentials: 'include'
           });
           const data = await res.json();
           if(res.ok) {

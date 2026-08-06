@@ -374,7 +374,7 @@
       const [profileData, setProfileData] = useState({ name: '', emp_id: '' });
 
       useEffect(() => {
-        fetch(`/api/auth/get_profile?email=${user.email}`)
+        fetch(`/api/auth/get_profile?email=${user.email}`, { credentials: 'include' })
           .then(res => res.json())
           .then(data => {
             if(!data.error) {
@@ -392,7 +392,8 @@
           const res = await fetch('/api/auth/update_profile', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id })
+            body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id }),
+            credentials: 'include'
           });
           const data = await res.json();
           if(res.ok) {

@@ -20,10 +20,10 @@ app = Flask(__name__)
 # Security configuration
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32))
 app.config['JWT_TOKEN_LOCATION'] = ['cookies']
-app.config['JWT_COOKIE_SECURE'] = os.getenv('ENVIRONMENT', 'development') == 'production' # True in production (HTTPS)
-app.config['JWT_COOKIE_CSRF_PROTECT'] = False # Natively mitigated below via SameSite
-app.config['JWT_COOKIE_SAMESITE'] = 'Strict' # Natively mitigate CSRF for same-origin frontends
-app.config['JWT_ACCESS_COOKIE_PATH'] = '/api/'
+app.config['JWT_COOKIE_SECURE'] = os.getenv('RENDER', '') != '' or os.getenv('ENVIRONMENT', '') == 'production'  # Auto-detect Render (HTTPS) or explicit production
+app.config['JWT_COOKIE_CSRF_PROTECT'] = False  # Mitigated via SameSite
+app.config['JWT_COOKIE_SAMESITE'] = 'Lax'  # Lax allows same-origin fetch + top-level navigations
+app.config['JWT_ACCESS_COOKIE_PATH'] = '/'  # Scoped to all routes for reliable cookie delivery
 
 jwt = JWTManager(app)
 
