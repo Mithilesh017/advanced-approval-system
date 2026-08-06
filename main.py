@@ -23,12 +23,13 @@ app.config['JWT_TOKEN_LOCATION'] = ['cookies']
 app.config['JWT_COOKIE_SECURE'] = os.getenv('RENDER', '') != '' or os.getenv('ENVIRONMENT', '') == 'production'  # Auto-detect Render (HTTPS) or explicit production
 app.config['JWT_COOKIE_CSRF_PROTECT'] = False  # Mitigated via SameSite
 app.config['JWT_COOKIE_SAMESITE'] = 'Lax'  # Lax allows same-origin fetch + top-level navigations
-app.config['JWT_ACCESS_COOKIE_PATH'] = '/api/'  # Scoped to API routes
+app.config['JWT_ACCESS_COOKIE_PATH'] = '/'  # Scoped to all routes for reliable cookie delivery
+app.config['JWT_ACCESS_COOKIE_NAME'] = 'ams_access_token' # Changed name to bypass stale cookies
 
 jwt = JWTManager(app)
 
 # Startup diagnostic — visible in Render logs
-print(f"[JWT Config] Secure={app.config['JWT_COOKIE_SECURE']}, SameSite={app.config['JWT_COOKIE_SAMESITE']}, Path={app.config['JWT_ACCESS_COOKIE_PATH']}, RENDER_ENV={os.getenv('RENDER', 'NOT_SET')}")
+print(f"[JWT Config] Secure={app.config['JWT_COOKIE_SECURE']}, SameSite={app.config['JWT_COOKIE_SAMESITE']}, Path={app.config['JWT_ACCESS_COOKIE_PATH']}, Name={app.config['JWT_ACCESS_COOKIE_NAME']}, RENDER_ENV={os.getenv('RENDER', 'NOT_SET')}")
 
 limiter = Limiter(
     get_remote_address,
@@ -325,8 +326,6 @@ def login():
             })
             access_token = create_access_token(identity={'email': email, 'role': 'SuperAdmin'})
             set_access_cookies(resp, access_token)
-            # Clear any stale cookies from previous path configurations
-            resp.delete_cookie('access_token_cookie', path='/')
             return resp
         else:
             return jsonify({'error': 'Invalid Super Admin password'}), 401
@@ -360,8 +359,6 @@ def login():
             })
             access_token = create_access_token(identity={'email': user['email'], 'role': user['role']})
             set_access_cookies(resp, access_token)
-            # Clear any stale cookies from previous path configurations
-            resp.delete_cookie('access_token_cookie', path='/')
             return resp
         else:
             return jsonify({'error': 'Invalid password'}), 401
