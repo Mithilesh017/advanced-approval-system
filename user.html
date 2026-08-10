@@ -34,17 +34,36 @@
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'user@gmail.com'});
       const [userRequests, setUserRequests] = useState([]);
 
-      const loadData = () => {
-        const saved = JSON.parse(localStorage.getItem('ams_requests') || '[]');
-        // Filter requests to only show ones created by this user (or legacy ones without an email for testing)
-        const myRequests = saved.filter(r => r.email === user.email || !r.email);
-        setUserRequests(myRequests);
+      const loadData = async () => {
+        try {
+          const res = await fetch('/api/auth/my_requests', { credentials: 'include' });
+          if (res.ok) {
+            const data = await res.json();
+            
+            // Map DB fields back to UI fields
+            const myRequests = data.map(r => ({
+              id: r.id,
+              reqId: `REQ_${r.id.toString().padStart(4, '0')}`,
+              date: new Date(r.created_at).toISOString().split('T')[0],
+              amount: r.amount,
+              status: r.final_decision.startsWith('ESCALATED') ? 'Pending' : (r.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'),
+              category: r.request_type,
+              role: r.role,
+              department: r.department,
+              destination: r.destination,
+              currency: r.currency,
+              email: r.submitted_by,
+              raw_status: r.final_decision
+            }));
+            setUserRequests(myRequests);
+          }
+        } catch (e) {
+          console.error("Failed to load requests", e);
+        }
       };
 
       useEffect(() => {
         loadData();
-        const interval = setInterval(loadData, 2000);
-        return () => clearInterval(interval);
       }, []);
 
       const pendingCount = userRequests.filter(r => r.status === 'Pending').length;
@@ -269,27 +288,21 @@
         try {
           const response = await fetch('/api/predict', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            credentials: 'include'
           });
           const result = await response.json();
           if (response.ok) {
-            const reqId = `REQ_${Math.floor(Math.random() * 10000)}`;
-            const saved = JSON.parse(localStorage.getItem('ams_requests') || '[]');
-            
             if (result.status === "APPROVED") {
               // Auto-approved by AI
-              const newReq = { ...formData, email: user.email, id: reqId, reason: result.message, status: 'Approved', shap: result.shap_explanations, confidence: result.confidence };
-              localStorage.setItem('ams_requests', JSON.stringify([newReq, ...saved]));
               Swal.fire({ icon: 'success', title: 'Auto-Approved!', text: 'Your request was approved instantly by the AI.' }).then(() => {
-                  refresh();
+                  loadData();
                   setView('approved');
               });
             } else {
               // Escalated for review
-              const newReq = { ...formData, email: user.email, id: reqId, reason: result.message, status: 'Pending', shap: result.shap_explanations, confidence: result.confidence };
-              localStorage.setItem('ams_requests', JSON.stringify([newReq, ...saved]));
               Swal.fire({ icon: 'warning', title: 'Sent for Manual Review', text: 'This request requires HR approval.' }).then(() => {
-                  refresh();
+                  loadData();
                   setView('pending');
               });
             }

@@ -295,7 +295,7 @@
 
         if (response.ok) {
           // Immediately log them in
-          localStorage.setItem('ams_user', JSON.stringify({ email: currentSetupEmail, role: data.redirect.includes('admin') ? 'Admin' : 'User', name: currentSetupEmail.split('@')[0] }));
+          localStorage.setItem('ams_user', JSON.stringify({ email: currentSetupEmail, role: data.role, name: currentSetupEmail.split('@')[0] }));
           Swal.fire({ icon: 'success', title: 'Account Activated', text: data.message, timer: 1500, showConfirmButton: false }).then(() => {
             window.location.href = data.redirect;
           });

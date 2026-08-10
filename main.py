@@ -73,14 +73,24 @@ def require_role(role):
 # ==========================================
 DB_FILE = 'auth.db'
 
-# To add a new super admin in the future, simply append their email to this list.
-SUPER_ADMINS = [
-    'superadmin.main.01@gmail.com'
-]
-# Super Admin password MUST be provided in environment variables for security.
-SUPER_ADMIN_PASSWORD = os.getenv('SUPER_ADMIN_PASSWORD')
-if not SUPER_ADMIN_PASSWORD:
-    raise ValueError("CRITICAL SECURITY ERROR: SUPER_ADMIN_PASSWORD environment variable is not set. Refusing to start.")
+# Initialize Super Admin via environment variables if provided
+def bootstrap_super_admin():
+    sa_email = os.getenv('INITIAL_SUPER_ADMIN_EMAIL', 'superadmin.main.01@gmail.com')
+    sa_password = os.getenv('INITIAL_SUPER_ADMIN_PASSWORD', os.getenv('SUPER_ADMIN_PASSWORD'))
+    
+    if not sa_email or not sa_password:
+        return
+        
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM Users WHERE email = ?', (sa_email,)).fetchone()
+    if not user:
+        from werkzeug.security import generate_password_hash
+        conn.execute(
+            'INSERT INTO Users (email, password_hash, role, status) VALUES (?, ?, ?, ?)',
+            (sa_email, generate_password_hash(sa_password), 'SuperAdmin', 'Active')
+        )
+        conn.commit()
+    conn.close()
 
 class PostgresWrapper:
     def __init__(self, conn):
@@ -121,6 +131,24 @@ def init_db():
                 role TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Requests (
+                id SERIAL PRIMARY KEY,
+                role TEXT,
+                department TEXT,
+                request_type TEXT,
+                destination TEXT,
+                amount NUMERIC,
+                currency TEXT,
+                normalized_amount NUMERIC,
+                xgb_score NUMERIC,
+                iso_score NUMERIC,
+                svm_score NUMERIC,
+                risk_score NUMERIC,
+                final_decision TEXT,
+                submitted_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
@@ -136,6 +164,24 @@ def init_db():
                 role TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT,
+                department TEXT,
+                request_type TEXT,
+                destination TEXT,
+                amount REAL,
+                currency TEXT,
+                normalized_amount REAL,
+                xgb_score REAL,
+                iso_score REAL,
+                svm_score REAL,
+                risk_score REAL,
+                final_decision TEXT,
+                submitted_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
@@ -144,6 +190,7 @@ def init_db():
 # Initialize DB on startup
 print("Initializing Auth Database...")
 init_db()
+bootstrap_super_admin()
 
 def check_and_add_columns():
     DATABASE_URL = os.getenv('DATABASE_URL')
@@ -230,8 +277,10 @@ def index():
 # ==========================================
 @app.route('/api/predict', methods=['POST'])
 @limiter.limit("20 per minute")
+@jwt_required()
 def predict():
     try:
+        current_email = get_jwt_identity()
         data = request.json
         
         # Extract inputs
@@ -241,6 +290,17 @@ def predict():
         destination = data.get('Destination')
         amount = data.get('Amount')
         currency = data.get('Currency')
+
+        required_fields = ['Role', 'Department', 'Request_Type', 'Destination', 'Currency']
+        if not all(data.get(f) for f in required_fields):
+            return jsonify({'error': f'Missing required fields.'}), 400
+            
+        try:
+            amount = float(amount)
+            if amount <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Amount must be a positive number.'}), 400
 
         # Normalize Amount to INR
         rate = exchange_rates.get(currency, 1.0)
@@ -301,6 +361,21 @@ def predict():
             status = "ESCALATED_MANUAL_REVIEW"
             message = "Marginal confidence score. Sent to HR for manual review (Grey Area)."
 
+        # Persist to DB
+        conn = get_db_connection()
+        conn.execute(
+            '''INSERT INTO Requests (
+                role, department, request_type, destination, amount, currency, 
+                normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
+                final_decision, submitted_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (role, department, req_type, destination, amount, currency, 
+             normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100, 
+             status, current_email)
+        )
+        conn.commit()
+        conn.close()
+
         return jsonify({
             'status': status,
             'message': message,
@@ -330,20 +405,6 @@ def login():
     if not email:
         return jsonify({'error': 'Email is required'}), 400
 
-    if email in SUPER_ADMINS:
-        if password == SUPER_ADMIN_PASSWORD:
-            resp = jsonify({
-                'status': 'SUCCESS',
-                'role': 'SuperAdmin',
-                'message': 'Welcome, Super Admin.',
-                'redirect': 'super_admin.html'
-            })
-            access_token = create_access_token(identity=str(email), additional_claims={'role': 'SuperAdmin'})
-            set_access_cookies(resp, access_token)
-            return resp
-        else:
-            return jsonify({'error': 'Invalid Super Admin password'}), 401
-
     conn = get_db_connection()
     user = conn.execute('SELECT * FROM Users WHERE email = ?', (email,)).fetchone()
     conn.close()
@@ -364,7 +425,7 @@ def login():
             return jsonify({'error': 'Password required.'}), 400
             
         if check_password_hash(user['password_hash'], password):
-            redirect_page = 'admin.html' if user['role'] == 'Admin' else 'user.html'
+            redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
             resp = jsonify({
                 'status': 'SUCCESS',
                 'role': user['role'],
@@ -393,10 +454,11 @@ def request_access():
     if role not in ['User', 'Admin']:
         return jsonify({'error': 'Invalid role requested.'}), 400
 
-    if email in SUPER_ADMINS:
-        return jsonify({'error': 'This email is reserved for Super Admins.'}), 400
-
     conn = get_db_connection()
+    existing_user = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
+    if existing_user and existing_user['role'] == 'SuperAdmin':
+        conn.close()
+        return jsonify({'error': 'This email is reserved for Super Admins.'}), 400
     try:
         conn.execute(
             'INSERT INTO Users (email, role, status) VALUES (?, ?, ?)',
@@ -409,15 +471,17 @@ def request_access():
         conn.close()
 
     if role == 'Admin':
-        for sa_email in SUPER_ADMINS:
-            email_service.sendAdminRegistrationNotification(sa_email, email)
+        conn = get_db_connection()
+        super_admins = conn.execute("SELECT email FROM Users WHERE role = 'SuperAdmin' AND status = 'Active'").fetchall()
+        conn.close()
+        for sa in super_admins:
+            email_service.sendAdminRegistrationNotification(sa['email'], email)
     else:
         conn = get_db_connection()
-        active_admins = conn.execute("SELECT email FROM Users WHERE role = 'Admin' AND status = 'Active'").fetchall()
+        active_admins = conn.execute("SELECT email FROM Users WHERE role IN ('Admin', 'SuperAdmin') AND status = 'Active'").fetchall()
         conn.close()
         
-        admin_emails = [a['email'] for a in active_admins]
-        all_notifiers = list(set(SUPER_ADMINS + admin_emails))
+        all_notifiers = [a['email'] for a in active_admins]
         
         for notify_email in all_notifiers:
             email_service.sendUserRegistrationNotification(notify_email, email, role)
@@ -457,11 +521,12 @@ def setup_password():
     name = email.split('@')[0]
     email_service.sendWelcomeEmail(email, name)
 
-    redirect_page = 'admin.html' if user['role'] == 'Admin' else 'user.html'
+    redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
     return jsonify({
         'status': 'SUCCESS', 
         'message': 'Password set successfully. Account is now active.',
-        'redirect': redirect_page
+        'redirect': redirect_page,
+        'role': user['role']
     })
 
 @app.route('/api/auth/pending_users', methods=['GET'])
@@ -600,6 +665,65 @@ def update_profile():
     conn.close()
     
     return jsonify({'status': 'SUCCESS', 'message': 'Profile updated successfully.'})
+
+@app.route('/api/auth/my_requests', methods=['GET'])
+@jwt_required()
+def my_requests():
+    current_email = get_jwt_identity()
+    conn = get_db_connection()
+    requests = conn.execute('SELECT * FROM Requests WHERE submitted_by = ? ORDER BY created_at DESC', (current_email,)).fetchall()
+    conn.close()
+    
+    requests_list = [dict(r) for r in requests]
+    return jsonify(requests_list)
+
+@app.route('/api/auth/pending_approval_requests', methods=['GET'])
+@require_role('Admin')
+def pending_approval_requests():
+    conn = get_db_connection()
+    requests = conn.execute("SELECT * FROM Requests WHERE final_decision LIKE 'ESCALATED%' ORDER BY created_at DESC").fetchall()
+    conn.close()
+    
+    requests_list = [dict(r) for r in requests]
+    return jsonify(requests_list)
+
+@app.route('/api/auth/all_requests', methods=['GET'])
+@require_role('Admin')
+def all_requests():
+    conn = get_db_connection()
+    requests = conn.execute("SELECT * FROM Requests ORDER BY created_at DESC").fetchall()
+    conn.close()
+    
+    requests_list = [dict(r) for r in requests]
+    return jsonify(requests_list)
+
+@app.route('/api/auth/approve_request', methods=['POST'])
+@require_role('Admin')
+def approve_request():
+    data = request.json
+    req_id = data.get('id')
+    if not req_id:
+        return jsonify({'error': 'Request ID is required'}), 400
+        
+    conn = get_db_connection()
+    conn.execute("UPDATE Requests SET final_decision = 'APPROVED' WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/reject_request', methods=['POST'])
+@require_role('Admin')
+def reject_request():
+    data = request.json
+    req_id = data.get('id')
+    if not req_id:
+        return jsonify({'error': 'Request ID is required'}), 400
+        
+    conn = get_db_connection()
+    conn.execute("UPDATE Requests SET final_decision = 'REJECTED' WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'SUCCESS'})
 
 @app.route('/api/auth/request_password_reset', methods=['POST'])
 @limiter.limit("3 per hour")

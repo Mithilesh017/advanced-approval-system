@@ -35,36 +35,36 @@
       const [allRequests, setAllRequests] = useState([]);
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'admin@gmail.com'});
 
-      const loadData = () => {
-        // Fallback to old format for compatibility if new format is empty
-        const oldPending = JSON.parse(localStorage.getItem('hr_pending_queue') || '[]');
-        let saved = JSON.parse(localStorage.getItem('ams_requests') || '[]');
-        
-        // Migrate old pending to new system just in case
-        if (oldPending.length > 0 && saved.length === 0) {
-            saved = oldPending.map(req => ({...req, status: 'Pending'}));
-            localStorage.setItem('ams_requests', JSON.stringify(saved));
-            localStorage.removeItem('hr_pending_queue');
+      const loadData = async () => {
+        try {
+          const res = await fetch('/api/auth/all_requests', { credentials: 'include' });
+          if (res.ok) {
+            const data = await res.json();
+            
+            const myRequests = data.map(r => ({
+              id: r.id,
+              reqId: `REQ_${r.id.toString().padStart(4, '0')}`,
+              date: new Date(r.created_at).toISOString().split('T')[0],
+              amount: r.amount,
+              status: r.final_decision.startsWith('ESCALATED') ? 'Pending' : (r.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'),
+              category: r.request_type,
+              role: r.role,
+              department: r.department,
+              destination: r.destination,
+              currency: r.currency,
+              email: r.submitted_by,
+              raw_status: r.final_decision,
+              aiScore: (r.xgb_score * 100).toFixed(1) + '%'
+            }));
+            setAllRequests(myRequests);
+          }
+        } catch (e) {
+          console.error("Failed to load requests", e);
         }
-
-        // Generate dummy data if totally empty for the sake of the charts displaying beautifully
-        if (saved.length === 0) {
-            saved = [
-                {id: 'REQ_111', role: 'Senior Engineer', department: 'Engineering', reqType: 'Hotel Booking', destination: 'Mumbai', currency: 'INR', amount: 8000, aiScore: 'N/A', status: 'Approved'},
-                {id: 'REQ_112', role: 'Junior Developer', department: 'Engineering', reqType: 'Flight Ticket', destination: 'Delhi', currency: 'INR', amount: 12000, aiScore: '0.89', status: 'Pending'},
-                {id: 'REQ_113', role: 'Executive', department: 'Sales', reqType: 'Software License', destination: 'Online', currency: 'USD', amount: 500, aiScore: 'N/A', status: 'Approved'},
-                {id: 'REQ_114', role: 'Junior Developer', department: 'Marketing', reqType: 'Hotel Booking', destination: 'Goa', currency: 'INR', amount: 45000, aiScore: '-1.45', status: 'Rejected'}
-            ];
-            localStorage.setItem('ams_requests', JSON.stringify(saved));
-        }
-
-        setAllRequests(saved);
       };
 
       useEffect(() => {
         loadData();
-        const interval = setInterval(loadData, 2000);
-        return () => clearInterval(interval);
       }, []);
 
       const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
@@ -128,14 +128,18 @@
                   <span className="count secondary">{rejectedCount}</span>
                 </button>
               </li>
-              <li>
-                <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
-                  <i className="fas fa-brain"></i> ML Agent
-                </button>
-              </li>
-              <li>
-                <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
-              </li>
+              {user.role === 'SuperAdmin' && (
+                <>
+                  <li>
+                    <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
+                      <i className="fas fa-brain"></i> ML Agent
+                    </button>
+                  </li>
+                  <li>
+                    <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
+                  </li>
+                </>
+              )}
               <li>
                 <button onClick={() => Swal.fire('About', 'Approval Management System Version 2.0', 'info')}><i className="fas fa-info-circle"></i> About App</button>
               </li>
@@ -173,8 +177,8 @@
                     refresh={loadData} 
                 />
             }
-            {view === 'mlops' && <MlopsView />}
-            {view === 'users' && <UsersView />}
+            {user.role === 'SuperAdmin' && view === 'mlops' && <MlopsView />}
+            {user.role === 'SuperAdmin' && view === 'users' && <UsersView />}
             {view === 'profile' && <ProfileView user={user} />}
           </div>
         </div>
@@ -356,12 +360,26 @@
         };
       }, [tableKey]); // Re-run only when the tableKey changes (full remount)
 
-      const handleAction = (id, newStatus) => {
-        let q = JSON.parse(localStorage.getItem('ams_requests') || '[]');
-        q = q.map(r => r.id === id ? { ...r, status: newStatus } : r);
-        localStorage.setItem('ams_requests', JSON.stringify(q));
-        refresh();
-        Swal.fire({ icon: 'success', title: `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+      const handleAction = async (id, newStatus) => {
+        let endpoint = '';
+        if (newStatus === 'Approved') endpoint = '/api/auth/approve_request';
+        else if (newStatus === 'Rejected') endpoint = '/api/auth/reject_request';
+        else return; // Moving back to pending not supported in this version
+
+        try {
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id }),
+            credentials: 'include'
+          });
+          if (res.ok) {
+            refresh();
+            Swal.fire({ icon: 'success', title: `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+          }
+        } catch (e) {
+          Swal.fire({ icon: 'error', title: 'API Error', text: 'Failed to update request.' });
+        }
       };
 
       const handleClearHistory = () => {
