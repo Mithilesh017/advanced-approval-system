@@ -177,7 +177,7 @@
                 />
             }
             {user.role === 'SuperAdmin' && view === 'mlops' && <MlopsView />}
-            {view === 'users' && <UsersView />}
+            {view === 'users' && <UsersView userRole={user.role} />}
             {view === 'profile' && <ProfileView user={user} />}
           </div>
         </div>
@@ -628,7 +628,7 @@
       );
     }
 
-    function UsersView() {
+    function UsersView({ userRole }) {
       const [allUsers, setAllUsers] = useState([]);
       const [loading, setLoading] = useState(true);
 
@@ -637,7 +637,11 @@
           const res = await fetch('/api/auth/users', { credentials: 'include' });
           const data = await res.json();
           if (Array.isArray(data)) {
-            setAllUsers(data);
+            let filteredData = data;
+            if (userRole === 'Admin') {
+              filteredData = data.filter(u => u.role !== 'SuperAdmin');
+            }
+            setAllUsers(filteredData);
           } else {
             if (res.status === 401 || res.status === 403 || data.msg) {
                Swal.fire('Session Expired', 'Please log in again to manage users.', 'warning').then(() => { window.location.href = 'index.html'; });
@@ -815,9 +819,11 @@
                             <span style={{color: u.status === 'Active' ? '#28a745' : u.status === 'Rejected' ? '#dc3545' : '#ffc107'}}>{u.status}</span>
                           </td>
                           <td style={{padding: '12px 10px'}}>
-                            <button onClick={() => handleDelete(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
-                              <i className="fas fa-trash-alt"></i> Remove
-                            </button>
+                            {(userRole === 'SuperAdmin' || (userRole === 'Admin' && u.role === 'User')) && (
+                              <button onClick={() => handleDelete(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
+                                <i className="fas fa-trash-alt"></i> Remove
+                              </button>
+                            )}
                           </td>
                         </tr>
                       ))}
