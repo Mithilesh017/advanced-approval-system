@@ -192,7 +192,6 @@ def init_db():
 # Initialize DB on startup
 print("Initializing Auth Database...")
 init_db()
-bootstrap_super_admin()
 
 def check_and_add_columns():
     DATABASE_URL = os.getenv('DATABASE_URL')
@@ -228,6 +227,8 @@ def get_db_connection():
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         return conn
+
+bootstrap_super_admin()
 
 
 # ==========================================
