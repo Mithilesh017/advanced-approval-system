@@ -169,6 +169,7 @@
                 requests={allRequests} 
                 userEmail={user.email.split('@')[0]} 
                 setView={setView} 
+                userRole={user.role}
             />}
             {(view === 'pending' || view === 'approved' || view === 'rejected') && 
                 <TableView 
@@ -185,7 +186,7 @@
       );
     }
 
-    function DashboardView({ requests, userEmail, setView }) {
+    function DashboardView({ requests, userEmail, setView, userRole }) {
       const pieRef = useRef(null);
       const barRef = useRef(null);
 
@@ -264,7 +265,9 @@
             <div className="qa-card qa-new" onClick={() => Swal.fire('Info', 'As an admin, you can view requests. Employees submit new requests from their portal.', 'info')}><i className="fas fa-plus-circle"></i> New Request</div>
             <div className="qa-card qa-pending" onClick={() => setView('pending')}><i className="fas fa-clock"></i> View Pending ({pending})</div>
             <div className="qa-card qa-approved" onClick={() => setView('approved')}><i className="fas fa-check-circle"></i> View Approved ({approved})</div>
-            <div className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</div>
+            {userRole === 'SuperAdmin' && (
+              <div className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</div>
+            )}
           </div>
 
           <div className="stats-grid-4">
@@ -408,29 +411,6 @@
 
       return (
         <div>
-          <div className="stats-grid-3">
-            <div className="stat-card yellow">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-clock"></i></div>
-              <div style={{float:'left'}}>
-                <div className="stat-value">{requests.filter(r=>r.status==='Pending').length}</div>
-                <div className="stat-label">Total Pending</div>
-              </div>
-            </div>
-            <div className="stat-card green">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-check-circle"></i></div>
-              <div style={{float:'left'}}>
-                <div className="stat-value">{requests.filter(r=>r.status==='Approved').length}</div>
-                <div className="stat-label">Approved Requests</div>
-              </div>
-            </div>
-            <div className="stat-card red">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-times-circle"></i></div>
-              <div style={{float:'left'}}>
-                <div className="stat-value">{requests.filter(r=>r.status==='Rejected').length}</div>
-                <div className="stat-label">Disapproved Requests</div>
-              </div>
-            </div>
-          </div>
 
           <div className="table-card">
             <div className="filters-row">
@@ -769,7 +749,7 @@
                             <span className="badge" style={{background: '#6c757d', color: 'white', display: 'inline-block', padding: '4px 8px', borderRadius: '4px', fontSize: '11px'}}>{u.role}</span>
                           </td>
                           <td style={{padding: '12px 10px', color: '#666', fontSize: '13px'}}>
-                            {new Date(u.created_at + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                            {new Date(u.created_at.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                           </td>
                           <td style={{padding: '12px 10px', display: 'flex', gap: '10px'}}>
                             <button onClick={() => handleApprove(u.email)} className="btn btn-primary" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px'}}>
