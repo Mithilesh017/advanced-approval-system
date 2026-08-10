@@ -129,17 +129,15 @@
                 </button>
               </li>
               {user.role === 'SuperAdmin' && (
-                <>
-                  <li>
-                    <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
-                      <i className="fas fa-brain"></i> ML Agent
-                    </button>
-                  </li>
-                  <li>
-                    <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
-                  </li>
-                </>
+                <li>
+                  <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
+                    <i className="fas fa-brain"></i> ML Agent
+                  </button>
+                </li>
               )}
+              <li>
+                <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
+              </li>
               <li>
                 <button onClick={() => Swal.fire('About', 'Approval Management System Version 2.0', 'info')}><i className="fas fa-info-circle"></i> About App</button>
               </li>
@@ -179,7 +177,7 @@
                 />
             }
             {user.role === 'SuperAdmin' && view === 'mlops' && <MlopsView />}
-            {user.role === 'SuperAdmin' && view === 'users' && <UsersView />}
+            {view === 'users' && <UsersView />}
             {view === 'profile' && <ProfileView user={user} />}
           </div>
         </div>
@@ -265,9 +263,7 @@
             <div className="qa-card qa-new" onClick={() => Swal.fire('Info', 'As an admin, you can view requests. Employees submit new requests from their portal.', 'info')}><i className="fas fa-plus-circle"></i> New Request</div>
             <div className="qa-card qa-pending" onClick={() => setView('pending')}><i className="fas fa-clock"></i> View Pending ({pending})</div>
             <div className="qa-card qa-approved" onClick={() => setView('approved')}><i className="fas fa-check-circle"></i> View Approved ({approved})</div>
-            {userRole === 'SuperAdmin' && (
-              <div className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</div>
-            )}
+            <div className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</div>
           </div>
 
           <div className="stats-grid-4">
@@ -411,7 +407,29 @@
 
       return (
         <div>
-
+          <div className="stats-grid-3">
+            <div className="stat-card yellow">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-clock"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{requests.filter(r=>r.status==='Pending').length}</div>
+                <div className="stat-label">Total Pending</div>
+              </div>
+            </div>
+            <div className="stat-card green">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-check-circle"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{requests.filter(r=>r.status==='Approved').length}</div>
+                <div className="stat-label">Approved Requests</div>
+              </div>
+            </div>
+            <div className="stat-card red">
+              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-times-circle"></i></div>
+              <div style={{float:'left'}}>
+                <div className="stat-value">{requests.filter(r=>r.status==='Rejected').length}</div>
+                <div className="stat-label">Disapproved Requests</div>
+              </div>
+            </div>
+          </div>
           <div className="table-card">
             <div className="filters-row">
               <div className="form-group">
