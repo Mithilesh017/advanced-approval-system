@@ -100,7 +100,7 @@
                 {user.email.charAt(0).toUpperCase()}
               </div>
               <div className="email">{user.email}</div>
-              <span className="badge">Admin</span>
+              <span className="badge">{user.role === 'SuperAdmin' ? 'Super Admin' : 'Admin'}</span>
             </div>
 
             <div className="nav-label">Navigation</div>
@@ -639,7 +639,7 @@
           const res = await fetch('/api/auth/users', { credentials: 'include' });
           const data = await res.json();
           if (Array.isArray(data)) {
-            setAllUsers(data.filter(u => u.role === 'User'));
+            setAllUsers(data);
           } else {
             if (res.status === 401 || res.status === 403 || data.msg) {
                Swal.fire('Session Expired', 'Please log in again to manage users.', 'warning').then(() => { window.location.href = 'index.html'; });

@@ -98,8 +98,11 @@ class PostgresWrapper:
         
     def execute(self, query, params=()):
         import psycopg2.extras
-        # Convert SQLite ? placeholders to PostgreSQL %s
-        query = query.replace('?', '%s')
+        # Escape literal % in LIKE clauses before placeholder conversion
+        # Split on ? to preserve placeholders, escape % in non-placeholder parts
+        parts = query.split('?')
+        parts = [p.replace('%', '%%') for p in parts]
+        query = '%s'.join(parts)
         # PostgreSQL requires single quotes for strings
         query = query.replace('"Pending"', "'Pending'")
         
