@@ -131,6 +131,7 @@ def init_db():
                 role TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS Requests (
@@ -164,6 +165,7 @@ def init_db():
                 role TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
         ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS Requests (
