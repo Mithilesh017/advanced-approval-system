@@ -34,7 +34,7 @@ print(f"[JWT Config] Secure={app.config['JWT_COOKIE_SECURE']}, SameSite={app.con
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["200 per day", "50 per hour"],
+    default_limits=["10000 per day", "2000 per hour"],
     storage_uri="memory://"
 )
 
