@@ -631,6 +631,7 @@
     function UsersView({ userRole }) {
       const [allUsers, setAllUsers] = useState([]);
       const [loading, setLoading] = useState(true);
+      const [activeRoleFilter, setActiveRoleFilter] = useState('All');
 
       const fetchUsers = async () => {
         try {
@@ -737,7 +738,7 @@
       };
 
       const pendingUsers = allUsers.filter(u => u.status === 'Pending');
-      const activeUsers = allUsers.filter(u => u.status !== 'Pending');
+      const activeUsers = allUsers.filter(u => u.status !== 'Pending' && (activeRoleFilter === 'All' || u.role === activeRoleFilter));
 
       return (
         <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
@@ -792,6 +793,15 @@
               
               <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-users"></i> Current Active Employees</h3>
               <p style={{color: '#666', marginBottom: '20px'}}>Manage existing user accounts in the system. You can remove user access entirely.</p>
+              
+              <div style={{marginBottom: '20px', display: 'flex', gap: '10px'}}>
+                <button className={`btn ${activeRoleFilter === 'All' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('All')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>All</button>
+                <button className={`btn ${activeRoleFilter === 'User' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('User')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>Users</button>
+                <button className={`btn ${activeRoleFilter === 'Admin' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('Admin')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>Admins</button>
+                {userRole === 'SuperAdmin' && (
+                  <button className={`btn ${activeRoleFilter === 'SuperAdmin' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('SuperAdmin')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>SuperAdmins</button>
+                )}
+              </div>
               
               {activeUsers.length === 0 ? (
                  <div style={{padding: '20px', background: '#f8f9fa', borderRadius: '5px', textAlign: 'center', color: '#666'}}>No active employees found.</div>
