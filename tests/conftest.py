@@ -1,11 +1,14 @@
 import os
+import secrets
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+from werkzeug.security import generate_password_hash
 
 ROOT = Path(__file__).resolve().parent.parent
+PASSWORD = 'correct-horse-battery'
 
 # Tests must never touch a real database, send real email or require HTTPS cookies,
 # whatever the local .env contains. load_dotenv() does not override variables set here.
@@ -19,7 +22,7 @@ os.environ.update({
     'ENVIRONMENT': '',
     'JWT_SECRET_KEY': 'test-only-secret-key-with-enough-length-for-hs256',
     'INITIAL_SUPER_ADMIN_EMAIL': 'owner@example.com',
-    'INITIAL_SUPER_ADMIN_PASSWORD': 'correct-horse-battery',
+    'INITIAL_SUPER_ADMIN_PASSWORD': PASSWORD,
 })
 
 # main.py loads the bundled model and serves pages by relative path.
@@ -30,7 +33,7 @@ import main  # noqa: E402
 
 main.limiter.enabled = False
 
-SUPER_ADMIN = {'email': 'owner@example.com', 'password': 'correct-horse-battery'}
+SUPER_ADMIN = {'email': 'owner@example.com', 'password': PASSWORD}
 
 
 @pytest.fixture
@@ -52,3 +55,35 @@ def query(module, sql, params=()):
         return [dict(row) for row in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
+
+
+def execute(module, sql, params=()):
+    conn = module.get_db_connection()
+    try:
+        cursor = conn.execute(sql, params)
+        rows = cursor.fetchall() if 'RETURNING' in sql else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def create_organization(module, name, status='Active'):
+    rows = execute(
+        module, 'INSERT INTO Organizations (name, join_code, status) VALUES (?, ?, ?) RETURNING id',
+        (name, secrets.token_urlsafe(9), status)
+    )
+    return rows[0][0]
+
+
+def create_user(module, email, role='User', organization_id=None, status='Active'):
+    execute(
+        module, 'INSERT INTO Users (email, password_hash, role, status, organization_id) VALUES (?, ?, ?, ?, ?)',
+        (email, generate_password_hash(PASSWORD), role, status, organization_id or module.DEFAULT_ORGANIZATION_ID)
+    )
+
+
+def login(client, email, password=PASSWORD):
+    response = client.post('/api/auth/login', json={'email': email, 'password': password})
+    assert response.status_code == 200, response.get_json()
+    return response

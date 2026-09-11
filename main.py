@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, g, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -60,13 +60,42 @@ limiter = Limiter(
 allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5000').split(',')
 CORS(app, supports_credentials=True, origins=allowed_origins)
 
+ORGANIZATION_PAUSED_MESSAGE = "Your organization's access is paused. Please contact your administrator."
+
+def create_session_token(user):
+    return create_access_token(identity=str(user['email']), additional_claims={'organization_id': user['organization_id']})
+
+def require_login(fn):
+    # Account status, role and organization are re-read on every request, so removing an account,
+    # changing a role or pausing an organization takes effect immediately instead of when the session expires.
+    @wraps(fn)
+    @jwt_required()
+    def decorator(*args, **kwargs):
+        conn = get_db_connection()
+        try:
+            user = conn.execute(
+                'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, '
+                'Organizations.status AS organization_status '
+                'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
+                (get_jwt_identity(),)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not user or user['status'] != 'Active' or user['organization_id'] != get_jwt().get('organization_id'):
+            return jsonify({'error': 'Your session is no longer valid. Please log in again.'}), 401
+        if user['organization_status'] != 'Active':
+            return jsonify({'error': ORGANIZATION_PAUSED_MESSAGE}), 403
+        g.user = dict(user)
+        return fn(*args, **kwargs)
+    return decorator
+
 def require_role(role):
     def wrapper(fn):
         @wraps(fn)
-        @jwt_required()
+        @require_login
         def decorator(*args, **kwargs):
-            claims = get_jwt()
-            if claims.get('role') != role and claims.get('role') != 'SuperAdmin':
+            if g.user['role'] != role and g.user['role'] != 'SuperAdmin':
                 return jsonify({"error": "Insufficient permissions"}), 403
             return fn(*args, **kwargs)
         return decorator
@@ -515,7 +544,7 @@ def index():
 # ==========================================
 @app.route('/api/predict', methods=['POST'])
 @limiter.limit("20 per minute")
-@jwt_required()
+@require_login
 def predict():
     artifacts, _ = get_active_model()
     if artifacts is None:
@@ -683,7 +712,7 @@ def model_info():
 
 
 @app.route('/api/model/form_options', methods=['GET'])
-@jwt_required()
+@require_login
 def model_form_options():
     artifacts, _ = get_active_model()
     if artifacts is None:
@@ -878,7 +907,11 @@ def login():
         return jsonify({'error': 'Email is required'}), 400
 
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM Users WHERE email = ?', (email,)).fetchone()
+    user = conn.execute(
+        'SELECT Users.*, Organizations.status AS organization_status FROM Users '
+        'LEFT JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
+        (email,)
+    ).fetchone()
     conn.close()
 
     if not user:
@@ -897,6 +930,8 @@ def login():
             return jsonify({'error': 'Password required.'}), 400
             
         if check_password_hash(user['password_hash'], password):
+            if user['organization_status'] != 'Active':
+                return jsonify({'status': 'PAUSED', 'error': ORGANIZATION_PAUSED_MESSAGE}), 403
             redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
             resp = jsonify({
                 'status': 'SUCCESS',
@@ -904,8 +939,7 @@ def login():
                 'message': 'Login successful.',
                 'redirect': redirect_page
             })
-            access_token = create_access_token(identity=str(user['email']), additional_claims={'role': user['role']})
-            set_access_cookies(resp, access_token)
+            set_access_cookies(resp, create_session_token(user))
             return resp
         else:
             return jsonify({'error': 'Invalid password'}), 401
@@ -1006,7 +1040,7 @@ def setup_password():
         'role': user['role'],
         'email': email
     })
-    set_access_cookies(resp, create_access_token(identity=email, additional_claims={'role': user['role']}))
+    set_access_cookies(resp, create_session_token(user))
     return resp
 
 @app.route('/api/auth/pending_users', methods=['GET'])
@@ -1043,7 +1077,7 @@ def delete_user():
 
     conn = get_db_connection()
     target = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
-    if target and get_jwt().get('role') != 'SuperAdmin' and target['role'] != 'User':
+    if target and g.user['role'] != 'SuperAdmin' and target['role'] != 'User':
         conn.close()
         return jsonify({'status': 'ERROR', 'message': 'Admins can only remove employee accounts.'}), 403
 
@@ -1067,7 +1101,7 @@ def approve_user():
 
     conn = get_db_connection()
     target = conn.execute('SELECT role FROM Users WHERE email = ? AND status = "Pending"', (email,)).fetchone()
-    if target and target['role'] == 'Admin' and get_jwt().get('role') != 'SuperAdmin':
+    if target and target['role'] == 'Admin' and g.user['role'] != 'SuperAdmin':
         conn.close()
         return jsonify({'error': 'Only a Super Admin can approve administrator requests.'}), 403
 
@@ -1102,7 +1136,7 @@ def reject_user():
 
     conn = get_db_connection()
     target = conn.execute('SELECT role FROM Users WHERE email = ? AND status = "Pending"', (email,)).fetchone()
-    if target and target['role'] == 'Admin' and get_jwt().get('role') != 'SuperAdmin':
+    if target and target['role'] == 'Admin' and g.user['role'] != 'SuperAdmin':
         conn.close()
         return jsonify({'error': 'Only a Super Admin can reject administrator requests.'}), 403
 
@@ -1126,7 +1160,7 @@ def reject_user():
     return jsonify({'status': 'SUCCESS', 'message': f'User {email} rejected.'})
 
 @app.route('/api/auth/get_profile', methods=['GET'])
-@jwt_required()
+@require_login
 def get_profile():
     email = get_jwt_identity()
         
@@ -1139,7 +1173,7 @@ def get_profile():
     return jsonify({'error': 'User not found'}), 404
 
 @app.route('/api/auth/update_profile', methods=['POST'])
-@jwt_required()
+@require_login
 def update_profile():
     data = request.get_json(silent=True) or {}
     email = get_jwt_identity()
@@ -1157,7 +1191,7 @@ def update_profile():
     return jsonify({'status': 'SUCCESS', 'message': 'Profile updated successfully.'})
 
 @app.route('/api/auth/my_requests', methods=['GET'])
-@jwt_required()
+@require_login
 def my_requests():
     current_email = get_jwt_identity()
     conn = get_db_connection()
