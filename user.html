@@ -56,6 +56,7 @@
       const [view, setView] = useState('pending');
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'user@gmail.com'});
       const [userRequests, setUserRequests] = useState([]);
+      const [teamSize, setTeamSize] = useState(0);
 
       const loadData = async () => {
         try {
@@ -80,7 +81,11 @@
               destination: r.destination,
               currency: r.currency,
               email: r.submitted_by,
-              raw_status: r.final_decision
+              raw_status: r.final_decision,
+              purpose: r.purpose,
+              expenseDate: r.expense_date,
+              endDate: r.end_date,
+              receiptCount: r.receipt_count || 0
             }));
             setUserRequests(myRequests);
           }
@@ -91,6 +96,10 @@
 
       useEffect(() => {
         loadData();
+        fetch('/api/auth/get_profile', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(profile => { if (profile) setTeamSize(profile.report_count || 0); })
+          .catch(() => {});
       }, []);
 
       const pendingCount = userRequests.filter(r => r.status === 'Pending').length;
@@ -149,6 +158,13 @@
                   <span className="count secondary">{rejectedCount}</span>
                 </button>
               </li>
+              {teamSize > 0 && (
+                <li>
+                  <button className={view === 'team' ? 'active' : ''} onClick={() => setView('team')}>
+                    <i className="fas fa-user-tie"></i> Team Approvals
+                  </button>
+                </li>
+              )}
               <li>
                 <button className={view === 'profile' ? 'active' : ''} onClick={() => setView('profile')}>
                   <i className="fas fa-user-circle"></i> Profile
@@ -164,6 +180,7 @@
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
                 {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
                 {view === 'new' && <><i className="fas fa-plus-circle"></i> Submit Expense</>}
+                {view === 'team' && <><i className="fas fa-user-tie"></i> Team Approvals</>}
                 {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
               </h2>
               <div className="header-actions">
@@ -178,6 +195,8 @@
 
             {view === 'new' ? (
               <NewRequestForm user={user} setView={setView} refresh={loadData} />
+            ) : view === 'team' ? (
+              <TeamApprovalsView user={user} />
             ) : view === 'profile' ? (
               <ProfileView user={user} />
             ) : (
@@ -187,6 +206,7 @@
                 pendingCount={pendingCount}
                 approvedCount={approvedCount}
                 rejectedCount={rejectedCount}
+                refresh={loadData}
               />
             )}
           </div>
@@ -194,7 +214,67 @@
       );
     }
 
-    function UserTableView({ requests, currentStatus, pendingCount, approvedCount, rejectedCount }) {
+    // Dates are plain YYYY-MM-DD values, so they are read as local dates to avoid shifting across time zones.
+    const formatRequestDates = (start, end) => {
+      const format = (value) => new Date(`${value}T00:00:00`).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return end && end !== start ? `${format(start)} to ${format(end)}` : format(start);
+    };
+
+    const localToday = () => {
+      const now = new Date();
+      return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+    };
+
+    const RECEIPT_ACCEPT = '.pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png';
+    const RECEIPT_TYPES = ['application/pdf', 'image/jpeg', 'image/png'];
+    const MAX_RECEIPTS = 5;
+
+    // A quick check in the browser; the server checks each file's real content again.
+    const checkReceiptFiles = (files) => {
+      if (files.length > MAX_RECEIPTS) return `Attach at most ${MAX_RECEIPTS} receipts.`;
+      if (files.some(file => file.size > 5 * 1024 * 1024)) return 'Each receipt must be 5 MB or smaller.';
+      if (files.some(file => !RECEIPT_TYPES.includes(file.type))) return 'Receipts must be PDF, JPG or PNG files.';
+      return null;
+    };
+
+    const fetchReceipts = async (requestId) => {
+      try {
+        const res = await fetch(`/api/auth/request_receipts?id=${encodeURIComponent(requestId)}`, { credentials: 'include' });
+        if (isSessionExpired(res)) return null;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'The receipts could not be loaded.');
+        return data.receipts;
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'Receipts Unavailable', text: err.message });
+        return null;
+      }
+    };
+
+    // Built from DOM nodes so file names are never treated as HTML.
+    const receiptListElement = (receipts) => {
+      const list = document.createElement('ul');
+      list.className = 'receipt-list';
+      receipts.forEach(receipt => {
+        const item = document.createElement('li');
+        const link = document.createElement('a');
+        link.href = `/api/auth/receipt?id=${encodeURIComponent(receipt.id)}`;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = `${receipt.filename} (${Math.max(1, Math.round(receipt.size / 1024))} KB)`;
+        item.append(link);
+        list.append(item);
+      });
+      if (!receipts.length) {
+        const empty = document.createElement('li');
+        empty.textContent = 'No receipts attached yet.';
+        list.append(empty);
+      }
+      return list;
+    };
+
+    const toFileArray = (value) => (value instanceof FileList ? Array.from(value) : value ? [value] : []);
+
+    function UserTableView({ requests, currentStatus, pendingCount, approvedCount, rejectedCount, refresh }) {
       const tableRef = useRef(null);
       const filteredRequests = requests.filter(r => r.status === currentStatus);
       const tableKey = currentStatus + "_" + JSON.stringify(filteredRequests);
@@ -217,6 +297,45 @@
            dt.destroy();
         };
       }, [tableKey]);
+
+      const manageReceipts = async (req) => {
+        const receipts = await fetchReceipts(req.id);
+        if (!receipts) return;
+        const list = receiptListElement(receipts);
+
+        const canAdd = req.status !== 'Rejected' && receipts.length < MAX_RECEIPTS;
+        const result = await Swal.fire({
+          title: `${req.reqId} Receipts`,
+          html: list,
+          ...(canAdd ? {
+            input: 'file',
+            inputAttributes: { multiple: 'multiple', accept: RECEIPT_ACCEPT, 'aria-label': 'Add receipts' },
+            showCancelButton: true,
+            confirmButtonText: 'Upload',
+            inputValidator: (value) => {
+              const chosen = toFileArray(value);
+              if (!chosen.length) return 'Choose at least one receipt.';
+              if (receipts.length + chosen.length > MAX_RECEIPTS) return `A request can have at most ${MAX_RECEIPTS} receipts.`;
+              return checkReceiptFiles(chosen) || undefined;
+            }
+          } : { confirmButtonText: 'Close' })
+        });
+        if (!canAdd || !result.isConfirmed) return;
+
+        const body = new FormData();
+        body.append('request_id', req.id);
+        toFileArray(result.value).forEach(file => body.append('receipts', file));
+        try {
+          const res = await fetch('/api/auth/add_receipts', { method: 'POST', body, credentials: 'include' });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The receipts could not be uploaded.');
+          refresh();
+          Swal.fire({ icon: 'success', title: 'Receipts Added', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Upload Failed', text: err.message });
+        }
+      };
 
       const getStatusBadge = (status) => {
         if(status === 'Pending') return <span className="status-badge status-pending">Pending</span>;
@@ -265,6 +384,7 @@
                     <th>Expense Type</th>
                     <th>Destination</th>
                     <th>Amount</th>
+                    <th>Receipts</th>
                     <th>Status</th>
                   </tr>
                 </thead>
@@ -277,9 +397,20 @@
                         <div className="cell-secondary">{req.empId || 'N/A'}</div>
                       </td>
                       <td>{req.department}</td>
-                      <td>{req.reqType}</td>
-                      <td>{req.destination}</td>
+                      <td>
+                        <div>{req.reqType}</div>
+                        {req.purpose && <div className="cell-secondary cell-purpose" title={req.purpose}>{req.purpose}</div>}
+                      </td>
+                      <td>
+                        <div>{req.destination}</div>
+                        {req.expenseDate && <div className="cell-secondary">{formatRequestDates(req.expenseDate, req.endDate)}</div>}
+                      </td>
                       <td className="cell-nowrap">{req.amount} {req.currency}</td>
+                      <td>
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => manageReceipts(req)} aria-label={`Receipts for ${req.reqId}`}>
+                          <i className="fas fa-paperclip"></i> {req.receiptCount}
+                        </button>
+                      </td>
                       <td>{getStatusBadge(req.status)}</td>
                     </tr>
                   ))}
@@ -345,6 +476,7 @@
       const [loading, setLoading] = useState(false);
       const [options, setOptions] = useState({});
       const [optionsLoaded, setOptionsLoaded] = useState(false);
+      const [receiptFiles, setReceiptFiles] = useState([]);
       const [formData, setFormData] = useState({
         empName: user.email.split('@')[0],
         empId: '',
@@ -353,7 +485,10 @@
         reqType: '',
         destination: '',
         currency: 'INR',
-        amount: 5000
+        amount: 5000,
+        purpose: '',
+        expenseDate: localToday(),
+        endDate: ''
       });
 
       useEffect(() => {
@@ -383,12 +518,23 @@
           Role: formData.role, Department: formData.department,
           Request_Type: formData.reqType, Destination: formData.destination,
           Currency: formData.currency, Amount: parseFloat(formData.amount),
-          Employee_Name: formData.empName, Employee_ID: formData.empId
+          Employee_Name: formData.empName, Employee_ID: formData.empId,
+          Purpose: formData.purpose, Expense_Date: formData.expenseDate, End_Date: formData.endDate || null
         };
+        const receiptProblem = checkReceiptFiles(receiptFiles);
+        if (receiptProblem) {
+          Swal.fire({ icon: 'error', title: 'Check Your Receipts', text: receiptProblem });
+          setLoading(false);
+          return;
+        }
+        // Sent as a form so receipt files travel with the request.
+        const body = new FormData();
+        Object.entries(payload).forEach(([key, value]) => { if (value !== null && value !== undefined) body.append(key, value); });
+        receiptFiles.forEach(file => body.append('receipts', file));
         try {
           const response = await fetch('/api/predict', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            method: 'POST',
+            body,
             credentials: 'include'
           });
           if (isSessionExpired(response)) { setLoading(false); return; }
@@ -464,6 +610,24 @@
                   <label htmlFor="nr-amount">Amount</label>
                   <input id="nr-amount" type="number" name="amount" value={formData.amount} onChange={handleChange} required min="1" />
                 </div>
+                <div className="form-group">
+                  <label htmlFor="nr-expenseDate">Expense date (or trip start)</label>
+                  <input id="nr-expenseDate" type="date" name="expenseDate" value={formData.expenseDate} onChange={handleChange} required />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="nr-endDate">Trip end date (optional)</label>
+                  <input id="nr-endDate" type="date" name="endDate" value={formData.endDate} min={formData.expenseDate || undefined} onChange={handleChange} />
+                </div>
+              </div>
+              <div className="form-group">
+                <label htmlFor="nr-purpose">Business purpose</label>
+                <textarea id="nr-purpose" name="purpose" value={formData.purpose} onChange={handleChange} required minLength={10} maxLength={500} rows={3} placeholder="e.g. Client workshop at the Mumbai office" />
+                <small className="field-hint">Explain why this expense is needed. Your approvers see this.</small>
+              </div>
+              <div className="form-group">
+                <label htmlFor="nr-receipts">Receipts (optional)</label>
+                <input id="nr-receipts" type="file" multiple accept={RECEIPT_ACCEPT} onChange={e => setReceiptFiles(Array.from(e.target.files))} />
+                <small className="field-hint">PDF, JPG or PNG, up to 5 files of 5 MB each. Your company may require a receipt above a set amount.</small>
               </div>
               <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={loading}>
                 {loading ? <span><i className="fas fa-spinner fa-spin"></i> AI is analyzing...</span> : <span><i className="fas fa-robot"></i> Submit to AI Agent</span>}
@@ -471,6 +635,159 @@
             </form>
             )}
           </div>
+        </div>
+      );
+    }
+
+    const TEAM_DECISIONS = {
+      approve: { url: '/api/auth/approve_request', title: 'Approve this request?', inputLabel: 'Note (optional)', confirm: 'Approve', reasonRequired: false, done: 'Request Approved' },
+      reject: { url: '/api/auth/reject_request', title: 'Reject this request?', inputLabel: 'Reason for rejecting (required)', confirm: 'Reject', reasonRequired: true, done: 'Request Rejected' }
+    };
+
+    const parseJsonList = (value) => {
+      try {
+        return value ? JSON.parse(value) : [];
+      } catch (err) {
+        return [];
+      }
+    };
+
+    function TeamApprovalsView({ user }) {
+      const [requests, setRequests] = useState(null);
+
+      const load = async () => {
+        try {
+          const res = await fetch('/api/auth/team_requests', { credentials: 'include' });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || "Your team's requests could not be loaded.");
+          setRequests(data.requests);
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Team Requests Unavailable', text: err.message });
+          setRequests([]);
+        }
+      };
+
+      useEffect(() => { load(); }, []);
+
+      const decide = async (req, kind) => {
+        const decision = TEAM_DECISIONS[kind];
+        const answer = await Swal.fire({
+          title: decision.title,
+          input: 'textarea',
+          inputLabel: decision.inputLabel,
+          inputAttributes: { maxlength: '1000' },
+          showCancelButton: true,
+          confirmButtonText: decision.confirm,
+          inputValidator: (value) => (decision.reasonRequired && !value.trim() ? 'Please give a reason. It is saved in the request history.' : undefined)
+        });
+        if (!answer.isConfirmed) return;
+
+        try {
+          const res = await fetch(decision.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: req.id, comment: answer.value.trim() }),
+            credentials: 'include'
+          });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The decision could not be saved.');
+          await load();
+          if (data.final_decision === 'ESCALATED_SECOND_APPROVAL') {
+            Swal.fire({
+              icon: 'info', title: 'First Approval Saved',
+              text: 'This amount needs two approvals, so an administrator must approve it as well.'
+            });
+          } else {
+            Swal.fire({ icon: 'success', title: decision.done, timer: 1500, showConfirmButton: false });
+          }
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Decision Failed', text: err.message });
+        }
+      };
+
+      const viewReceipts = async (req, reqId) => {
+        const receipts = await fetchReceipts(req.id);
+        if (receipts) Swal.fire({ title: `${reqId} Receipts`, html: receiptListElement(receipts), confirmButtonText: 'Close' });
+      };
+
+      const isPending = (req) => req.final_decision.startsWith('ESCALATED');
+
+      return (
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-user-tie"></i> Team Approvals</h3>
+          <p className="panel-subtitle">Requests from people who report to you. You decide the ones waiting for you; rejecting needs a reason, and every decision is saved in the request history.</p>
+
+          {requests === null ? (
+            <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading your team's requests...</div>
+          ) : requests.length === 0 ? (
+            <div className="empty-state is-neutral"><i className="fas fa-user-tie"></i>No requests from your team yet.</div>
+          ) : (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Request</th>
+                    <th>Employee</th>
+                    <th>Details</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {requests.map(req => {
+                    const reqId = `REQ_${String(req.id).padStart(4, '0')}`;
+                    const pending = isPending(req);
+                    const waitingForMe = pending && req.approver_email === user.email;
+                    return (
+                      <tr key={req.id}>
+                        <td className="cell-primary">{reqId}</td>
+                        <td>
+                          <div className="cell-primary">{req.employee_name || req.submitted_by}</div>
+                          <div className="cell-secondary">{req.submitted_by}</div>
+                        </td>
+                        <td>
+                          <div>{req.request_type} · {req.destination}</div>
+                          {req.purpose && <div className="cell-secondary cell-purpose">{req.purpose}</div>}
+                          {req.expense_date && <div className="cell-secondary">{formatRequestDates(req.expense_date, req.end_date)}</div>}
+                          {parseJsonList(req.policy_violations).map(violation => (
+                            <span key={violation.rule_id} className="badge badge-block badge-red" title={violation.reason}>
+                              <i className="fas fa-scale-balanced"></i> {violation.name}
+                            </span>
+                          ))}
+                        </td>
+                        <td className="cell-nowrap">
+                          <div>{req.amount} {req.currency}</div>
+                          <button type="button" className="btn btn-secondary btn-sm" onClick={() => viewReceipts(req, reqId)} aria-label={`Receipts for ${reqId}`}>
+                            <i className="fas fa-paperclip"></i> {req.receipt_count || 0}
+                          </button>
+                        </td>
+                        <td>
+                          <span className={`status-badge ${pending ? 'status-pending' : req.final_decision === 'APPROVED' ? 'status-approved' : 'status-rejected'}`}>
+                            {pending ? 'Pending' : req.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'}
+                          </span>
+                        </td>
+                        <td className="cell-nowrap">
+                          {waitingForMe ? (
+                            <div className="cell-actions">
+                              <button type="button" className="btn btn-primary btn-sm" onClick={() => decide(req, 'approve')}><i className="fas fa-check"></i> Approve</button>
+                              <button type="button" className="btn btn-tinted-danger btn-sm" onClick={() => decide(req, 'reject')}><i className="fas fa-times"></i> Reject</button>
+                            </div>
+                          ) : (
+                            <span className="cell-muted">
+                              {!pending ? '—' : req.final_decision === 'ESCALATED_SECOND_APPROVAL' ? 'Waiting for a second approval' : 'With the admins'}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       );
     }
@@ -484,7 +801,7 @@
           .then(res => isSessionExpired(res) ? null : res.json())
           .then(data => {
             if(data && !data.error) {
-              setProfileData({ name: data.name || '', emp_id: data.emp_id || '' });
+              setProfileData({ name: data.name || '', emp_id: data.emp_id || '', manager_email: data.manager_email || '' });
             }
           });
       }, [user.email]);
@@ -568,6 +885,10 @@
             <div className="form-group">
               <label htmlFor="pf-empid">Employee ID</label>
               <input id="pf-empid" type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} placeholder="e.g., EMP_1234" />
+            </div>
+            <div className="form-group">
+              <label htmlFor="pf-manager">Manager (set by your administrator)</label>
+              <input id="pf-manager" type="text" value={profileData.manager_email || 'No manager assigned'} disabled />
             </div>
             <button type="submit" className="btn btn-primary" disabled={loading}>
                {loading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-save"></i>} Update Profile

@@ -4,12 +4,12 @@ import json
 import pytest
 
 from conftest import (
-    SUPER_ADMIN, create_organization, create_platform_owner, create_user, execute, login, query, use_model_score,
+    REQUEST_DETAILS, SUPER_ADMIN, create_organization, create_platform_owner, create_user, execute, login, query, use_model_score,
 )
 
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
 }
 UPDATE_SETTINGS = '/api/auth/update_approval_settings'
 
@@ -68,6 +68,7 @@ def test_admins_see_approval_settings_but_employees_do_not(app_db):
     assert admin_view['approval_settings'] == {
         'approval_mode': 'automatic', 'auto_approve_above': 0.8,
         'minimum_auto_approve_above': 0.8, 'maximum_auto_approve_above': 0.99,
+        'second_approval_above': None, 'maximum_second_approval_above': app_db.SECOND_APPROVAL_MAX_INR,
     }
     assert 'approval_settings' not in session(app_db, 'staff@example.com').get('/api/auth/organization').get_json()
 

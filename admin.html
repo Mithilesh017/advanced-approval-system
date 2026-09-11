@@ -59,7 +59,9 @@
       ESCALATED_POLICY: 'Low AI confidence',
       ESCALATED_MANUAL_REVIEW: 'Needs manual review',
       ESCALATED_SHADOW: 'AI recommends approval',
-      ESCALATED_RULE: 'Breaks a policy rule'
+      ESCALATED_RULE: 'Breaks a policy rule',
+      ESCALATED_HIGH_VALUE: 'Large amount',
+      ESCALATED_SECOND_APPROVAL: 'Waiting for a second approval'
     };
 
     const parseViolations = (value) => {
@@ -79,8 +81,10 @@
     const HISTORY_ACTIONS = {
       'request.submitted': 'Submitted',
       'request.approved': 'Approved',
+      'request.first_approved': 'First approval given',
       'request.rejected': 'Rejected',
-      'request.reopened': 'Moved back to pending'
+      'request.reopened': 'Moved back to pending',
+      'receipt.added': 'Receipt added'
     };
     const FEATURE_LABELS = { Role: 'Role', Department: 'Department', Request_Type: 'Request type', Destination: 'Destination', Amount_INR: 'Amount' };
 
@@ -91,6 +95,9 @@
       element.append(...children);
       return element;
     };
+
+    // SweetAlert2 renders select option labels as HTML, so names and emails are escaped first.
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 
     const formatHistoryTime = (value) => new Date(value).toLocaleString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
@@ -115,6 +122,14 @@
       return parts;
     };
 
+    const receiptLink = (details) => {
+      const link = historyNode('a', 'receipt-link', [`${details.filename} (${Math.max(1, Math.round(details.size / 1024))} KB)`]);
+      link.href = `/api/auth/receipt?id=${encodeURIComponent(details.receipt_id)}`;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      return link;
+    };
+
     const buildHistory = (events) => {
       if (!events.length) {
         return historyNode('p', 'history-empty', ['No history was recorded for this request. Requests handled before the audit log was added have no history.']);
@@ -126,9 +141,21 @@
         ]),
         historyNode('div', 'history-meta', [event.actor_email ? `by ${event.actor_email}` : 'by the system']),
         ...(event.comment ? [historyNode('blockquote', 'history-comment', [event.comment])] : []),
+        ...(event.action === 'receipt.added' && event.details ? [receiptLink(event.details)] : []),
         ...(event.action === 'request.submitted' ? submissionDetails(event) : [])
       ])));
     };
+
+    // Dates are plain YYYY-MM-DD values, so they are read as local dates to avoid shifting across time zones.
+    const formatRequestDates = (start, end) => {
+      const format = (value) => new Date(`${value}T00:00:00`).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return end && end !== start ? `${format(start)} to ${format(end)}` : format(start);
+    };
+
+    const requestSummary = (req) => historyNode('div', 'history-summary', [
+      historyNode('div', 'history-purpose', [req.purpose || 'No business purpose was recorded for this request.']),
+      ...(req.expenseDate ? [historyNode('div', 'history-meta', [`Dates: ${formatRequestDates(req.expenseDate, req.endDate)}`])] : [])
+    ]);
 
     const showRequestHistory = async (req) => {
       try {
@@ -136,7 +163,7 @@
         if (isSessionExpired(res)) return;
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || 'The history could not be loaded.');
-        Swal.fire({ title: `${req.reqId} History`, html: buildHistory(data.events), width: 640, confirmButtonText: 'Close' });
+        Swal.fire({ title: `${req.reqId} History`, html: historyNode('div', '', [requestSummary(req), buildHistory(data.events)]), width: 640, confirmButtonText: 'Close' });
       } catch (err) {
         Swal.fire({ icon: 'error', title: 'History Unavailable', text: err.message });
       }
@@ -175,7 +202,13 @@
               confidence: r.xgb_score == null ? undefined : Math.round(r.xgb_score * 1000) / 10,
               reason: DECISION_LABELS[r.final_decision],
               shadowRecommendation: r.approval_mode === 'shadow' ? r.ai_decision : null,
-              violations: parseViolations(r.policy_violations)
+              violations: parseViolations(r.policy_violations),
+              purpose: r.purpose,
+              expenseDate: r.expense_date,
+              endDate: r.end_date,
+              receiptCount: r.receipt_count || 0,
+              approverEmail: r.approver_email,
+              firstApprovedBy: r.first_approved_by
             }));
             setAllRequests(myRequests);
           }
@@ -302,6 +335,7 @@
                     requests={allRequests} 
                     currentStatus={view === 'pending' ? 'Pending' : view === 'approved' ? 'Approved' : 'Rejected'} 
                     refresh={loadData} 
+                    currentUserEmail={user.email}
                 />
             }
             {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
@@ -489,7 +523,7 @@
       );
     }
 
-    function TableView({ requests, currentStatus, refresh }) {
+    function TableView({ requests, currentStatus, refresh, currentUserEmail }) {
       const tableRef = useRef(null);
       const [department, setDepartment] = useState('');
       const [reqType, setReqType] = useState('');
@@ -558,7 +592,14 @@
           const data = await res.json().catch(() => ({}));
           if (res.ok) {
             refresh();
-            Swal.fire({ icon: 'success', title: newStatus === 'Pending' ? 'Moved to Pending' : `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+            if (data.final_decision === 'ESCALATED_SECOND_APPROVAL') {
+              Swal.fire({
+                icon: 'info', title: 'First Approval Saved',
+                text: 'This amount needs two approvals, so another administrator must approve it as well.'
+              });
+            } else {
+              Swal.fire({ icon: 'success', title: newStatus === 'Pending' ? 'Moved to Pending' : `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+            }
           } else {
             Swal.fire({ icon: 'error', title: 'Update Failed', text: data.error || data.msg || 'The request could not be updated.' });
           }
@@ -649,9 +690,20 @@
                       </td>
                       <td>{req.department}</td>
                       <td>{req.role}</td>
-                      <td>{req.reqType}</td>
-                      <td>{req.destination}</td>
-                      <td className="cell-nowrap">{req.amount} {req.currency}</td>
+                      <td>
+                        <div>{req.reqType}</div>
+                        {req.purpose && <div className="cell-secondary cell-purpose" title={req.purpose}>{req.purpose}</div>}
+                      </td>
+                      <td>
+                        <div>{req.destination}</div>
+                        {req.expenseDate && <div className="cell-secondary">{formatRequestDates(req.expenseDate, req.endDate)}</div>}
+                      </td>
+                      <td className="cell-nowrap">
+                        <div>{req.amount} {req.currency}</div>
+                        {req.receiptCount > 0 && (
+                          <div className="cell-secondary"><i className="fas fa-paperclip"></i> {req.receiptCount} receipt{req.receiptCount === 1 ? '' : 's'}</div>
+                        )}
+                      </td>
                       <td>
                         {req.confidence !== undefined && (
                           <span className={`badge badge-block ${req.confidence > 80 ? 'badge-green' : req.confidence < 20 ? 'badge-red' : 'badge-orange'}`}>
@@ -669,12 +721,22 @@
                             <i className="fas fa-scale-balanced"></i> {violation.name}
                           </span>
                         ))}
+                        {req.status === 'Pending' && req.approverEmail && (
+                          <span className="badge badge-block badge-purple"><i className="fas fa-user-tie"></i> Waiting for manager {req.approverEmail}</span>
+                        )}
+                        {req.firstApprovedBy && (
+                          <span className="badge badge-block badge-purple"><i className="fas fa-user-check"></i> First approved by {req.firstApprovedBy}</span>
+                        )}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
                       <td className="cell-nowrap">
                         {req.status === 'Pending' ? (
                           <>
-                            <button type="button" className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve" aria-label="Approve"><i className="fas fa-check"></i></button>
+                            {req.firstApprovedBy === currentUserEmail ? (
+                              <span className="cell-muted" title="You gave the first approval, so somebody else must give the second one.">Approved by you</span>
+                            ) : (
+                              <button type="button" className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve" aria-label="Approve"><i className="fas fa-check"></i></button>
+                            )}
                             <button type="button" className="action-btn delete" onClick={() => handleAction(req.id, 'Rejected')} title="Reject" aria-label="Reject"><i className="fas fa-xmark"></i></button>
                           </>
                         ) : (
@@ -810,6 +872,40 @@
         }
       };
 
+      const handleSetManager = async (employee) => {
+        const inputOptions = { '': 'No manager (admins decide)' };
+        allUsers
+          .filter(u => u.status === 'Active' && u.email !== employee.email)
+          .forEach(u => { inputOptions[u.email] = escapeHtml(u.name ? `${u.name} (${u.email})` : u.email); });
+
+        const result = await Swal.fire({
+          titleText: `Manager for ${employee.email}`,
+          text: 'Requests that need a person go to this manager first. Requests already waiting move to the new manager.',
+          input: 'select',
+          inputOptions,
+          inputValue: employee.manager_email || '',
+          showCancelButton: true,
+          confirmButtonText: 'Save'
+        });
+        if (!result.isConfirmed) return;
+
+        try {
+          const res = await fetch('/api/auth/set_manager', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: employee.email, manager_email: result.value || null }),
+            credentials: 'include'
+          });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The manager could not be saved.');
+          fetchUsers();
+          Swal.fire({ icon: 'success', title: 'Manager Saved', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Could Not Save', text: err.message });
+        }
+      };
+
       const pendingUsers = allUsers.filter(u => u.status === 'Pending');
       const activeUsers = allUsers.filter(u => u.status !== 'Pending' && (activeRoleFilter === 'All' || u.role === activeRoleFilter));
 
@@ -904,6 +1000,7 @@
                       <tr>
                         <th>Email Address</th>
                         <th>Role</th>
+                        <th>Manager</th>
                         <th>Status</th>
                         <th>Action</th>
                       </tr>
@@ -917,6 +1014,14 @@
                           </td>
                           <td>
                             <span className={`badge ${u.role === 'SuperAdmin' ? 'badge-purple' : u.role === 'Admin' ? 'badge-accent' : ''}`}>{u.role}</span>
+                          </td>
+                          <td>
+                            <div className="cell-secondary">{u.manager_email || 'No manager'}</div>
+                            {u.status === 'Active' && (userRole === 'SuperAdmin' || u.role === 'User') && (
+                              <button type="button" className="btn btn-secondary btn-sm" onClick={() => handleSetManager(u)}>
+                                <i className="fas fa-user-tie"></i> {u.manager_email ? 'Change' : 'Assign'}
+                              </button>
+                            )}
                           </td>
                           <td>
                             <span className={`status-badge ${u.status === 'Active' ? 'status-approved' : u.status === 'Rejected' ? 'status-rejected' : 'status-pending'}`}>{u.status}</span>
@@ -943,7 +1048,8 @@
     const RULE_TYPE_LABELS = {
       amount_limit: 'Amount limit',
       duplicate_request: 'Duplicate request',
-      always_review: 'Always review'
+      always_review: 'Always review',
+      receipt_required: 'Receipt required'
     };
     const REVIEW_FIELD_OPTIONS = [
       { value: 'request_type', label: 'Request type', optionKey: 'Request_Type' },
@@ -951,7 +1057,7 @@
       { value: 'role', label: 'Role', optionKey: 'Role' },
       { value: 'department', label: 'Department', optionKey: 'Department' }
     ];
-    const EMPTY_RULE = { rule_type: 'amount_limit', role: '', request_type: '', max_amount_inr: '', window_days: '7', field: 'request_type', value: '' };
+    const EMPTY_RULE = { rule_type: 'amount_limit', role: '', request_type: '', max_amount_inr: '', window_days: '7', field: 'request_type', value: '', above_amount_inr: '0' };
 
     const describeRule = (form) => {
       if (form.rule_type === 'amount_limit') {
@@ -959,6 +1065,10 @@
       }
       if (form.rule_type === 'duplicate_request') {
         return `Same employee, request type and amount within ${form.window_days} days`;
+      }
+      if (form.rule_type === 'receipt_required') {
+        const above = Number(form.above_amount_inr);
+        return above > 0 ? `Receipt required above ₹${above.toLocaleString('en-IN')}` : 'Receipt required on every request';
       }
       const field = REVIEW_FIELD_OPTIONS.find(option => option.value === form.field);
       return `Always review ${field.label.toLowerCase()} "${form.value.trim()}"`;
@@ -969,6 +1079,7 @@
         return { role: form.role.trim() || null, request_type: form.request_type.trim() || null, max_amount_inr: Number(form.max_amount_inr) };
       }
       if (form.rule_type === 'duplicate_request') return { window_days: Number(form.window_days) };
+      if (form.rule_type === 'receipt_required') return { above_amount_inr: Number(form.above_amount_inr) };
       return { field: form.field, values: [form.value.trim()] };
     };
 
@@ -1062,6 +1173,7 @@
                   <option value="amount_limit">Amount limit</option>
                   <option value="duplicate_request">Duplicate request</option>
                   <option value="always_review">Always review</option>
+                  <option value="receipt_required">Receipt required</option>
                 </select>
               </div>
 
@@ -1079,6 +1191,13 @@
                   <input id="rule-request-type" type="text" list={listId('Request_Type')} value={form.request_type} onChange={e => setField('request_type', e.target.value)} />
                 </div>
               </>)}
+
+              {form.rule_type === 'receipt_required' && (
+                <div className="form-group">
+                  <label htmlFor="rule-receipt-above">Require a receipt above (INR, 0 for every request)</label>
+                  <input id="rule-receipt-above" type="number" min="0" step="1" value={form.above_amount_inr} onChange={e => setField('above_amount_inr', e.target.value)} required />
+                </div>
+              )}
 
               {form.rule_type === 'duplicate_request' && (
                 <div className="form-group">
@@ -1156,11 +1275,17 @@
     function SettingsView({ organization, onSaved }) {
       const settings = organization && organization.approval_settings;
       const [percent, setPercent] = useState('');
+      const [secondApproval, setSecondApproval] = useState('');
       const [saving, setSaving] = useState(false);
+      const [savingSecond, setSavingSecond] = useState(false);
 
       useEffect(() => {
         if (settings) setPercent(String(Math.round(settings.auto_approve_above * 100)));
       }, [settings && settings.auto_approve_above]);
+
+      useEffect(() => {
+        if (settings) setSecondApproval(settings.second_approval_above == null ? '' : String(settings.second_approval_above));
+      }, [settings && settings.second_approval_above]);
 
       if (!settings) {
         return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading approval settings...</div></div>;
@@ -1170,19 +1295,13 @@
       const maximum = Math.round(settings.maximum_auto_approve_above * 100);
       const shadow = settings.approval_mode === 'shadow';
 
-      const handleSave = async (e) => {
-        e.preventDefault();
-        const value = Number(percent);
-        if (!Number.isInteger(value) || value < minimum || value > maximum) {
-          Swal.fire({ icon: 'error', title: 'Invalid Threshold', text: `Enter a whole number from ${minimum} to ${maximum}.` });
-          return;
-        }
-        setSaving(true);
+      const saveSettings = async (body, setBusy) => {
+        setBusy(true);
         try {
           const res = await fetch('/api/auth/update_approval_settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ auto_approve_above: value / 100 }),
+            body: JSON.stringify(body),
             credentials: 'include'
           });
           if (isSessionExpired(res)) return;
@@ -1193,8 +1312,29 @@
         } catch (err) {
           Swal.fire({ icon: 'error', title: 'Save Failed', text: err.message });
         } finally {
-          setSaving(false);
+          setBusy(false);
         }
+      };
+
+      const handleSave = async (e) => {
+        e.preventDefault();
+        const value = Number(percent);
+        if (!Number.isInteger(value) || value < minimum || value > maximum) {
+          Swal.fire({ icon: 'error', title: 'Invalid Threshold', text: `Enter a whole number from ${minimum} to ${maximum}.` });
+          return;
+        }
+        await saveSettings({ auto_approve_above: value / 100 }, setSaving);
+      };
+
+      const handleSaveSecondApproval = async (e) => {
+        e.preventDefault();
+        const entered = secondApproval.trim();
+        const value = entered === '' ? null : Number(entered);
+        if (value !== null && (!Number.isFinite(value) || value < 1 || value > settings.maximum_second_approval_above)) {
+          Swal.fire({ icon: 'error', title: 'Invalid Amount', text: 'Enter an amount of ₹1 or more, or leave the box empty to turn this off.' });
+          return;
+        }
+        await saveSettings({ second_approval_above: value }, setSavingSecond);
       };
 
       return (
@@ -1225,6 +1365,27 @@
             </div>
             <button type="submit" className="btn btn-primary" disabled={saving}>
               {saving ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Settings</span>}
+            </button>
+          </form>
+        </div>
+
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-user-check"></i> Second Approval for Large Requests</h3>
+          <p className="panel-subtitle">
+            Requests worth this much or more need two approvals: the employee's manager decides first, then a different
+            administrator. They are never approved automatically, whatever the AI score says.
+          </p>
+          <form onSubmit={handleSaveSecondApproval} className="profile-form">
+            <div className="form-group">
+              <label htmlFor="second-approval-above">Ask for a second approval from (₹)</label>
+              <input id="second-approval-above" type="number" min="1" step="1" placeholder="Off" value={secondApproval}
+                     onChange={e => setSecondApproval(e.target.value)} />
+              <small className="field-hint">
+                Amounts are compared in rupees, after other currencies are converted. Leave the box empty to turn this off.
+              </small>
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={savingSecond}>
+              {savingSecond ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Amount</span>}
             </button>
           </form>
         </div>

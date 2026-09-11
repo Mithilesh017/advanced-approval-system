@@ -3,11 +3,11 @@ import json
 
 import pytest
 
-from conftest import SUPER_ADMIN, add_request, create_organization, create_platform_owner, create_user, login, query
+from conftest import REQUEST_DETAILS, SUPER_ADMIN, add_request, create_organization, create_platform_owner, create_user, login, query
 
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
 }
 HISTORY = '/api/auth/request_history'
 
@@ -47,7 +47,10 @@ def test_submission_records_score_explanation_and_model_version(app_db, team):
     assert details['unrecognized_category'] is False
     assert set(details['anomaly_detectors']) == {'isolation_forest', 'one_class_svm'}
     assert set(details['explanation']) == set(app_db.model_pipeline.FEATURES)
-    assert details['thresholds'] == {'auto_approve_above': app_db.AUTO_APPROVE_THRESHOLD, 'escalate_below': app_db.ESCALATE_THRESHOLD}
+    assert details['thresholds'] == {
+        'auto_approve_above': app_db.AUTO_APPROVE_THRESHOLD, 'escalate_below': app_db.ESCALATE_THRESHOLD,
+        'second_approval_above': None,
+    }
 
 
 def test_decisions_record_who_what_and_why(app_db, team):

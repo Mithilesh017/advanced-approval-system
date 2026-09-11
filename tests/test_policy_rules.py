@@ -4,11 +4,11 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from conftest import SUPER_ADMIN, create_organization, create_user, execute, login, query, use_model_score
+from conftest import REQUEST_DETAILS, SUPER_ADMIN, create_organization, create_user, execute, login, query, use_model_score
 
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
 }
 RULES = '/api/auth/policy_rules'
 CREATE = '/api/auth/create_policy_rule'

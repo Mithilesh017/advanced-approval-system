@@ -1,4 +1,4 @@
-from flask import Flask, g, redirect, request, jsonify, send_from_directory
+from flask import Flask, g, redirect, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -15,7 +15,7 @@ import time
 import email_service
 import model_pipeline
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 import pandas as pd
 import joblib
@@ -24,6 +24,8 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
 from urllib.parse import quote
+from werkzeug.exceptions import HTTPException
+from werkzeug.utils import secure_filename
 
 load_dotenv()
 
@@ -44,6 +46,8 @@ app.config['JWT_COOKIE_SAMESITE'] = 'Lax'  # Lax allows same-origin fetch + top-
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'  # Scoped to all routes for reliable cookie delivery
 app.config['JWT_ACCESS_COOKIE_NAME'] = 'ams_access_token' # Changed name to bypass stale cookies
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=int(os.getenv('JWT_ACCESS_TOKEN_HOURS', '8')))
+# Receipts travel with requests: at most 5 files of 5 MB each, plus the form fields.
+app.config['MAX_CONTENT_LENGTH'] = 26 * 1024 * 1024
 
 jwt = JWTManager(app)
 
@@ -76,8 +80,9 @@ def require_login(fn):
         conn = get_db_connection()
         try:
             user = conn.execute(
-                'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, '
-                'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above '
+                'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, Users.manager_email, '
+                'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above, '
+                'Organizations.second_approval_above '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
             ).fetchone()
@@ -372,6 +377,21 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Receipts (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL REFERENCES Requests(id),
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BYTEA NOT NULL,
+                uploaded_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -478,6 +498,21 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL REFERENCES Requests(id),
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BLOB NOT NULL,
+                uploaded_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -492,6 +527,14 @@ REQUEST_EXTRA_COLUMNS = {
     'ai_decision': 'TEXT',
     'approval_mode': 'TEXT',
     'policy_violations': 'TEXT',
+    # Dates are stored as ISO text (YYYY-MM-DD) so SQLite and PostgreSQL return the same value.
+    'purpose': 'TEXT',
+    'expense_date': 'TEXT',
+    'end_date': 'TEXT',
+    # Who must decide a request that is waiting: the employee's manager, or NULL when the admins decide.
+    'approver_email': 'TEXT',
+    # Set when a large request has one approval and is waiting for a second one from an administrator.
+    'first_approved_by': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -509,6 +552,8 @@ def check_and_add_columns():
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS second_approval_above DOUBLE PRECISION')
+        cursor.execute('ALTER TABLE Users ADD COLUMN IF NOT EXISTS manager_email TEXT')
         conn.commit()
         conn.close()
         return
@@ -526,6 +571,8 @@ def check_and_add_columns():
         cursor.execute("ALTER TABLE Users ADD COLUMN reset_token TEXT")
     if 'reset_expiry' not in columns:
         cursor.execute("ALTER TABLE Users ADD COLUMN reset_expiry DATETIME")
+    if 'manager_email' not in columns:
+        cursor.execute("ALTER TABLE Users ADD COLUMN manager_email TEXT")
 
     cursor.execute("PRAGMA table_info(Requests)")
     request_columns = {col[1] for col in cursor.fetchall()}
@@ -541,7 +588,7 @@ def check_and_add_columns():
 
     cursor.execute("PRAGMA table_info(Organizations)")
     organization_columns = {col[1] for col in cursor.fetchall()}
-    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL')):
+    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL'), ('second_approval_above', 'REAL')):
         if column not in organization_columns:
             cursor.execute(f"ALTER TABLE Organizations ADD COLUMN {column} {column_type}")
 
@@ -705,11 +752,262 @@ def organization_auto_approve_threshold(organization):
     value = organization.get('auto_approve_above')
     return AUTO_APPROVE_THRESHOLD if value is None else max(AUTO_APPROVE_THRESHOLD, float(value))
 
+# A request worth at least this much needs two approvals. Nothing is set until a Super Admin turns it on.
+SECOND_APPROVAL_MAX_INR = 1_000_000_000.0
+
+def organization_second_approval_amount(organization):
+    value = organization.get('second_approval_above')
+    return None if value is None else float(value)
+
+def needs_second_approval(organization, amount_inr):
+    above = organization_second_approval_amount(organization)
+    return above is not None and float(amount_inr or 0) >= above
+
+
+# ==========================================
+# WAITING-APPROVER NOTICES
+# ==========================================
+def request_reference(request_id):
+    return f"REQ_{int(request_id):04d}"
+
+def approvers_to_notify(conn, organization_id, approver_email):
+    """The manager a request is waiting for, or every administrator when it waits for the admins."""
+    if approver_email:
+        rows = conn.execute(
+            "SELECT email, role FROM Users WHERE email = ? AND organization_id = ? AND status = 'Active'",
+            (approver_email, organization_id)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT email, role FROM Users WHERE organization_id = ? AND status = 'Active' AND role IN ('Admin', 'SuperAdmin')",
+            (organization_id,)
+        ).fetchall()
+    return [(row["email"], home_page(row["role"])) for row in rows]
+
+def notify_waiting_approvers(recipients, summary, organization_name, note=None):
+    """Email trouble must never fail a decision that is already saved, so every send is guarded."""
+    for email, page in recipients:
+        try:
+            email_service.sendApprovalWaitingEmail(email, summary, f"{public_base_url()}/{page}", organization_name, note)
+        except Exception:
+            app.logger.exception("Could not tell %s that a request is waiting for them", email)
+
+def waiting_notice(conn, organization_id, request_id, approver_email, note=None):
+    """Collects what the notice needs while the connection is open. Call the returned function after the commit."""
+    row = conn.execute(
+        "SELECT Requests.id, Requests.submitted_by, Requests.employee_name, Requests.amount, Requests.currency, "
+        "Requests.request_type, Requests.destination, Requests.purpose, Organizations.name AS organization_name "
+        "FROM Requests JOIN Organizations ON Organizations.id = Requests.organization_id "
+        "WHERE Requests.id = ? AND Requests.organization_id = ?",
+        (request_id, organization_id)
+    ).fetchone()
+    recipients = approvers_to_notify(conn, organization_id, approver_email)
+    if not row or not recipients:
+        return lambda: None
+    summary = {
+        "reference": request_reference(row["id"]),
+        "employee": row["employee_name"] or row["submitted_by"],
+        "amount": f"{row['amount']} {row['currency']}",
+        "details": f"{row['request_type']} - {row['destination']}",
+        "purpose": row["purpose"],
+    }
+    organization_name = row["organization_name"]
+    return lambda: notify_waiting_approvers(recipients, summary, organization_name, note)
+
+
+# ==========================================
+# REQUEST DETAILS
+# ==========================================
+PURPOSE_MIN_LENGTH = 10
+PURPOSE_MAX_LENGTH = 500
+REQUEST_DATE_WINDOW = timedelta(days=366)
+TRIP_MAX_DAYS = 90
+
+def parse_request_dates(start_value, end_value):
+    """Returns (expense date, end date or None, None) as ISO strings, or (None, None, error message)."""
+    def parse(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError:
+            return None
+
+    start = parse(start_value)
+    if start is None:
+        return None, None, 'Please give the expense date, for example 2026-09-12.'
+    today = datetime.utcnow().date()
+    if not today - REQUEST_DATE_WINDOW <= start <= today + REQUEST_DATE_WINDOW:
+        return None, None, 'The expense date must be within a year of today.'
+
+    if end_value in (None, ''):
+        return start.isoformat(), None, None
+    end = parse(end_value)
+    if end is None:
+        return None, None, 'The end date must be a date, for example 2026-09-14.'
+    if not start <= end <= start + timedelta(days=TRIP_MAX_DAYS):
+        return None, None, f'The end date must be on or after the expense date and within {TRIP_MAX_DAYS} days of it.'
+    return start.isoformat(), end.isoformat(), None
+
+
+# ==========================================
+# RECEIPTS
+# ==========================================
+RECEIPT_MAX_BYTES = 5 * 1024 * 1024
+RECEIPTS_PER_REQUEST = 5
+# A receipt's type is read from its content, never from its name or what the browser claims.
+RECEIPT_SIGNATURES = (
+    (b'%PDF-', 'application/pdf', '.pdf'),
+    (b'\x89PNG\r\n\x1a\n', 'image/png', '.png'),
+    (b'\xff\xd8\xff', 'image/jpeg', '.jpg'),
+)
+RECEIPT_COUNT_SQL = '(SELECT COUNT(*) FROM Receipts WHERE Receipts.request_id = Requests.id) AS receipt_count'
+
+def read_receipt_uploads(files):
+    """Returns (receipts, None) for valid uploads, or (None, error message)."""
+    files = [upload for upload in files if upload and upload.filename]
+    if len(files) > RECEIPTS_PER_REQUEST:
+        return None, f'Attach at most {RECEIPTS_PER_REQUEST} receipts to a request.'
+    receipts = []
+    for upload in files:
+        content = upload.read(RECEIPT_MAX_BYTES + 1)
+        if not content:
+            return None, 'One of the receipt files is empty.'
+        if len(content) > RECEIPT_MAX_BYTES:
+            return None, 'Each receipt must be 5 MB or smaller.'
+        kind = next(((mime, extension) for signature, mime, extension in RECEIPT_SIGNATURES if content.startswith(signature)), None)
+        if kind is None:
+            return None, 'Receipts must be PDF, JPG or PNG files.'
+        stem = os.path.splitext(secure_filename(upload.filename))[0][:100] or 'receipt'
+        receipts.append({
+            'filename': stem + kind[1], 'content_type': kind[0], 'size': len(content),
+            'sha256': hashlib.sha256(content).hexdigest(), 'content': content,
+        })
+    return receipts, None
+
+def save_receipts(conn, organization_id, request_id, uploader, receipts):
+    for receipt in receipts:
+        receipt_id = conn.execute(
+            'INSERT INTO Receipts (organization_id, request_id, filename, content_type, size, sha256, content, uploaded_by) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
+            (organization_id, request_id, receipt['filename'], receipt['content_type'], receipt['size'],
+             receipt['sha256'], receipt['content'], uploader)
+        ).fetchall()[0][0]
+        details = {key: receipt[key] for key in ('filename', 'content_type', 'size', 'sha256')}
+        record_event(conn, 'receipt.added', organization_id=organization_id, request_id=request_id, actor=uploader,
+                     details={'receipt_id': receipt_id, **details})
+
+def is_manager_of(conn, employee_email):
+    return bool(conn.execute(
+        'SELECT 1 FROM Users WHERE email = ? AND organization_id = ? AND manager_email = ?',
+        (employee_email, g.user['organization_id'], g.user['email'])
+    ).fetchone())
+
+def can_review_request(conn, request_id):
+    # Admins review every request in their organization; managers review their direct reports' requests.
+    if g.user['role'] in ('Admin', 'SuperAdmin'):
+        return True
+    row = conn.execute(
+        'SELECT submitted_by FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])
+    ).fetchone()
+    return bool(row) and is_manager_of(conn, row['submitted_by'])
+
+def can_view_request(conn, request_id):
+    # Employees see receipts on their own requests; their manager and the organization's admins see them too.
+    row = conn.execute(
+        'SELECT submitted_by FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])
+    ).fetchone()
+    return bool(row) and (row['submitted_by'] == g.user['email'] or can_review_request(conn, request_id))
+
+@app.errorhandler(413)
+def upload_too_large(error):
+    return jsonify({'error': f'The upload is too large. Attach at most {RECEIPTS_PER_REQUEST} receipts of 5 MB each.'}), 413
+
+@app.route('/api/auth/request_receipts', methods=['GET'])
+@require_login
+def request_receipts():
+    request_id = request.args.get('id', type=int)
+    if request_id is None:
+        return jsonify({'error': 'Request ID is required'}), 400
+
+    conn = get_db_connection()
+    try:
+        if not can_view_request(conn, request_id):
+            return jsonify({'error': 'Request not found.'}), 404
+        rows = conn.execute(
+            'SELECT id, filename, content_type, size, uploaded_by, created_at FROM Receipts '
+            'WHERE request_id = ? AND organization_id = ? ORDER BY id',
+            (request_id, g.user['organization_id'])
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({'receipts': [to_json_row(row) for row in rows]})
+
+@app.route('/api/auth/receipt', methods=['GET'])
+@require_login
+def download_receipt():
+    receipt_id = request.args.get('id', type=int)
+    if receipt_id is None:
+        return jsonify({'error': 'Receipt ID is required'}), 400
+
+    conn = get_db_connection()
+    try:
+        receipt = conn.execute(
+            'SELECT request_id, filename, content_type, content FROM Receipts WHERE id = ? AND organization_id = ?',
+            (receipt_id, g.user['organization_id'])
+        ).fetchone()
+        if not receipt or not can_view_request(conn, receipt['request_id']):
+            return jsonify({'error': 'Receipt not found.'}), 404
+    finally:
+        conn.close()
+
+    # Images open in the browser; PDFs download, so no uploaded document runs inside this site.
+    response = send_file(
+        io.BytesIO(bytes(receipt['content'])), mimetype=receipt['content_type'], download_name=receipt['filename'],
+        as_attachment=receipt['content_type'] == 'application/pdf', etag=False
+    )
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Cache-Control'] = 'private, no-store'
+    response.headers['Content-Security-Policy'] = "default-src 'none'; img-src 'self'"
+    return response
+
+@app.route('/api/auth/add_receipts', methods=['POST'])
+@limiter.limit("30 per hour")
+@require_login
+def add_receipts():
+    request_id = request.form.get('request_id', type=int)
+    if request_id is None:
+        return jsonify({'error': 'Request ID is required'}), 400
+    receipts, error = read_receipt_uploads(request.files.getlist('receipts'))
+    if error:
+        return jsonify({'error': error}), 400
+    if not receipts:
+        return jsonify({'error': 'Choose at least one receipt.'}), 400
+
+    conn = get_db_connection()
+    try:
+        target = conn.execute(
+            'SELECT id, submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            (request_id, g.user['organization_id'])
+        ).fetchone()
+        if not target or target['submitted_by'] != g.user['email']:
+            return jsonify({'error': 'Request not found.'}), 404
+        if target['final_decision'] == 'REJECTED':
+            return jsonify({'error': "Receipts can't be added to a rejected request."}), 409
+        existing = conn.execute('SELECT COUNT(*) AS total FROM Receipts WHERE request_id = ?', (target['id'],)).fetchone()['total']
+        if existing + len(receipts) > RECEIPTS_PER_REQUEST:
+            return jsonify({'error': f'A request can have at most {RECEIPTS_PER_REQUEST} receipts.'}), 409
+        save_receipts(conn, g.user['organization_id'], target['id'], g.user['email'], receipts)
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'added': len(receipts)}), 201
+
 
 # ==========================================
 # POLICY RULES
 # ==========================================
-POLICY_RULE_TYPES = ('amount_limit', 'duplicate_request', 'always_review')
+POLICY_RULE_TYPES = ('amount_limit', 'duplicate_request', 'always_review', 'receipt_required')
 POLICY_REVIEW_FIELDS = {'request_type': 'Request type', 'destination': 'Destination', 'role': 'Role', 'department': 'Department'}
 POLICY_RULES_PER_ORGANIZATION = 100
 POLICY_TEXT_MAX_LENGTH = 100
@@ -737,6 +1035,12 @@ def validate_policy_config(rule_type, config):
             return None, 'window_days must be a whole number from 1 to 90.'
         return {'window_days': days}, None
 
+    if rule_type == 'receipt_required':
+        above = config.get('above_amount_inr', 0)
+        if isinstance(above, bool) or not isinstance(above, (int, float)) or not math.isfinite(above) or not 0 <= above <= 1_000_000_000:
+            return None, 'above_amount_inr must be an amount in INR, or 0 to require a receipt on every request.'
+        return {'above_amount_inr': float(above)}, None
+
     field, values = config.get('field'), config.get('values')
     if not isinstance(field, str) or field not in POLICY_REVIEW_FIELDS:
         return None, f"field must be one of: {', '.join(POLICY_REVIEW_FIELDS)}."
@@ -762,6 +1066,11 @@ def policy_rule_reason(conn, rule_type, config, organization_id, submitter, fiel
         ).fetchone()['total']
         if earlier:
             return f"The same employee submitted this request type and amount within the last {config['window_days']} days."
+    elif rule_type == 'receipt_required':
+        if fields['receipt_count'] == 0 and fields['amount_inr'] > config['above_amount_inr']:
+            if config['above_amount_inr']:
+                return f"No receipt was attached for an amount above ₹{config['above_amount_inr']:,.0f}."
+            return 'No receipt was attached.'
     elif rule_type == 'always_review':
         value = str(fields[config['field']] or '').strip()
         if value.lower() in {v.lower() for v in config['values']}:
@@ -924,7 +1233,8 @@ def predict():
 
     try:
         current_email = get_jwt_identity()
-        data = request.get_json(silent=True) or {}
+        # The employee portal sends a form so receipt files travel with the request; other clients may send JSON.
+        data = request.form.to_dict() if request.mimetype == 'multipart/form-data' else (request.get_json(silent=True) or {})
         xgb_model = artifacts['xgboost_model']
         iso_forest = artifacts['isolation_forest']
         oc_svm = artifacts['one_class_svm']
@@ -955,6 +1265,16 @@ def predict():
                 raise ValueError
         except (TypeError, ValueError):
             return jsonify({'error': 'Amount must be a positive number.'}), 400
+
+        purpose = str(data.get('Purpose') or '').strip() if isinstance(data.get('Purpose'), (str, type(None))) else ''
+        if not PURPOSE_MIN_LENGTH <= len(purpose) <= PURPOSE_MAX_LENGTH:
+            return jsonify({'error': f'Please describe the business purpose in {PURPOSE_MIN_LENGTH} to {PURPOSE_MAX_LENGTH} characters.'}), 400
+        expense_date, end_date, date_error = parse_request_dates(data.get('Expense_Date'), data.get('End_Date'))
+        if date_error:
+            return jsonify({'error': date_error}), 400
+        receipts, receipt_error = read_receipt_uploads(request.files.getlist('receipts'))
+        if receipt_error:
+            return jsonify({'error': receipt_error}), 400
 
         # Normalize Amount to INR
         rate = exchange_rates.get(currency, 1.0)
@@ -1024,21 +1344,26 @@ def predict():
         # person; rules never approve or reject on their own, and the AI's own decision is still recorded.
         violations = policy_violations(conn, g.user['organization_id'], current_email, {
             'role': role, 'department': department, 'request_type': req_type, 'destination': destination,
-            'amount': amount, 'currency': currency, 'amount_inr': normalized_inr,
+            'amount': amount, 'currency': currency, 'amount_inr': normalized_inr, 'receipt_count': len(receipts),
         })
         if violations:
             status = 'ESCALATED_RULE'
+        # A large request always needs two people, so it never passes on the AI's word alone.
+        if status == 'APPROVED' and needs_second_approval(g.user, normalized_inr):
+            status = 'ESCALATED_HIGH_VALUE'
+        # A request that needs a person goes to the employee's manager first; without a manager, the admins decide.
+        approver_email = g.user['manager_email'] if status.startswith('ESCALATED') else None
         request_id = conn.execute(
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
                 final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode,
-                policy_violations
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
+                policy_violations, purpose, expense_date, end_date, approver_email
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
              status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode,
-             json.dumps(violations) if violations else None)
+             json.dumps(violations) if violations else None, purpose, expense_date, end_date, approver_email)
         ).fetchall()[0][0]
         record_event(
             conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
@@ -1047,15 +1372,22 @@ def predict():
                 'approval_mode': approval_mode,
                 'ai_recommendation': ai_decision,
                 'policy_violations': violations,
+                'approver': approver_email,
                 'approval_score': round(xgb_prob, 4),
                 'unrecognized_category': is_unknown_category,
                 'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
-                'thresholds': {'auto_approve_above': auto_approve_above, 'escalate_below': ESCALATE_THRESHOLD},
+                'thresholds': {'auto_approve_above': auto_approve_above, 'escalate_below': ESCALATE_THRESHOLD,
+                               'second_approval_above': organization_second_approval_amount(g.user)},
                 'explanation': shap_impact,
             }
         )
+        save_receipts(conn, g.user['organization_id'], request_id, current_email, receipts)
+        # Whoever must decide is told once the request is safely saved.
+        send_notice = waiting_notice(conn, g.user['organization_id'], request_id, approver_email) if status.startswith('ESCALATED') else None
         conn.commit()
         conn.close()
+        if send_notice:
+            send_notice()
 
         # Employees only learn the outcome. Scores and escalation reasons stay with administrators,
         # so nobody can map the model's boundaries by resubmitting variations of a request.
@@ -1066,6 +1398,8 @@ def predict():
             'normalized_inr': normalized_inr,
         })
 
+    except HTTPException:
+        raise  # For example an upload over the size limit, answered by its own handler.
     except Exception:
         app.logger.exception("Prediction failed")
         return jsonify({
@@ -1555,6 +1889,8 @@ def current_organization():
             'auto_approve_above': organization_auto_approve_threshold(g.user),
             'minimum_auto_approve_above': AUTO_APPROVE_THRESHOLD,
             'maximum_auto_approve_above': AUTO_APPROVE_THRESHOLD_MAX,
+            'second_approval_above': organization_second_approval_amount(g.user),
+            'maximum_second_approval_above': SECOND_APPROVAL_MAX_INR,
         }
     return jsonify(body)
 
@@ -1565,24 +1901,110 @@ def update_approval_settings():
     if 'approval_mode' in data:
         return jsonify({'error': 'Only Neuzem can switch an organization between shadow and automatic approval.'}), 403
 
-    value = data.get('auto_approve_above')
-    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-            or not AUTO_APPROVE_THRESHOLD <= value <= AUTO_APPROVE_THRESHOLD_MAX):
-        return jsonify({
-            'error': f'The auto-approval threshold must be between {AUTO_APPROVE_THRESHOLD:.0%} and {AUTO_APPROVE_THRESHOLD_MAX:.0%}.'
-        }), 400
-    value = round(float(value), 4)
-    previous = organization_auto_approve_threshold(g.user)
+    changes = {}
+    if 'auto_approve_above' in data:
+        value = data['auto_approve_above']
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or not AUTO_APPROVE_THRESHOLD <= value <= AUTO_APPROVE_THRESHOLD_MAX):
+            return jsonify({
+                'error': f'The auto-approval threshold must be between {AUTO_APPROVE_THRESHOLD:.0%} and {AUTO_APPROVE_THRESHOLD_MAX:.0%}.'
+            }), 400
+        changes['auto_approve_above'] = (organization_auto_approve_threshold(g.user), round(float(value), 4))
+
+    if 'second_approval_above' in data:
+        # None turns the second approval off; any amount from ₹1 upwards turns it on.
+        value = data['second_approval_above']
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not math.isfinite(value) or not 1 <= value <= SECOND_APPROVAL_MAX_INR):
+            return jsonify({
+                'error': f'The second-approval amount must be between ₹1 and ₹{SECOND_APPROVAL_MAX_INR:,.0f}, or empty to turn it off.'
+            }), 400
+        changes['second_approval_above'] = (organization_second_approval_amount(g.user),
+                                            None if value is None else round(float(value), 2))
+
+    if not changes:
+        return jsonify({'error': 'There is nothing to change.'}), 400
 
     conn = get_db_connection()
     try:
-        conn.execute('UPDATE Organizations SET auto_approve_above = ? WHERE id = ?', (value, g.user['organization_id']))
+        for column, (previous, value) in changes.items():
+            conn.execute(f'UPDATE Organizations SET {column} = ? WHERE id = ?', (value, g.user['organization_id']))
         record_event(conn, 'settings.updated', organization_id=g.user['organization_id'], actor=g.user['email'],
-                     details={'auto_approve_above': {'from': previous, 'to': value}})
+                     details={column: {'from': previous, 'to': value} for column, (previous, value) in changes.items()})
         conn.commit()
     finally:
         conn.close()
-    return jsonify({'status': 'SUCCESS', 'auto_approve_above': value})
+    return jsonify({'status': 'SUCCESS', **{column: value for column, (_, value) in changes.items()}})
+
+@app.route('/api/auth/set_manager', methods=['POST'])
+@require_role('Admin')
+def set_manager():
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    manager_email = data.get('manager_email') or None
+    if not isinstance(email, str) or (manager_email is not None and not isinstance(manager_email, str)):
+        return jsonify({'error': 'email and manager_email must be email addresses.'}), 400
+    if manager_email == email:
+        return jsonify({'error': 'An employee cannot be their own manager.'}), 400
+
+    organization_id = g.user['organization_id']
+    conn = get_db_connection()
+    try:
+        employee = conn.execute(
+            'SELECT email, role, manager_email FROM Users WHERE email = ? AND organization_id = ?', (email, organization_id)
+        ).fetchone()
+        if not employee:
+            return jsonify({'error': 'User not found.'}), 404
+        # Admins manage employees' reporting lines; only Super Admins change an administrator's manager.
+        if employee['role'] != 'User' and g.user['role'] != 'SuperAdmin':
+            return jsonify({'error': "Only a Super Admin can change an administrator's manager."}), 403
+
+        if manager_email:
+            manager = conn.execute(
+                "SELECT email FROM Users WHERE email = ? AND organization_id = ? AND status = 'Active'", (manager_email, organization_id)
+            ).fetchone()
+            if not manager:
+                return jsonify({'error': 'The manager must be an active account in your organization.'}), 404
+            # Walk up from the new manager: reaching the employee again would make a reporting loop.
+            current, seen = manager_email, set()
+            while current and current not in seen:
+                if current == email:
+                    return jsonify({'error': 'This would make a loop where people manage each other.'}), 409
+                seen.add(current)
+                row = conn.execute('SELECT manager_email FROM Users WHERE email = ? AND organization_id = ?', (current, organization_id)).fetchone()
+                current = row['manager_email'] if row else None
+
+        if employee['manager_email'] != manager_email:
+            conn.execute('UPDATE Users SET manager_email = ? WHERE email = ? AND organization_id = ?', (manager_email, email, organization_id))
+            # Requests already waiting for a decision move to the new manager, or to the admins when there is none.
+            # A request already waiting for its second approval stays with the administrators.
+            conn.execute(
+                "UPDATE Requests SET approver_email = ? WHERE submitted_by = ? AND organization_id = ? "
+                "AND final_decision LIKE 'ESCALATED%' AND final_decision != 'ESCALATED_SECOND_APPROVAL'",
+                (manager_email, email, organization_id)
+            )
+            record_event(conn, 'user.manager_changed', organization_id=organization_id, actor=g.user['email'],
+                         details={'email': email, 'from': employee['manager_email'], 'to': manager_email})
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/team_requests', methods=['GET'])
+@require_login
+def team_requests():
+    # A manager sees the requests of the people who report to them; approver_email shows which are waiting for them.
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT Requests.*, {RECEIPT_COUNT_SQL} FROM Requests "
+            "JOIN Users ON Users.email = Requests.submitted_by AND Users.organization_id = Requests.organization_id "
+            "WHERE Requests.organization_id = ? AND Users.manager_email = ? ORDER BY Requests.created_at DESC",
+            (g.user['organization_id'], g.user['email'])
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({'requests': [to_json_row(row) for row in rows]})
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
@@ -1707,7 +2129,7 @@ def get_pending_users():
 def get_all_users():
     conn = get_db_connection()
     users = conn.execute(
-        'SELECT id, email, name, role, status, created_at FROM Users WHERE organization_id = ?', (g.user['organization_id'],)
+        'SELECT id, email, name, role, status, manager_email, created_at FROM Users WHERE organization_id = ?', (g.user['organization_id'],)
     ).fetchall()
     conn.close()
     
@@ -1736,6 +2158,9 @@ def delete_user():
 
     cursor = conn.execute('DELETE FROM Users WHERE email = ? AND organization_id = ?', (email, g.user['organization_id']))
     if cursor.rowcount:
+        # People who reported to the removed account lose their manager, and requests waiting for it go to the admins.
+        conn.execute('UPDATE Users SET manager_email = NULL WHERE manager_email = ? AND organization_id = ?', (email, g.user['organization_id']))
+        conn.execute('UPDATE Requests SET approver_email = NULL WHERE approver_email = ? AND organization_id = ?', (email, g.user['organization_id']))
         record_event(conn, 'user.deleted', organization_id=g.user['organization_id'], actor=g.user['email'],
                      details={'email': email, 'role': target['role'] if target else None})
     conn.commit()
@@ -1839,7 +2264,13 @@ def get_profile():
     email = get_jwt_identity()
         
     conn = get_db_connection()
-    user = conn.execute('SELECT name, emp_id, role, created_at FROM Users WHERE email = ?', (email,)).fetchone()
+    user = conn.execute(
+        'SELECT name, emp_id, role, manager_email, created_at, '
+        '(SELECT COUNT(*) FROM Users AS reports WHERE reports.manager_email = Users.email '
+        'AND reports.organization_id = Users.organization_id) AS report_count '
+        'FROM Users WHERE email = ?',
+        (email,)
+    ).fetchone()
     conn.close()
     
     if user:
@@ -1873,7 +2304,7 @@ def my_requests():
     requests = conn.execute(
         "SELECT id, role, department, request_type, destination, amount, currency, normalized_amount, "
         "CASE WHEN final_decision LIKE 'ESCALATED%' THEN 'ESCALATED' ELSE final_decision END AS final_decision, "
-        "submitted_by, employee_name, employee_id, created_at "
+        f"submitted_by, employee_name, employee_id, purpose, expense_date, end_date, created_at, {RECEIPT_COUNT_SQL} "
         "FROM Requests WHERE submitted_by = ? AND organization_id = ? ORDER BY created_at DESC",
         (current_email, g.user['organization_id'])
     ).fetchall()
@@ -1887,7 +2318,7 @@ def my_requests():
 def pending_approval_requests():
     conn = get_db_connection()
     requests = conn.execute(
-        "SELECT * FROM Requests WHERE final_decision LIKE 'ESCALATED%' AND organization_id = ? ORDER BY created_at DESC",
+        f"SELECT *, {RECEIPT_COUNT_SQL} FROM Requests WHERE final_decision LIKE 'ESCALATED%' AND organization_id = ? ORDER BY created_at DESC",
         (g.user['organization_id'],)
     ).fetchall()
     conn.close()
@@ -1900,7 +2331,7 @@ def pending_approval_requests():
 def all_requests():
     conn = get_db_connection()
     requests = conn.execute(
-        "SELECT * FROM Requests WHERE organization_id = ? ORDER BY created_at DESC", (g.user['organization_id'],)
+        f"SELECT *, {RECEIPT_COUNT_SQL} FROM Requests WHERE organization_id = ? ORDER BY created_at DESC", (g.user['organization_id'],)
     ).fetchall()
     conn.close()
     
@@ -1915,7 +2346,7 @@ def is_decided(decision):
 
 COMMENT_MAX_LENGTH = 1000
 
-def change_request_decision(new_decision, allowed_from, conflict_message, action, reason_required=False):
+def change_request_decision(new_decision, allowed_from, conflict_message, action, reason_required=False, managers_allowed=False):
     data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
@@ -1928,10 +2359,15 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
     conn = get_db_connection()
     try:
         target = conn.execute(
-            'SELECT id, submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            'SELECT id, submitted_by, final_decision, approver_email, normalized_amount, first_approved_by '
+            'FROM Requests WHERE id = ? AND organization_id = ?',
             (req_id, g.user['organization_id'])
         ).fetchone()
         if not target:
+            return jsonify({'error': 'Request not found.'}), 404
+        # Admins decide any request in their organization; a manager decides only the requests waiting for them.
+        is_assigned_manager = managers_allowed and target['approver_email'] == g.user['email']
+        if g.user['role'] not in ('Admin', 'SuperAdmin') and not is_assigned_manager:
             return jsonify({'error': 'Request not found.'}), 404
         if target['submitted_by'] == g.user['email']:
             return jsonify({'error': 'You cannot review your own request.'}), 403
@@ -1940,37 +2376,70 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
         if reason_required and not comment:
             return jsonify({'error': 'Please give a reason. It is saved in the request history.'}), 400
 
+        details = {'decided_as': 'manager' if is_assigned_manager else 'admin'}
+        first_approver = target['first_approved_by']
+        if new_decision == 'APPROVED':
+            if first_approver == g.user['email']:
+                return jsonify({'error': 'You gave the first approval, so somebody else must give the second one.'}), 403
+            if first_approver is None and needs_second_approval(g.user, target['normalized_amount']):
+                # A large request is only half approved: an administrator must add the second approval.
+                new_decision, action = 'ESCALATED_SECOND_APPROVAL', 'request.first_approved'
+                first_approver = g.user['email']
+                details['second_approval_above'] = organization_second_approval_amount(g.user)
+            elif first_approver:
+                details['first_approved_by'] = first_approver
+
         reviewer = g.user['email'] if is_decided(new_decision) else None
-        # Matching the status that was checked stops two admins acting at once from overwriting each other.
+        next_approver = None
+        if new_decision == 'ESCALATED_SECOND_APPROVAL':
+            pass  # No single approver: any other administrator can give the second approval.
+        elif not is_decided(new_decision):
+            # A reopened request starts over with the employee's current manager, or with the admins if they have none.
+            submitter = conn.execute(
+                'SELECT manager_email FROM Users WHERE email = ? AND organization_id = ?',
+                (target['submitted_by'], g.user['organization_id'])
+            ).fetchone()
+            next_approver = submitter['manager_email'] if submitter else None
+            first_approver = None
+        # Matching the status that was checked stops two people acting at once from overwriting each other.
         cursor = conn.execute(
-            f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'} "
-            'WHERE id = ? AND organization_id = ? AND final_decision = ?',
-            (new_decision, reviewer, target['id'], g.user['organization_id'], target['final_decision'])
+            f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'}, "
+            'approver_email = ?, first_approved_by = ? WHERE id = ? AND organization_id = ? AND final_decision = ?',
+            (new_decision, reviewer, next_approver, first_approver, target['id'], g.user['organization_id'], target['final_decision'])
         )
         if not cursor.rowcount:
             return jsonify({'error': conflict_message}), 409
         # The decision and its history entry are saved together, or neither is.
         record_event(
             conn, action, organization_id=g.user['organization_id'], request_id=target['id'], actor=g.user['email'],
-            from_status=target['final_decision'], to_status=new_decision, comment=comment
+            from_status=target['final_decision'], to_status=new_decision, comment=comment, details=details
         )
+        send_notice = None
+        if is_awaiting_review(new_decision):
+            note = ('This request already has one approval and needs a second one from an administrator.'
+                    if new_decision == 'ESCALATED_SECOND_APPROVAL' else None)
+            send_notice = waiting_notice(conn, g.user['organization_id'], target['id'], next_approver, note)
         conn.commit()
     finally:
         conn.close()
-    return jsonify({'status': 'SUCCESS'})
+    if send_notice:
+        send_notice()
+    return jsonify({'status': 'SUCCESS', 'final_decision': new_decision})
 
 @app.route('/api/auth/approve_request', methods=['POST'])
-@require_role('Admin')
+@require_login
 def approve_request():
     return change_request_decision(
-        'APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.', 'request.approved'
+        'APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.', 'request.approved',
+        managers_allowed=True
     )
 
 @app.route('/api/auth/reject_request', methods=['POST'])
-@require_role('Admin')
+@require_login
 def reject_request():
     return change_request_decision(
-        'REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.', 'request.rejected', reason_required=True
+        'REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.', 'request.rejected',
+        reason_required=True, managers_allowed=True
     )
 
 @app.route('/api/auth/reopen_request', methods=['POST'])
@@ -1982,7 +2451,7 @@ def reopen_request():
     )
 
 @app.route('/api/auth/request_history', methods=['GET'])
-@require_role('Admin')
+@require_login
 def request_history():
     request_id = request.args.get('id', type=int)
     if request_id is None:
@@ -1992,6 +2461,8 @@ def request_history():
     try:
         if not conn.execute('SELECT id FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])).fetchone():
             return jsonify({'error': 'Request not found.'}), 404
+        if not can_review_request(conn, request_id):
+            return jsonify({'error': "Only administrators and the employee's manager can see this history."}), 403
         rows = conn.execute(
             'SELECT action, actor_email, from_status, to_status, comment, details, created_at FROM AuditEvents '
             'WHERE request_id = ? AND organization_id = ? ORDER BY id',

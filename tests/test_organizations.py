@@ -1,4 +1,4 @@
-from conftest import SUPER_ADMIN, join_code_of, query
+from conftest import REQUEST_DETAILS, SUPER_ADMIN, join_code_of, query
 
 # The tables as they existed before organizations, in each backend's original form.
 LEGACY_SCHEMA = {
@@ -97,7 +97,7 @@ def test_submitted_request_records_the_submitters_organization(client, app_db):
     assert client.post('/api/auth/login', json=SUPER_ADMIN).status_code == 200
     response = client.post('/api/predict', json={
         'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-        'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+        'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
     })
     assert response.status_code == 200, response.get_json()
     assert query(app_db, 'SELECT submitted_by, organization_id FROM Requests') == [
