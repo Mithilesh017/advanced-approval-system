@@ -105,8 +105,9 @@ def test_employee_cannot_use_admin_features(client, app_db):
 
 def test_admin_cannot_use_super_admin_features(client, app_db):
     create_user(app_db, 'manager@example.com', role='Admin')
+    create_user(app_db, 'candidate@example.com', role='Admin', status='Pending')
     login(client, 'manager@example.com')
-    assert client.get('/api/model/info').status_code == 403
+    assert client.post('/api/auth/approve_user', json={'email': 'candidate@example.com'}).status_code == 403
 
 
 def test_super_admin_can_use_admin_features(client, app_db):

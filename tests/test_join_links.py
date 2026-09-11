@@ -1,6 +1,6 @@
 import pytest
 
-from conftest import PASSWORD, SUPER_ADMIN, create_organization, create_user, execute, join_code_of, login, query
+from conftest import PASSWORD, create_organization, create_user, execute, join_code_of, login, query
 
 ACCOUNT_EMAILS = (
     'sendUserRegistrationNotification', 'sendAdminRegistrationNotification', 'sendUserApprovedEmail',
@@ -102,17 +102,11 @@ def test_admins_get_their_organizations_join_link(app_db, acme):
     body = session(app_db, 'admin@acme.test').get('/api/auth/organization').get_json()
     assert body['name'] == 'Acme Pvt Ltd'
     assert body['join_link'].endswith(f"/join/{acme['code']}")
-    assert body['can_manage_model'] is False
 
 
 def test_employees_see_their_organization_but_not_the_join_link(app_db, acme):
     body = session(app_db, 'staff@acme.test').get('/api/auth/organization').get_json()
-    assert body == {'name': 'Acme Pvt Ltd', 'join_link': None, 'can_manage_model': False}
-
-
-def test_only_default_organization_super_admins_are_offered_model_management(app_db, acme):
-    assert session(app_db, 'super@acme.test').get('/api/auth/organization').get_json()['can_manage_model'] is False
-    assert session(app_db, SUPER_ADMIN['email']).get('/api/auth/organization').get_json()['can_manage_model'] is True
+    assert body == {'name': 'Acme Pvt Ltd', 'join_link': None}
 
 
 def test_account_emails_escape_the_organization_name(app_db, monkeypatch):

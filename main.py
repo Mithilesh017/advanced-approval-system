@@ -103,17 +103,6 @@ def require_role(role):
         return decorator
     return wrapper
 
-def require_model_admin(fn):
-    # The model is shared by every organization. Until the Platform Owner role exists,
-    # only Super Admins of the default organization may retrain it or switch versions.
-    @wraps(fn)
-    @require_role('SuperAdmin')
-    def decorator(*args, **kwargs):
-        if g.user['organization_id'] != DEFAULT_ORGANIZATION_ID:
-            return jsonify({"error": "Insufficient permissions"}), 403
-        return fn(*args, **kwargs)
-    return decorator
-
 PLATFORM_OWNER_ROLE = 'PlatformOwner'
 HOME_PAGES = {PLATFORM_OWNER_ROLE: 'platform.html', 'SuperAdmin': 'admin.html', 'Admin': 'admin.html'}
 
@@ -738,18 +727,18 @@ def predict():
         }), 500
 
 
-@app.route('/api/model/info', methods=['GET'])
-@require_model_admin
+@app.route('/api/platform/model/info', methods=['GET'])
+@require_platform_owner
 def model_info():
     artifacts, version_id = get_active_model()
     if artifacts is None:
         return jsonify({'ready': False})
 
     conn = get_db_connection()
-    decided = conn.execute(
-        "SELECT COUNT(*) AS total FROM Requests WHERE reviewed_by IS NOT NULL AND final_decision IN ('APPROVED', 'REJECTED')"
-    ).fetchone()['total']
-    conn.close()
+    try:
+        decided = conn.execute(f"SELECT COUNT(*) AS total {TRAINABLE_DECISIONS_SQL}").fetchone()['total']
+    finally:
+        conn.close()
 
     metrics = artifacts.get('metrics') or {}
     return jsonify({
@@ -770,6 +759,8 @@ def model_info():
     })
 
 
+REQUEST_FEATURE_COLUMNS = dict(zip(model_pipeline.CATEGORICAL_FEATURES, ('role', 'department', 'request_type', 'destination')))
+
 @app.route('/api/model/form_options', methods=['GET'])
 @require_login
 def model_form_options():
@@ -777,11 +768,23 @@ def model_form_options():
     if artifacts is None:
         return jsonify({'error': 'The AI model is currently unavailable. Please try again later.'}), 503
 
-    options = artifacts.get('form_options') or {
-        col: sorted(str(value) for value in artifacts['encoders'][col].classes_)
-        for col in model_pipeline.CATEGORICAL_FEATURES
-    }
-    return jsonify({'options': options, 'currencies': list(exchange_rates)})
+    options = {col: set(values) for col, values in model_pipeline.standard_form_options(artifacts).items()}
+
+    # Beyond the shared base list, offer only values this organization has used and the model has learned,
+    # so one organization's own roles, departments or destinations never appear in another's form.
+    conn = get_db_connection()
+    try:
+        used = conn.execute(
+            'SELECT DISTINCT role, department, request_type, destination FROM Requests WHERE organization_id = ?',
+            (g.user['organization_id'],)
+        ).fetchall()
+    finally:
+        conn.close()
+    for feature, column in REQUEST_FEATURE_COLUMNS.items():
+        learned = set(map(str, artifacts['encoders'][feature].classes_))
+        options[feature].update(str(row[column]) for row in used if row[column] is not None and str(row[column]) in learned)
+
+    return jsonify({'options': {col: sorted(values) for col, values in options.items()}, 'currencies': list(exchange_rates)})
 
 
 def utc_now_text():
@@ -802,18 +805,31 @@ def training_job_to_json(row):
         job['message'] = 'Retraining was interrupted, most likely by a server restart. Please try again.'
     return job
 
+# The model only learns from requests an administrator decided by hand, in organizations that agreed to share their data.
+TRAINABLE_DECISIONS_SQL = (
+    "FROM Requests JOIN Organizations ON Organizations.id = Requests.organization_id "
+    "WHERE Requests.reviewed_by IS NOT NULL AND Requests.final_decision IN ('APPROVED', 'REJECTED') "
+    "AND Organizations.allow_training_data = 1"
+)
+
+def trainable_decisions(conn):
+    rows = conn.execute(
+        "SELECT Requests.id, Requests.role, Requests.department, Requests.request_type, Requests.destination, "
+        f"Requests.normalized_amount, Requests.final_decision {TRAINABLE_DECISIONS_SQL}"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
 def run_training_job(job_id, started_by):
     try:
         update_training_job(job_id, step='collecting')
         current, _ = get_active_model(force=True)
         base = model_pipeline.base_training_data(current, BASE_TRAINING_CSV)
         conn = get_db_connection()
-        decisions = conn.execute(
-            "SELECT id, role, department, request_type, destination, normalized_amount, final_decision FROM Requests "
-            "WHERE reviewed_by IS NOT NULL AND final_decision IN ('APPROVED', 'REJECTED')"
-        ).fetchall()
-        conn.close()
-        feedback = model_pipeline.feedback_training_data([dict(row) for row in decisions])
+        try:
+            decisions = trainable_decisions(conn)
+        finally:
+            conn.close()
+        feedback = model_pipeline.feedback_training_data(decisions)
 
         update_training_job(job_id, step='training')
         candidate, holdout = model_pipeline.train_ensemble(base, feedback)
@@ -865,9 +881,9 @@ def run_training_job(job_id, started_by):
         )
 
 
-@app.route('/api/model/retrain', methods=['POST'])
+@app.route('/api/platform/model/retrain', methods=['POST'])
 @limiter.limit("10 per hour")
-@require_model_admin
+@require_platform_owner
 def retrain_model():
     started_by = get_jwt_identity()
     conn = get_db_connection()
@@ -892,8 +908,8 @@ def retrain_model():
     return jsonify({'status': 'STARTED', 'job_id': job_id}), 202
 
 
-@app.route('/api/model/jobs/latest', methods=['GET'])
-@require_model_admin
+@app.route('/api/platform/model/jobs/latest', methods=['GET'])
+@require_platform_owner
 def latest_training_job():
     conn = get_db_connection()
     row = conn.execute('SELECT * FROM TrainingJobs ORDER BY id DESC LIMIT 1').fetchone()
@@ -901,8 +917,8 @@ def latest_training_job():
     return jsonify({'job': training_job_to_json(row) if row else None})
 
 
-@app.route('/api/model/versions', methods=['GET'])
-@require_model_admin
+@app.route('/api/platform/model/versions', methods=['GET'])
+@require_platform_owner
 def model_versions():
     conn = get_db_connection()
     rows = conn.execute('SELECT id, metrics, created_by, is_active, created_at FROM ModelVersions ORDER BY id DESC').fetchall()
@@ -924,8 +940,8 @@ def model_versions():
     return jsonify({'versions': versions, 'bundled': bundled_info})
 
 
-@app.route('/api/model/activate', methods=['POST'])
-@require_model_admin
+@app.route('/api/platform/model/activate', methods=['POST'])
+@require_platform_owner
 def activate_model_version():
     data = request.get_json(silent=True) or {}
     version_id = data.get('version_id')
@@ -1166,7 +1182,6 @@ def current_organization():
     return jsonify({
         'name': organization['name'],
         'join_link': f"{public_base_url()}/join/{quote(organization['join_code'], safe='')}" if is_admin else None,
-        'can_manage_model': g.user['role'] == 'SuperAdmin' and g.user['organization_id'] == DEFAULT_ORGANIZATION_ID,
     })
 
 @app.route('/api/auth/request_access', methods=['POST'])

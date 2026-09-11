@@ -5,11 +5,12 @@ from conftest import (
     create_user, execute, login, query,
 )
 
-PLATFORM_ROUTES = [
-    ('GET', '/api/platform/organizations'),
-    ('POST', '/api/platform/create_organization'),
-    ('POST', '/api/platform/update_organization'),
-]
+def platform_routes(app):
+    return [
+        (method, rule.rule)
+        for rule in app.url_map.iter_rules() if rule.rule.startswith('/api/platform/')
+        for method in rule.methods - {'HEAD', 'OPTIONS'}
+    ]
 
 
 def session(app_db, email):
@@ -75,7 +76,7 @@ def test_platform_owner_cannot_reach_any_organizations_data(app_db, owner):
             status = owner.open(rule.rule, method=method, json={}).status_code
             assert status in (401, 403), f'{method} {rule.rule} answered {status} for a Platform Owner'
             checked += 1
-    assert checked >= 20
+    assert checked >= 15
 
 
 @pytest.mark.parametrize('role', ['SuperAdmin', 'Admin', 'User'])
@@ -87,8 +88,10 @@ def test_organization_accounts_cannot_use_the_platform(app_db, role):
         create_user(app_db, email, role=role)
     client = session(app_db, email)
 
-    for method, path in PLATFORM_ROUTES:
-        assert client.open(path, method=method, json={'id': 1, 'status': 'Paused'}).status_code == 403
+    routes = platform_routes(app_db.app)
+    assert len(routes) >= 8
+    for method, path in routes:
+        assert client.open(path, method=method, json={'id': 1, 'status': 'Paused', 'version_id': None}).status_code == 403
     assert query(app_db, 'SELECT status FROM Organizations') == [{'status': 'Active'}]
 
 

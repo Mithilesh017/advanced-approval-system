@@ -98,9 +98,10 @@ def test_access_requests_only_notify_that_organizations_admins(app_db, orgs, mon
     assert sorted(notified) == ['admin@a.test', 'super@a.test', 'super@a.test']
 
 
-def test_only_default_organization_super_admins_manage_the_shared_model(app_db, orgs):
-    for path in ('/api/model/info', '/api/model/versions', '/api/model/jobs/latest'):
-        assert session(app_db, 'super@a.test').get(path).status_code == 403
-    assert session(app_db, 'super@a.test').post('/api/model/retrain').status_code == 403
-    assert session(app_db, 'super@a.test').post('/api/model/activate', json={'version_id': None}).status_code == 403
-    assert session(app_db, SUPER_ADMIN['email']).get('/api/model/info').status_code == 200
+@pytest.mark.parametrize('email', [SUPER_ADMIN['email'], 'super@a.test'])
+def test_no_organization_account_can_manage_the_shared_model(app_db, orgs, email):
+    client = session(app_db, email)
+    for path in ('/api/platform/model/info', '/api/platform/model/versions', '/api/platform/model/jobs/latest'):
+        assert client.get(path).status_code == 403
+    assert client.post('/api/platform/model/retrain').status_code == 403
+    assert client.post('/api/platform/model/activate', json={'version_id': None}).status_code == 403
