@@ -62,6 +62,7 @@ allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5000').split(',')
 CORS(app, supports_credentials=True, origins=allowed_origins)
 
 ORGANIZATION_PAUSED_MESSAGE = "Your organization's access is paused. Please contact your administrator."
+SESSION_INVALID_MESSAGE = 'Your session is no longer valid. Please log in again.'
 
 def create_session_token(user):
     return create_access_token(identity=str(user['email']), additional_claims={'organization_id': user['organization_id']})
@@ -84,7 +85,7 @@ def require_login(fn):
             conn.close()
 
         if not user or user['status'] != 'Active' or user['organization_id'] != get_jwt().get('organization_id'):
-            return jsonify({'error': 'Your session is no longer valid. Please log in again.'}), 401
+            return jsonify({'error': SESSION_INVALID_MESSAGE}), 401
         if user['organization_status'] != 'Active':
             return jsonify({'error': ORGANIZATION_PAUSED_MESSAGE}), 403
         g.user = dict(user)
@@ -110,6 +111,34 @@ def require_model_admin(fn):
     def decorator(*args, **kwargs):
         if g.user['organization_id'] != DEFAULT_ORGANIZATION_ID:
             return jsonify({"error": "Insufficient permissions"}), 403
+        return fn(*args, **kwargs)
+    return decorator
+
+PLATFORM_OWNER_ROLE = 'PlatformOwner'
+HOME_PAGES = {PLATFORM_OWNER_ROLE: 'platform.html', 'SuperAdmin': 'admin.html', 'Admin': 'admin.html'}
+
+def home_page(role):
+    return HOME_PAGES.get(role, 'user.html')
+
+def require_platform_owner(fn):
+    # Platform Owners run the Neuzem platform and belong to no organization, so require_login,
+    # which needs an organization, never lets them into any organization's data.
+    @wraps(fn)
+    @jwt_required()
+    def decorator(*args, **kwargs):
+        conn = get_db_connection()
+        try:
+            user = conn.execute(
+                'SELECT id, email, role, status, organization_id FROM Users WHERE email = ?', (get_jwt_identity(),)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not user or user['status'] != 'Active' or user['organization_id'] != get_jwt().get('organization_id'):
+            return jsonify({'error': SESSION_INVALID_MESSAGE}), 401
+        if user['role'] != PLATFORM_OWNER_ROLE or user['organization_id'] is not None:
+            return jsonify({"error": "Insufficient permissions"}), 403
+        g.user = dict(user)
         return fn(*args, **kwargs)
     return decorator
 
@@ -441,12 +470,35 @@ def ensure_default_organization():
             (DEFAULT_ORGANIZATION_NAME, secrets.token_urlsafe(9))
         )
         organization_id = conn.execute('SELECT id FROM Organizations WHERE is_default = 1').fetchone()['id']
-        for table in ORGANIZATION_SCOPED_TABLES:
-            conn.execute(f'UPDATE {table} SET organization_id = ? WHERE organization_id IS NULL', (organization_id,))
+        # Platform Owners are the only accounts that belong to no organization.
+        conn.execute(
+            'UPDATE Users SET organization_id = ? WHERE organization_id IS NULL AND role != ?', (organization_id, PLATFORM_OWNER_ROLE)
+        )
+        conn.execute('UPDATE Requests SET organization_id = ? WHERE organization_id IS NULL', (organization_id,))
         conn.commit()
     finally:
         conn.close()
     return organization_id
+
+def bootstrap_platform_owner():
+    email = os.getenv('PLATFORM_OWNER_EMAIL')
+    password = os.getenv('PLATFORM_OWNER_PASSWORD')
+    if not email or not password:
+        return
+
+    conn = get_db_connection()
+    try:
+        existing = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
+        if existing is None:
+            conn.execute(
+                'INSERT INTO Users (email, password_hash, role, status) VALUES (?, ?, ?, ?)',
+                (email, generate_password_hash(password), PLATFORM_OWNER_ROLE, 'Active')
+            )
+            conn.commit()
+        elif existing['role'] != PLATFORM_OWNER_ROLE:
+            print(f"[WARNING] PLATFORM_OWNER_EMAIL already belongs to a {existing['role']} account, so no Platform Owner was created.")
+    finally:
+        conn.close()
 
 def setup_database():
     global DEFAULT_ORGANIZATION_ID
@@ -454,6 +506,7 @@ def setup_database():
     check_and_add_columns()
     DEFAULT_ORGANIZATION_ID = ensure_default_organization()
     bootstrap_super_admin()
+    bootstrap_platform_owner()
 
 print("Initializing Auth Database...")
 setup_database()
@@ -900,6 +953,122 @@ def activate_model_version():
 
 
 # ==========================================
+# PLATFORM (NEUZEM) API ROUTES
+# ==========================================
+ORGANIZATION_STATUSES = ('Active', 'Paused')
+
+@app.route('/api/platform/organizations', methods=['GET'])
+@require_platform_owner
+def platform_organizations():
+    # Neuzem sees each organization's settings, size and Super Admin contacts, never its requests or employee records.
+    conn = get_db_connection()
+    try:
+        organizations = conn.execute(
+            "SELECT id, name, status, allow_training_data, is_default, created_by, created_at, "
+            "(SELECT COUNT(*) FROM Users WHERE Users.organization_id = Organizations.id AND Users.status = 'Active') AS active_users, "
+            "(SELECT COUNT(*) FROM Requests WHERE Requests.organization_id = Organizations.id) AS requests "
+            "FROM Organizations ORDER BY is_default DESC, name"
+        ).fetchall()
+        super_admins = conn.execute("SELECT organization_id, email, status FROM Users WHERE role = 'SuperAdmin' ORDER BY email").fetchall()
+    finally:
+        conn.close()
+
+    contacts = {}
+    for admin in super_admins:
+        contacts.setdefault(admin['organization_id'], []).append({'email': admin['email'], 'status': admin['status']})
+
+    result = []
+    for row in organizations:
+        organization = to_json_row(row)
+        organization['allow_training_data'] = bool(organization['allow_training_data'])
+        organization['is_default'] = bool(organization['is_default'])
+        organization['super_admins'] = contacts.get(row['id'], [])
+        result.append(organization)
+    return jsonify({'organizations': result})
+
+@app.route('/api/platform/create_organization', methods=['POST'])
+@limiter.limit("30 per hour")
+@require_platform_owner
+def platform_create_organization():
+    data = request.get_json(silent=True) or {}
+    name = ' '.join(str(data.get('name') or '').split())
+    email = str(data.get('super_admin_email') or '').strip()
+    allow_training_data = data.get('allow_training_data', False)
+
+    if not 2 <= len(name) <= 100:
+        return jsonify({'error': 'Organization name must be 2 to 100 characters.'}), 400
+    if not is_valid_email(email):
+        return jsonify({'error': "Please enter a valid email address for the organization's Super Admin."}), 400
+    if not isinstance(allow_training_data, bool):
+        return jsonify({'error': 'allow_training_data must be true or false.'}), 400
+
+    conn = get_db_connection()
+    try:
+        if conn.execute('SELECT id FROM Organizations WHERE LOWER(name) = LOWER(?)', (name,)).fetchone():
+            return jsonify({'error': 'An organization with this name already exists.'}), 409
+        if conn.execute('SELECT id FROM Users WHERE email = ?', (email,)).fetchone():
+            return jsonify({'error': 'This email already has an account. Each email can belong to only one organization.'}), 409
+
+        organization_id = conn.execute(
+            'INSERT INTO Organizations (name, join_code, allow_training_data, created_by) VALUES (?, ?, ?, ?) RETURNING id',
+            (name, secrets.token_urlsafe(9), int(allow_training_data), g.user['email'])
+        ).fetchall()[0][0]
+        conn.execute(
+            'INSERT INTO Users (email, role, status, organization_id) VALUES (?, ?, ?, ?)',
+            (email, 'SuperAdmin', 'Approved_Awaiting_Password', organization_id)
+        )
+        conn.commit()
+        # The setup link goes only to the Super Admin's inbox, so Neuzem never knows their password.
+        setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
+    except DB_INTEGRITY_ERRORS:
+        return jsonify({'error': 'This organization or email was just added. Refresh the list and try again.'}), 409
+    finally:
+        conn.close()
+
+    email_service.sendOrganizationCreatedEmail(email, name, setup_link)
+    return jsonify({
+        'status': 'SUCCESS',
+        'organization_id': organization_id,
+        'message': f'{name} was created. A setup link was emailed to {email}.',
+    }), 201
+
+@app.route('/api/platform/update_organization', methods=['POST'])
+@require_platform_owner
+def platform_update_organization():
+    data = request.get_json(silent=True) or {}
+    organization_id = data.get('id')
+    if isinstance(organization_id, bool) or not isinstance(organization_id, int):
+        return jsonify({'error': 'id must be an organization number.'}), 400
+
+    changes = {}
+    if 'status' in data:
+        if data['status'] not in ORGANIZATION_STATUSES:
+            return jsonify({'error': 'status must be Active or Paused.'}), 400
+        changes['status'] = data['status']
+    if 'allow_training_data' in data:
+        if not isinstance(data['allow_training_data'], bool):
+            return jsonify({'error': 'allow_training_data must be true or false.'}), 400
+        changes['allow_training_data'] = int(data['allow_training_data'])
+    if not changes:
+        return jsonify({'error': 'Nothing to update.'}), 400
+
+    conn = get_db_connection()
+    try:
+        organization = conn.execute('SELECT is_default FROM Organizations WHERE id = ?', (organization_id,)).fetchone()
+        if not organization:
+            return jsonify({'error': 'Organization not found.'}), 404
+        if organization['is_default'] and changes.get('status') == 'Paused':
+            return jsonify({'error': 'The default organization holds the original accounts and cannot be paused.'}), 409
+        # Column names come from the fixed keys above, never from the request.
+        assignments = ', '.join(f'{column} = ?' for column in changes)
+        conn.execute(f'UPDATE Organizations SET {assignments} WHERE id = ?', (*changes.values(), organization_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
+
+
+# ==========================================
 # 5. AUTHENTICATION API ROUTES
 # ==========================================
 @app.route('/api/auth/login', methods=['POST'])
@@ -936,9 +1105,9 @@ def login():
             return jsonify({'error': 'Password required.'}), 400
             
         if check_password_hash(user['password_hash'], password):
-            if user['organization_status'] != 'Active':
+            if user['role'] != PLATFORM_OWNER_ROLE and user['organization_status'] != 'Active':
                 return jsonify({'status': 'PAUSED', 'error': ORGANIZATION_PAUSED_MESSAGE}), 403
-            redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
+            redirect_page = home_page(user['role'])
             resp = jsonify({
                 'status': 'SUCCESS',
                 'role': user['role'],
@@ -1094,7 +1263,7 @@ def setup_password():
 
     email_service.sendWelcomeEmail(email, email.split('@')[0], organization_name_of(email))
 
-    redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
+    redirect_page = home_page(user['role'])
     resp = jsonify({
         'status': 'SUCCESS',
         'message': 'Password set successfully. Account is now active.',
@@ -1391,7 +1560,7 @@ def request_password_reset():
         setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
         conn.close()
         name = email.split('@')[0]
-        if user['role'] == 'Admin':
+        if user['role'] in ('Admin', 'SuperAdmin'):
             email_service.sendAdminApprovedEmail(email, name, setup_link, organization_name_of(email))
         else:
             email_service.sendUserApprovedEmail(email, name, setup_link, organization_name_of(email))

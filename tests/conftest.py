@@ -36,6 +36,11 @@ main.limiter.enabled = False
 
 SUPER_ADMIN = {'email': 'owner@example.com', 'password': PASSWORD}
 
+PUBLIC_ENDPOINTS = {
+    'login', 'logout', 'request_access', 'setup_password', 'join_info',
+    'request_password_reset', 'reset_password', 'reject_reset',
+}
+
 
 @pytest.fixture
 def app_db(tmp_path, monkeypatch):
@@ -75,6 +80,14 @@ def create_organization(module, name, status='Active'):
         (name, secrets.token_urlsafe(9), status)
     )
     return rows[0][0]
+
+
+def create_platform_owner(module, email='founder@neuzem.test'):
+    execute(
+        module, 'INSERT INTO Users (email, password_hash, role, status) VALUES (?, ?, ?, ?)',
+        (email, generate_password_hash(PASSWORD), 'PlatformOwner', 'Active')
+    )
+    return email
 
 
 def join_code_of(module, organization_id):

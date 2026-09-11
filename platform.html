@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Neuzem Platform - Approval Management System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&display=swap">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11.26.25"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="platform-page">
+    <header class="top-header">
+      <h2><i class="fas fa-building"></i> Organizations</h2>
+      <div class="platform-header-actions">
+        <span class="user-welcome" id="ownerEmail"></span>
+        <button type="button" class="btn btn-secondary btn-sm" id="logoutButton">
+          <i class="fas fa-right-from-bracket" aria-hidden="true"></i> Log out
+        </button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h3 class="panel-title"><i class="fas fa-plus"></i> Add organization</h3>
+      <p class="panel-subtitle">Creates the organization and emails its Super Admin a link to set their own password. Neuzem never sees that password.</p>
+      <form id="createForm">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="orgName">Organization name</label>
+            <input type="text" id="orgName" minlength="2" maxlength="100" placeholder="Acme Pvt Ltd" required>
+          </div>
+          <div class="form-group">
+            <label for="superAdminEmail">Super Admin email</label>
+            <input type="email" id="superAdminEmail" placeholder="finance.head@acme.com" required>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="allowTraining">
+          <span>The organization has agreed in writing to share anonymized request data for AI training.</span>
+        </label>
+        <button type="submit" class="btn btn-primary">
+          <i class="fas fa-paper-plane" aria-hidden="true"></i> Create and send setup link
+        </button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-title"><i class="fas fa-building"></i> All organizations</h3>
+      <p class="panel-subtitle">Pausing an organization blocks its logins immediately and keeps its data. You see each organization's settings and size, never its requests or employee records.</p>
+      <div id="organizationsStatus" class="loading-inline"><i class="fas fa-spinner fa-spin"></i> Loading organizations...</div>
+      <div id="organizationsTable" class="table-scroll" hidden>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Organization</th>
+              <th>Super Admins</th>
+              <th>Active users</th>
+              <th>Requests</th>
+              <th>AI training data</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="organizationsBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const PLATFORM_API = '/api/platform';
+    const ACCOUNT_STATUS_LABELS = { Active: 'Active', Approved_Awaiting_Password: 'Setup link sent' };
+
+    function signOut() {
+      fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+        .catch(() => {})
+        .finally(() => {
+          localStorage.removeItem('ams_user');
+          window.location.href = 'index.html';
+        });
+    }
+
+    let signOutNotified = false;
+    function handleAccessFailure(response) {
+      if (response.status !== 401 && response.status !== 422 && response.status !== 403) return false;
+      if (!signOutNotified) {
+        signOutNotified = true;
+        const expired = response.status !== 403;
+        Swal.fire({
+          icon: expired ? 'warning' : 'error',
+          title: expired ? 'Session Expired' : 'Platform Owners Only',
+          text: expired ? 'Please log in again to continue.' : 'This page is only for Neuzem Platform Owners.',
+          allowOutsideClick: false
+        }).then(signOut);
+      }
+      return true;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...options });
+      if (handleAccessFailure(response)) return null;
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || data.msg || 'The request failed.');
+      return data;
+    }
+
+    // Every value from the server is set as text, never as HTML.
+    function el(tag, className, children = []) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      node.append(...children);
+      return node;
+    }
+
+    function icon(name) {
+      const node = el('i', `fas ${name}`);
+      node.setAttribute('aria-hidden', 'true');
+      return node;
+    }
+
+    function button(label, iconName, className, onClick) {
+      const node = el('button', `btn btn-sm ${className}`, [icon(iconName), ` ${label}`]);
+      node.type = 'button';
+      node.addEventListener('click', onClick);
+      return node;
+    }
+
+    function formatDate(value) {
+      return new Date(value).toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    function renderOrganizationRow(org) {
+      const name = el('div', 'cell-primary', [org.name]);
+      if (org.is_default) name.append(' ', el('span', 'badge badge-purple', ['Default']));
+      const created = `Created ${formatDate(org.created_at)}${org.created_by ? ` by ${org.created_by}` : ''}`;
+
+      const admins = org.super_admins.length
+        ? org.super_admins.map(admin => el('div', '', [
+            el('div', 'cell-primary', [admin.email]),
+            el('div', 'cell-secondary', [ACCOUNT_STATUS_LABELS[admin.status] || admin.status])
+          ]))
+        : [el('span', 'cell-muted', ['None'])];
+
+      const sharing = org.allow_training_data;
+      const training = el('div', 'cell-actions', [
+        el('span', `badge ${sharing ? 'badge-green' : ''}`, [sharing ? 'Shared' : 'Not shared']),
+        button(sharing ? 'Stop' : 'Allow', sharing ? 'fa-ban' : 'fa-check', 'btn-secondary',
+          () => updateOrganization(org, { allow_training_data: !sharing }))
+      ]);
+
+      const active = org.status === 'Active';
+      const action = org.is_default
+        ? el('span', 'cell-muted', ['Always active'])
+        : active
+          ? button('Pause', 'fa-pause', 'btn-tinted-danger', () => updateOrganization(org, { status: 'Paused' }))
+          : button('Resume', 'fa-play', 'btn-primary', () => updateOrganization(org, { status: 'Active' }));
+
+      return el('tr', '', [
+        el('td', '', [name, el('div', 'cell-secondary', [created])]),
+        el('td', '', admins),
+        el('td', '', [String(org.active_users)]),
+        el('td', '', [String(org.requests)]),
+        el('td', '', [training]),
+        el('td', '', [el('span', `status-badge ${active ? 'status-approved' : 'status-rejected'}`, [org.status])]),
+        el('td', '', [action])
+      ]);
+    }
+
+    function renderOrganizations(organizations) {
+      document.getElementById('organizationsBody').replaceChildren(...organizations.map(renderOrganizationRow));
+      document.getElementById('organizationsStatus').hidden = true;
+      document.getElementById('organizationsTable').hidden = false;
+    }
+
+    async function loadOrganizations() {
+      try {
+        const data = await api(`${PLATFORM_API}/organizations`);
+        if (data) renderOrganizations(data.organizations);
+      } catch (err) {
+        document.getElementById('organizationsStatus').replaceChildren(icon('fa-triangle-exclamation'), ` ${err.message}`);
+      }
+    }
+
+    function confirmationFor(org, changes) {
+      if (changes.status === 'Paused') {
+        return {
+          titleText: `Pause ${org.name}?`,
+          text: 'Everyone in this organization is signed out on their next action and cannot log in until you resume it. Their data is kept.',
+          confirmButtonText: 'Pause organization',
+          confirmButtonColor: '#d70015'
+        };
+      }
+      if (changes.status === 'Active') {
+        return { titleText: `Resume ${org.name}?`, text: 'People in this organization can log in again.', confirmButtonText: 'Resume organization' };
+      }
+      return changes.allow_training_data
+        ? { titleText: `Use ${org.name}'s data for AI training?`, text: 'Only turn this on if the organization has agreed in writing. Names, emails and employee IDs are never used for training.', confirmButtonText: 'Allow' }
+        : { titleText: `Stop using ${org.name}'s data for AI training?`, text: 'Their decisions will be left out of future model training.', confirmButtonText: 'Stop sharing' };
+    }
+
+    async function updateOrganization(org, changes) {
+      const result = await Swal.fire({ icon: 'question', showCancelButton: true, ...confirmationFor(org, changes) });
+      if (!result.isConfirmed) return;
+      try {
+        const data = await api(`${PLATFORM_API}/update_organization`, { method: 'POST', body: JSON.stringify({ id: org.id, ...changes }) });
+        if (!data) return;
+        await loadOrganizations();
+        Swal.fire({ icon: 'success', title: 'Saved', timer: 1200, showConfirmButton: false });
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'Update Failed', text: err.message });
+      }
+    }
+
+    document.getElementById('createForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const submit = form.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      try {
+        const data = await api(`${PLATFORM_API}/create_organization`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: document.getElementById('orgName').value,
+            super_admin_email: document.getElementById('superAdminEmail').value,
+            allow_training_data: document.getElementById('allowTraining').checked
+          })
+        });
+        if (!data) return;
+        form.reset();
+        await loadOrganizations();
+        Swal.fire({ icon: 'success', title: 'Organization Created', text: data.message });
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'Could Not Create Organization', text: err.message });
+      } finally {
+        submit.disabled = false;
+      }
+    });
+
+    document.getElementById('logoutButton').addEventListener('click', () => {
+      Swal.fire({
+        title: 'Confirm Logout',
+        text: 'Are you sure you want to log out?',
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Yes, log me out'
+      }).then(result => { if (result.isConfirmed) signOut(); });
+    });
+
+    try {
+      const owner = JSON.parse(localStorage.getItem('ams_user') || 'null');
+      if (owner && owner.email) document.getElementById('ownerEmail').textContent = owner.email;
+    } catch (err) {
+      // A missing or unreadable stored profile only hides the email badge.
+    }
+
+    loadOrganizations();
+  </script>
+</body>
+</html>

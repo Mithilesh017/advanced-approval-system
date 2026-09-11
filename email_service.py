@@ -233,6 +233,19 @@ def sendWelcomeEmail(user_email, user_name, organization_name):
     html = _get_base_template(content)
     _send_email_async(user_email, subject, html)
 
+def sendOrganizationCreatedEmail(super_admin_email, organization_name, setup_link):
+    subject = "Your Organization Is Ready"
+    content = f"""
+    <h3>Hello,</h3>
+    <p>{_organization(organization_name)} has been set up on the Advanced Approval Management System, and you are its Super Admin.</p>
+    <p>Create your password using the secure link below to activate your account. The link expires in 72 hours.</p>
+    {_action_button(setup_link, 'Set Up Your Password')}
+    <p>After that, you can invite your administrators and employees from the Manage Users page.</p>
+    <p>Thank you.</p>
+    """
+    html = _get_base_template(content)
+    _send_email_async(super_admin_email, subject, html)
+
 def sendPasswordResetEmail(user_email, reset_link, reject_link):
     subject = "Password Reset Request"
     content = f"""
