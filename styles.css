@@ -285,6 +285,9 @@ button { -webkit-tap-highlight-color: transparent; }
 .callout strong { display: block; margin-bottom: 1px; font-size: 0.875rem; }
 .callout-info { background: var(--accent-tint); color: #004f9e; }
 .callout-warning { background: var(--orange-tint); color: #7a4500; }
+.callout-success { background: var(--green-tint); color: #145c26; }
+.callout-danger { background: var(--red-tint); color: #8f0f08; }
+.callout-meta { margin-top: 6px; font-size: var(--text-xs); opacity: 0.85; }
 
 /* ---------- Forms ---------- */
 
@@ -955,6 +958,30 @@ select:disabled {
 .panel-title.is-danger i { color: var(--red-text); }
 .panel-subtitle { max-width: 70ch; margin-bottom: 20px; font-size: 0.875rem; color: var(--label-3); }
 .panel-subtitle code { padding: 1px 6px; border-radius: 6px; font-family: var(--font-mono); font-size: var(--text-sm); color: var(--label-2); background: var(--fill-soft); }
+.field-other { margin-top: 8px; }
+.retrain-result { margin: 20px 0 0; }
+
+.training-steps { display: grid; gap: 10px; margin: 20px 0 0; padding: 0; list-style: none; }
+.training-step { display: flex; align-items: center; gap: 12px; font-size: 0.875rem; color: var(--label-3); transition: color 200ms var(--ease-standard); }
+.training-step.is-active { font-weight: 600; color: var(--label); }
+.training-step.is-done { color: var(--green-text); }
+
+.training-step-icon {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  background: var(--fill);
+  color: var(--label-3);
+  transition: background-color 200ms var(--ease-standard), color 200ms var(--ease-standard);
+}
+
+.training-step.is-active .training-step-icon { background: var(--accent-tint); color: var(--accent); }
+.training-step.is-done .training-step-icon { background: var(--green-tint); color: var(--green-text); }
 .panel-title + form, .panel-title + .form-grid { margin-top: 18px; }
 
 .divider { height: 1px; margin: 28px 0; border: 0; background: var(--separator); }

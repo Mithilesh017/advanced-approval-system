@@ -80,6 +80,8 @@
               status: r.final_decision.startsWith('ESCALATED') ? 'Pending' : (r.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'),
               category: r.request_type,
               reqType: r.request_type,
+              empName: r.employee_name,
+              empId: r.employee_id,
               role: r.role,
               department: r.department,
               destination: r.destination,
@@ -593,25 +595,122 @@
       );
     }
 
+    const TRAINING_STEPS = [
+      { key: 'collecting', label: 'Collecting training data and admin decisions' },
+      { key: 'training', label: 'Training the models' },
+      { key: 'evaluating', label: 'Checking quality against the current model' },
+      { key: 'publishing', label: 'Publishing the new model' }
+    ];
+    const RESULT_STYLES = {
+      succeeded: { callout: 'callout-success', icon: 'fa-circle-check', title: 'New model is live' },
+      rejected: { callout: 'callout-info', icon: 'fa-circle-info', title: 'Current model kept' },
+      failed: { callout: 'callout-danger', icon: 'fa-triangle-exclamation', title: 'Retraining failed' }
+    };
+    const formatPercent = (value) => value == null ? '—' : `${(value * 100).toFixed(1)}%`;
+    const formatDateTime = (value) => value
+      ? new Date(value).toLocaleString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      : '—';
+
     function MlopsView() {
       const [info, setInfo] = useState(null);
+      const [versions, setVersions] = useState(null);
+      const [job, setJob] = useState(null);
       const [loadError, setLoadError] = useState('');
+      const [starting, setStarting] = useState(false);
+
+      const fetchJson = async (url, options = {}) => {
+        const res = await fetch(url, { credentials: 'include', ...options });
+        if (isSessionExpired(res)) return null;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || data.msg || 'The request failed.');
+        return data;
+      };
+
+      const loadModel = async () => {
+        try {
+          const [infoData, versionData, jobData] = await Promise.all([
+            fetchJson('/api/model/info'),
+            fetchJson('/api/model/versions'),
+            fetchJson('/api/model/jobs/latest')
+          ]);
+          if (infoData) setInfo(infoData);
+          if (versionData) setVersions(versionData);
+          if (jobData) setJob(jobData.job);
+          setLoadError('');
+        } catch (err) {
+          setLoadError('Could not load model details from the server.');
+        }
+      };
+
+      useEffect(() => { loadModel(); }, []);
+
+      const isRunning = !!job && job.status === 'running';
 
       useEffect(() => {
-        fetch('/api/model/info', { credentials: 'include' })
-          .then(res => {
-            if (isSessionExpired(res)) return null;
-            if (!res.ok) throw new Error('Model info request failed');
-            return res.json();
-          })
-          .then(data => { if (data) setInfo(data); })
-          .catch(() => setLoadError('Could not load model details from the server.'));
-      }, []);
+        if (!isRunning) return;
+        const timer = setInterval(async () => {
+          try {
+            const data = await fetchJson('/api/model/jobs/latest');
+            if (!data) return;
+            setJob(data.job);
+            if (!data.job || data.job.status !== 'running') loadModel();
+          } catch (err) {}
+        }, 2000);
+        return () => clearInterval(timer);
+      }, [isRunning]);
 
-      const categoryCount = info && info.vocabulary ? Object.values(info.vocabulary).reduce((sum, n) => sum + n, 0) : null;
-      const updatedLabel = info && info.trained_at
-        ? new Date(info.trained_at).toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' })
-        : '—';
+      const triggerRetrain = async () => {
+        const result = await Swal.fire({
+          title: 'Retrain the AI model?',
+          text: 'The model will learn from its base data plus every request an admin approved or rejected by hand. The new model only goes live if it scores at least as well as the current one.',
+          icon: 'question',
+          showCancelButton: true,
+          confirmButtonText: 'Start retraining'
+        });
+        if (!result.isConfirmed) return;
+
+        setStarting(true);
+        try {
+          const started = await fetchJson('/api/model/retrain', { method: 'POST' });
+          if (started) {
+            const latest = await fetchJson('/api/model/jobs/latest');
+            if (latest) setJob(latest.job);
+          }
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Could Not Start Retraining', text: err.message });
+        }
+        setStarting(false);
+      };
+
+      const activateVersion = async (versionId, label) => {
+        const result = await Swal.fire({
+          title: `Switch to ${label}?`,
+          text: 'New requests will be scored by this model within about 30 seconds.',
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonText: 'Switch model'
+        });
+        if (!result.isConfirmed) return;
+
+        try {
+          const data = await fetchJson('/api/model/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ version_id: versionId })
+          });
+          if (data) {
+            Swal.fire({ icon: 'success', title: 'Model Switched', timer: 1500, showConfirmButton: false });
+            loadModel();
+          }
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Switch Failed', text: err.message });
+        }
+      };
+
+      const metrics = (info && info.metrics) || {};
+      const activeLabel = !info ? '—' : !info.ready ? 'Unavailable' : info.version_id ? `Version ${info.version_id}` : 'Original model';
+      const currentStep = job ? TRAINING_STEPS.findIndex(step => step.key === job.step) : -1;
+      const resultStyle = job && RESULT_STYLES[job.status];
 
       return (
         <div>
@@ -620,7 +719,7 @@
               <div className="dash-banner-icon"><i className="fas fa-robot"></i></div>
               <div>
                 <h3>MLOps Control Center</h3>
-                <p>Inspect the AI approval model that is currently scoring requests.</p>
+                <p>Retrain the AI approval model from your admins' decisions and switch between versions, all from here.</p>
               </div>
             </div>
           </div>
@@ -628,61 +727,138 @@
           <div className="stats-grid-3">
             <div className="stat-card blue">
               <div className="stat-icon"><i className="fas fa-microchip"></i></div>
-              <div className="stat-value is-compact">{info ? (info.ready ? 'XGBoost Ensemble' : 'Unavailable') : '—'}</div>
+              <div className="stat-value is-compact">{activeLabel}</div>
               <div className="stat-label">Active Model</div>
             </div>
             <div className="stat-card green">
-              <div className="stat-icon"><i className="fas fa-tags"></i></div>
-              <div className="stat-value">{categoryCount ?? '—'}</div>
-              <div className="stat-label">Known Categories</div>
+              <div className="stat-icon"><i className="fas fa-bullseye"></i></div>
+              <div className="stat-value" title="ROC-AUC measured on requests the model never trained on">{formatPercent(metrics.roc_auc)}</div>
+              <div className="stat-label">Quality Score</div>
             </div>
             <div className="stat-card purple">
-              <div className="stat-icon"><i className="fas fa-history"></i></div>
-              <div className="stat-value is-compact">{updatedLabel}</div>
-              <div className="stat-label">Model File Updated</div>
+              <div className="stat-icon"><i className="fas fa-user-check"></i></div>
+              <div className="stat-value">{info && info.ready ? info.new_decisions_since_training : '—'}</div>
+              <div className="stat-label">New Admin Decisions Since Training</div>
             </div>
           </div>
 
           <div className="panel">
-            <h3 className="panel-title"><i className="fas fa-cogs"></i> Decision Pipeline</h3>
+            <h3 className="panel-title"><i className="fas fa-bolt"></i> Retrain Model</h3>
+            <p className="panel-subtitle">
+              Retraining teaches the model from requests your admins approved or rejected by hand, including job roles, departments and destinations it has not seen before. Last trained {formatDateTime(info && info.trained_at)}.
+            </p>
             {loadError && <p className="panel-subtitle">{loadError}</p>}
-            {!info && !loadError && <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading model details...</div>}
-            {info && !info.ready && (
-              <p className="panel-subtitle">The model files failed to load on the server, so new requests cannot be scored until this is fixed.</p>
+            <button type="button" onClick={triggerRetrain} disabled={isRunning || starting || !info || !info.ready} className="btn btn-primary btn-lg">
+              {isRunning || starting
+                ? <span><i className="fas fa-spinner fa-spin"></i> Retraining in progress...</span>
+                : <span><i className="fas fa-bolt"></i> Retrain Model Now</span>}
+            </button>
+
+            {isRunning && (
+              <ol className="training-steps" aria-live="polite">
+                {TRAINING_STEPS.map((step, index) => {
+                  const state = index < currentStep ? 'done' : index === currentStep ? 'active' : 'waiting';
+                  return (
+                    <li key={step.key} className={`training-step is-${state}`}>
+                      <span className="training-step-icon">
+                        {state === 'done' ? <i className="fas fa-check"></i> : state === 'active' ? <i className="fas fa-spinner fa-spin"></i> : index + 1}
+                      </span>
+                      {step.label}
+                    </li>
+                  );
+                })}
+              </ol>
             )}
-            {info && info.ready && (
-              <>
-                <p className="panel-subtitle">
-                  Requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% are auto-approved. Unknown categories, detected anomalies, and lower scores are escalated for manual review.
-                </p>
-                <div className="table-scroll">
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>Component</th>
-                        <th>What it does</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {info.components.map(c => (
-                        <tr key={c.name}>
-                          <td className="cell-primary">{c.name}</td>
-                          <td className="cell-muted">{c.purpose}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+
+            {!isRunning && resultStyle && (
+              <div className={`callout retrain-result ${resultStyle.callout}`} role="status">
+                <i className={`fas ${resultStyle.icon}`} aria-hidden="true"></i>
+                <div>
+                  <strong>{resultStyle.title}</strong>
+                  {job.message}
+                  <div className="callout-meta">{formatDateTime(job.finished_at || job.started_at)} · started by {job.started_by}</div>
                 </div>
-              </>
+              </div>
             )}
           </div>
 
-          <div className="panel">
-            <h3 className="panel-title"><i className="fas fa-bolt"></i> Retraining</h3>
-            <p className="panel-subtitle">
-              Retraining runs offline: run <code>train_ensemble_model.py</code> on the latest data, commit the new <code>ensemble_ai_model.pkl</code>, and redeploy.
-            </p>
-          </div>
+          {versions && (
+            <div className="panel">
+              <h3 className="panel-title"><i className="fas fa-clock-rotate-left"></i> Version History</h3>
+              <p className="panel-subtitle">Every successful retrain is saved. If a new model behaves unexpectedly, switch back to an earlier version.</p>
+              <div className="table-scroll">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Version</th>
+                      <th>Trained</th>
+                      <th>Trained By</th>
+                      <th>Quality Score</th>
+                      <th>Admin Decisions Used</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {versions.versions.map(v => (
+                      <tr key={v.id}>
+                        <td className="cell-primary">Version {v.id}</td>
+                        <td className="cell-muted">{formatDateTime(v.created_at)}</td>
+                        <td className="cell-muted">{v.created_by || '—'}</td>
+                        <td>{formatPercent(v.metrics && v.metrics.roc_auc)}</td>
+                        <td>{v.metrics ? v.metrics.feedback_rows : '—'}</td>
+                        <td className="cell-nowrap">
+                          {v.is_active
+                            ? <span className="status-badge status-approved">Active</span>
+                            : <button type="button" className="btn btn-secondary btn-sm" onClick={() => activateVersion(v.id, `Version ${v.id}`)}>Use this version</button>}
+                        </td>
+                      </tr>
+                    ))}
+                    {versions.bundled.available && (
+                      <tr>
+                        <td className="cell-primary">Original model</td>
+                        <td className="cell-muted">{formatDateTime(versions.bundled.trained_at)}</td>
+                        <td className="cell-muted">Shipped with the app</td>
+                        <td>{formatPercent(versions.bundled.metrics && versions.bundled.metrics.roc_auc)}</td>
+                        <td>{versions.bundled.metrics ? versions.bundled.metrics.feedback_rows : '—'}</td>
+                        <td className="cell-nowrap">
+                          {versions.bundled.is_active
+                            ? <span className="status-badge status-approved">Active</span>
+                            : <button type="button" className="btn btn-secondary btn-sm" onClick={() => activateVersion(null, 'the original model')}>Use this version</button>}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {info && info.ready && (
+            <div className="panel">
+              <h3 className="panel-title"><i className="fas fa-cogs"></i> Decision Pipeline</h3>
+              <p className="panel-subtitle">
+                Requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% are auto-approved. Unknown categories, detected anomalies, and lower scores are escalated for manual review.
+              </p>
+              <div className="table-scroll">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Component</th>
+                      <th>What it does</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {info.components.map(c => (
+                      <tr key={c.name}>
+                        <td className="cell-primary">{c.name}</td>
+                        <td className="cell-muted">{c.purpose}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       );
     }

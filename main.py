@@ -4,11 +4,16 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from decimal import Decimal
 import hashlib
+import io
+import json
 import math
 import re
 import sqlite3
 import os
+import threading
+import time
 import email_service
+import model_pipeline
 import secrets
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -84,13 +89,16 @@ def issue_token(conn, email, ttl):
     conn.commit()
     return token
 
+def as_datetime(value):
+    # SQLite returns the stored string; PostgreSQL returns a datetime.
+    if isinstance(value, str):
+        return datetime.strptime(value[:19].replace('T', ' '), '%Y-%m-%d %H:%M:%S')
+    return value
+
 def token_expired(expiry):
     if not expiry:
         return True
-    # SQLite returns the stored string; PostgreSQL returns a datetime.
-    if isinstance(expiry, str):
-        expiry = datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S')
-    return datetime.utcnow() > expiry
+    return datetime.utcnow() > as_datetime(expiry)
 
 def public_base_url():
     return (os.getenv('APP_BASE_URL') or request.host_url).rstrip('/')
@@ -203,6 +211,29 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ModelVersions (
+                id SERIAL PRIMARY KEY,
+                artifact BYTEA NOT NULL,
+                metrics TEXT,
+                created_by TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS TrainingJobs (
+                id SERIAL PRIMARY KEY,
+                status TEXT NOT NULL,
+                step TEXT,
+                message TEXT,
+                metrics TEXT,
+                started_by TEXT,
+                model_version_id INTEGER,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+        ''')
         conn.commit()
         conn.close()
     else:
@@ -237,6 +268,29 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ModelVersions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                artifact BLOB NOT NULL,
+                metrics TEXT,
+                created_by TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS TrainingJobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL,
+                step TEXT,
+                message TEXT,
+                metrics TEXT,
+                started_by TEXT,
+                model_version_id INTEGER,
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                finished_at DATETIME
+            )
+        ''')
         conn.commit()
         conn.close()
 
@@ -244,10 +298,24 @@ def init_db():
 print("Initializing Auth Database...")
 init_db()
 
+REQUEST_EXTRA_COLUMNS = {
+    'employee_name': 'TEXT',
+    'employee_id': 'TEXT',
+    'reviewed_by': 'TEXT',
+    'reviewed_at': 'TIMESTAMP',
+}
+
 def check_and_add_columns():
     DATABASE_URL = os.getenv('DATABASE_URL')
     if DATABASE_URL:
-        return # Postgres init handles all columns
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        for column, column_type in REQUEST_EXTRA_COLUMNS.items():
+            cursor.execute(f'ALTER TABLE Requests ADD COLUMN IF NOT EXISTS {column} {column_type}')
+        conn.commit()
+        conn.close()
+        return
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -262,6 +330,12 @@ def check_and_add_columns():
         cursor.execute("ALTER TABLE Users ADD COLUMN reset_token TEXT")
     if 'reset_expiry' not in columns:
         cursor.execute("ALTER TABLE Users ADD COLUMN reset_expiry DATETIME")
+
+    cursor.execute("PRAGMA table_info(Requests)")
+    request_columns = {col[1] for col in cursor.fetchall()}
+    for column, column_type in REQUEST_EXTRA_COLUMNS.items():
+        if column not in request_columns:
+            cursor.execute(f"ALTER TABLE Requests ADD COLUMN {column} {column_type.replace('TIMESTAMP', 'DATETIME')}")
         
     conn.commit()
     conn.close()
@@ -285,21 +359,64 @@ bootstrap_super_admin()
 # ==========================================
 # 2. MACHINE LEARNING CONFIGURATION
 # ==========================================
+BUNDLED_MODEL_PATH = 'ensemble_ai_model.pkl'
+BASE_TRAINING_CSV = 'combined_corporate_approval_data.csv'
+MODEL_REFRESH_SECONDS = 30
+MODEL_VERSIONS_KEPT = 5
+TRAINING_JOB_STALE_AFTER = timedelta(minutes=30)
+
+_model_lock = threading.Lock()
+_model_state = {'artifacts': None, 'version_id': None, 'checked_at': None}
+_bundled_artifacts = None
+
+def load_bundled_artifacts():
+    global _bundled_artifacts
+    if _bundled_artifacts is None:
+        _bundled_artifacts = joblib.load(BUNDLED_MODEL_PATH)
+    return _bundled_artifacts
+
+def bundled_file_timestamp():
+    return datetime.fromtimestamp(os.path.getmtime(BUNDLED_MODEL_PATH), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def get_active_model(force=False):
+    # Each worker process re-checks the database periodically, so a retrain or rollback reaches all of them.
+    with _model_lock:
+        now = time.monotonic()
+        fresh = _model_state['checked_at'] is not None and now - _model_state['checked_at'] < MODEL_REFRESH_SECONDS
+        if fresh and not force and _model_state['artifacts'] is not None:
+            return _model_state['artifacts'], _model_state['version_id']
+
+        try:
+            conn = get_db_connection()
+            try:
+                row = conn.execute('SELECT id FROM ModelVersions WHERE is_active = 1 ORDER BY id DESC LIMIT 1').fetchone()
+                version_id = row['id'] if row else None
+                if version_id is None:
+                    artifacts = load_bundled_artifacts()
+                elif version_id == _model_state['version_id'] and _model_state['artifacts'] is not None:
+                    artifacts = _model_state['artifacts']
+                else:
+                    blob = conn.execute('SELECT artifact FROM ModelVersions WHERE id = ?', (version_id,)).fetchone()['artifact']
+                    artifacts = joblib.load(io.BytesIO(bytes(blob)))
+            finally:
+                conn.close()
+            _model_state.update(artifacts=artifacts, version_id=version_id)
+        except Exception:
+            app.logger.exception("Could not load the active model")
+            if _model_state['artifacts'] is None:
+                try:
+                    _model_state.update(artifacts=load_bundled_artifacts(), version_id=None)
+                except Exception:
+                    app.logger.exception("Could not load the bundled model")
+
+        _model_state['checked_at'] = now
+        return _model_state['artifacts'], _model_state['version_id']
+
 print("Loading ensemble model artifacts...")
-MODEL_READY = False
-try:
-    artifacts = joblib.load("ensemble_ai_model.pkl")
-    xgb_model = artifacts['xgboost_model']
-    iso_forest = artifacts['isolation_forest']
-    oc_svm = artifacts['one_class_svm']
-    explainer = artifacts['shap_explainer']
-    encoders = artifacts['encoders']
-    scaler = artifacts['scaler']
-    features = artifacts['features']
-    MODEL_READY = True
-    print("Model artifacts loaded successfully.")
-except Exception as e:
-    print(f"Error loading model artifacts: {e}")
+if get_active_model(force=True)[0] is not None:
+    print(f"Model artifacts loaded successfully (active: {'version ' + str(_model_state['version_id']) if _model_state['version_id'] else 'bundled model'}).")
+else:
+    print("Error loading model artifacts: no usable model was found.")
 
 exchange_rates = {
     'INR': 1.0,
@@ -338,7 +455,8 @@ def index():
 @limiter.limit("20 per minute")
 @jwt_required()
 def predict():
-    if not MODEL_READY:
+    artifacts, _ = get_active_model()
+    if artifacts is None:
         return jsonify({
             'error': 'The AI model is currently unavailable. Please try again later.',
             'status': 'ESCALATED_SYSTEM_ERROR'
@@ -347,6 +465,13 @@ def predict():
     try:
         current_email = get_jwt_identity()
         data = request.get_json(silent=True) or {}
+        xgb_model = artifacts['xgboost_model']
+        iso_forest = artifacts['isolation_forest']
+        oc_svm = artifacts['one_class_svm']
+        explainer = artifacts['shap_explainer']
+        encoders = artifacts['encoders']
+        scaler = artifacts['scaler']
+        features = artifacts['features']
         
         # Extract inputs
         role = data.get('Role')
@@ -355,6 +480,8 @@ def predict():
         destination = data.get('Destination')
         amount = data.get('Amount')
         currency = data.get('Currency')
+        employee_name = str(data.get('Employee_Name') or '').strip()[:100] or None
+        employee_id = str(data.get('Employee_ID') or '').strip()[:50] or None
 
         required_fields = ['Role', 'Department', 'Request_Type', 'Destination', 'Currency']
         if not all(data.get(f) for f in required_fields):
@@ -435,11 +562,11 @@ def predict():
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
-                final_decision, submitted_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                final_decision, submitted_by, employee_name, employee_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (role, department, req_type, destination, amount, currency, 
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100, 
-             status, current_email)
+             status, current_email, employee_name, employee_id)
         )
         conn.commit()
         conn.close()
@@ -464,23 +591,215 @@ def predict():
 @app.route('/api/model/info', methods=['GET'])
 @require_role('SuperAdmin')
 def model_info():
-    if not MODEL_READY:
+    artifacts, version_id = get_active_model()
+    if artifacts is None:
         return jsonify({'ready': False})
 
-    updated_at = datetime.fromtimestamp(os.path.getmtime('ensemble_ai_model.pkl'), timezone.utc)
+    conn = get_db_connection()
+    decided = conn.execute(
+        "SELECT COUNT(*) AS total FROM Requests WHERE reviewed_by IS NOT NULL AND final_decision IN ('APPROVED', 'REJECTED')"
+    ).fetchone()['total']
+    conn.close()
+
+    metrics = artifacts.get('metrics') or {}
     return jsonify({
         'ready': True,
+        'version_id': version_id,
         'components': [
             {'name': 'XGBoost classifier', 'purpose': 'Scores how likely a request is to be approved'},
             {'name': 'Isolation Forest', 'purpose': 'Flags requests with unusual patterns'},
             {'name': 'One-Class SVM', 'purpose': 'Second anomaly detector for unusual requests'},
             {'name': 'SHAP explainer', 'purpose': 'Explains which fields drove each score'},
         ],
-        'features': list(features),
-        'vocabulary': {col: len(encoders[col].classes_) for col in ['Role', 'Department', 'Request_Type', 'Destination']},
+        'features': list(artifacts['features']),
+        'vocabulary': {col: len(artifacts['encoders'][col].classes_) for col in model_pipeline.CATEGORICAL_FEATURES},
         'thresholds': {'auto_approve_above': AUTO_APPROVE_THRESHOLD, 'escalate_below': ESCALATE_THRESHOLD},
-        'trained_at': updated_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+        'trained_at': artifacts.get('trained_at') or bundled_file_timestamp(),
+        'metrics': metrics,
+        'new_decisions_since_training': max(0, int(decided) - int(metrics.get('feedback_rows', 0))),
     })
+
+
+@app.route('/api/model/form_options', methods=['GET'])
+@jwt_required()
+def model_form_options():
+    artifacts, _ = get_active_model()
+    if artifacts is None:
+        return jsonify({'error': 'The AI model is currently unavailable. Please try again later.'}), 503
+
+    options = artifacts.get('form_options') or {
+        col: sorted(str(value) for value in artifacts['encoders'][col].classes_)
+        for col in model_pipeline.CATEGORICAL_FEATURES
+    }
+    return jsonify({'options': options, 'currencies': list(exchange_rates)})
+
+
+def utc_now_text():
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+def update_training_job(job_id, **fields):
+    assignments = ', '.join(f'{name} = ?' for name in fields)
+    conn = get_db_connection()
+    conn.execute(f'UPDATE TrainingJobs SET {assignments} WHERE id = ?', (*fields.values(), job_id))
+    conn.commit()
+    conn.close()
+
+def training_job_to_json(row):
+    job = to_json_row(row)
+    job['metrics'] = json.loads(job['metrics']) if job.get('metrics') else None
+    if job['status'] == 'running' and datetime.utcnow() - as_datetime(row['started_at']) > TRAINING_JOB_STALE_AFTER:
+        job['status'] = 'failed'
+        job['message'] = 'Retraining was interrupted, most likely by a server restart. Please try again.'
+    return job
+
+def run_training_job(job_id, started_by):
+    try:
+        update_training_job(job_id, step='collecting')
+        current, _ = get_active_model(force=True)
+        base = model_pipeline.base_training_data(current, BASE_TRAINING_CSV)
+        conn = get_db_connection()
+        decisions = conn.execute(
+            "SELECT id, role, department, request_type, destination, normalized_amount, final_decision FROM Requests "
+            "WHERE reviewed_by IS NOT NULL AND final_decision IN ('APPROVED', 'REJECTED')"
+        ).fetchall()
+        conn.close()
+        feedback = model_pipeline.feedback_training_data([dict(row) for row in decisions])
+
+        update_training_job(job_id, step='training')
+        candidate, holdout = model_pipeline.train_ensemble(base, feedback)
+
+        update_training_job(job_id, step='evaluating')
+        comparison = model_pipeline.compare_with_current(candidate, holdout, current)
+        metrics = dict(candidate['metrics'])
+        metrics['previous_roc_auc'] = (comparison['current'] or {}).get('roc_auc')
+        candidate['metrics'] = metrics
+        new_score, old_score = metrics['roc_auc'], metrics['previous_roc_auc']
+
+        if not comparison['accepted']:
+            update_training_job(
+                job_id, status='rejected', step='done', metrics=json.dumps(metrics), finished_at=utc_now_text(),
+                message=f"The retrained model scored {new_score:.1%} while the current model scores {old_score:.1%}, so the current model stays active."
+            )
+            return
+
+        update_training_job(job_id, step='publishing')
+        buffer = io.BytesIO()
+        joblib.dump(candidate, buffer)
+        conn = get_db_connection()
+        version_id = conn.execute(
+            'INSERT INTO ModelVersions (artifact, metrics, created_by, is_active) VALUES (?, ?, ?, 0) RETURNING id',
+            (buffer.getvalue(), json.dumps(metrics), started_by)
+        ).fetchall()[0][0]
+        conn.execute('UPDATE ModelVersions SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END', (version_id,))
+        conn.execute(
+            'DELETE FROM ModelVersions WHERE is_active = 0 AND id NOT IN (SELECT id FROM ModelVersions ORDER BY id DESC LIMIT ?)',
+            (MODEL_VERSIONS_KEPT,)
+        )
+        conn.commit()
+        conn.close()
+        get_active_model(force=True)
+
+        previous_text = f" (previous model: {old_score:.1%})" if old_score is not None else ""
+        update_training_job(
+            job_id, status='succeeded', step='done', metrics=json.dumps(metrics), model_version_id=version_id,
+            finished_at=utc_now_text(),
+            message=f"Version {version_id} is now scoring new requests with a quality score of {new_score:.1%}{previous_text}."
+        )
+    except model_pipeline.TrainingDataMissing as exc:
+        update_training_job(job_id, status='failed', step='done', message=str(exc), finished_at=utc_now_text())
+    except Exception:
+        app.logger.exception("Model retraining failed")
+        update_training_job(
+            job_id, status='failed', step='done', finished_at=utc_now_text(),
+            message='Retraining failed because of a server error. The current model is still active.'
+        )
+
+
+@app.route('/api/model/retrain', methods=['POST'])
+@limiter.limit("10 per hour")
+@require_role('SuperAdmin')
+def retrain_model():
+    started_by = get_jwt_identity()
+    conn = get_db_connection()
+    latest = conn.execute('SELECT * FROM TrainingJobs ORDER BY id DESC LIMIT 1').fetchone()
+    if latest and latest['status'] == 'running':
+        if training_job_to_json(latest)['status'] == 'running':
+            conn.close()
+            return jsonify({'error': 'A retraining job is already running.'}), 409
+        conn.execute(
+            "UPDATE TrainingJobs SET status = 'failed', step = 'done', message = ? WHERE id = ?",
+            ('Retraining was interrupted, most likely by a server restart.', latest['id'])
+        )
+
+    job_id = conn.execute(
+        "INSERT INTO TrainingJobs (status, step, started_by) VALUES ('running', 'queued', ?) RETURNING id",
+        (started_by,)
+    ).fetchall()[0][0]
+    conn.commit()
+    conn.close()
+
+    threading.Thread(target=run_training_job, args=(job_id, started_by), daemon=True).start()
+    return jsonify({'status': 'STARTED', 'job_id': job_id}), 202
+
+
+@app.route('/api/model/jobs/latest', methods=['GET'])
+@require_role('SuperAdmin')
+def latest_training_job():
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM TrainingJobs ORDER BY id DESC LIMIT 1').fetchone()
+    conn.close()
+    return jsonify({'job': training_job_to_json(row) if row else None})
+
+
+@app.route('/api/model/versions', methods=['GET'])
+@require_role('SuperAdmin')
+def model_versions():
+    conn = get_db_connection()
+    rows = conn.execute('SELECT id, metrics, created_by, is_active, created_at FROM ModelVersions ORDER BY id DESC').fetchall()
+    conn.close()
+
+    versions = []
+    for row in rows:
+        version = to_json_row(row)
+        version['metrics'] = json.loads(version['metrics']) if version.get('metrics') else None
+        version['is_active'] = bool(version['is_active'])
+        versions.append(version)
+
+    try:
+        bundled = load_bundled_artifacts()
+        bundled_info = {'available': True, 'trained_at': bundled.get('trained_at') or bundled_file_timestamp(), 'metrics': bundled.get('metrics')}
+    except Exception:
+        bundled_info = {'available': False, 'trained_at': None, 'metrics': None}
+    bundled_info['is_active'] = not any(v['is_active'] for v in versions)
+    return jsonify({'versions': versions, 'bundled': bundled_info})
+
+
+@app.route('/api/model/activate', methods=['POST'])
+@require_role('SuperAdmin')
+def activate_model_version():
+    data = request.get_json(silent=True) or {}
+    version_id = data.get('version_id')
+    if version_id is not None and (isinstance(version_id, bool) or not isinstance(version_id, int)):
+        return jsonify({'error': 'version_id must be a model version number, or null for the original model.'}), 400
+
+    conn = get_db_connection()
+    if version_id is None:
+        try:
+            load_bundled_artifacts()
+        except Exception:
+            conn.close()
+            return jsonify({'error': 'The original model file could not be loaded.'}), 409
+        conn.execute('UPDATE ModelVersions SET is_active = 0')
+    else:
+        if not conn.execute('SELECT id FROM ModelVersions WHERE id = ?', (version_id,)).fetchone():
+            conn.close()
+            return jsonify({'error': 'Model version not found.'}), 404
+        conn.execute('UPDATE ModelVersions SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END', (version_id,))
+    conn.commit()
+    conn.close()
+
+    get_active_model(force=True)
+    return jsonify({'status': 'SUCCESS'})
 
 
 # ==========================================
@@ -814,7 +1133,10 @@ def approve_request():
         return jsonify({'error': 'Request ID is required'}), 400
         
     conn = get_db_connection()
-    cursor = conn.execute("UPDATE Requests SET final_decision = 'APPROVED' WHERE id = ?", (req_id,))
+    cursor = conn.execute(
+        "UPDATE Requests SET final_decision = 'APPROVED', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (get_jwt_identity(), req_id)
+    )
     conn.commit()
     updated = cursor.rowcount
     conn.close()
@@ -831,7 +1153,10 @@ def reject_request():
         return jsonify({'error': 'Request ID is required'}), 400
         
     conn = get_db_connection()
-    cursor = conn.execute("UPDATE Requests SET final_decision = 'REJECTED' WHERE id = ?", (req_id,))
+    cursor = conn.execute(
+        "UPDATE Requests SET final_decision = 'REJECTED', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (get_jwt_identity(), req_id)
+    )
     conn.commit()
     updated = cursor.rowcount
     conn.close()
@@ -848,7 +1173,10 @@ def reopen_request():
         return jsonify({'error': 'Request ID is required'}), 400
 
     conn = get_db_connection()
-    cursor = conn.execute("UPDATE Requests SET final_decision = 'ESCALATED_MANUAL_REVIEW' WHERE id = ?", (req_id,))
+    cursor = conn.execute(
+        "UPDATE Requests SET final_decision = 'ESCALATED_MANUAL_REVIEW', reviewed_by = NULL, reviewed_at = NULL WHERE id = ?",
+        (req_id,)
+    )
     conn.commit()
     updated = cursor.rowcount
     conn.close()

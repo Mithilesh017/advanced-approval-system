@@ -73,6 +73,8 @@
               status: r.final_decision.startsWith('ESCALATED') ? 'Pending' : (r.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'),
               category: r.request_type,
               reqType: r.request_type,
+              empName: r.employee_name,
+              empId: r.employee_id,
               role: r.role,
               department: r.department,
               destination: r.destination,
@@ -289,20 +291,90 @@
       );
     }
 
+    const OTHER_OPTION = '__other__';
+
+    function ChoiceField({ id, label, name, value, options, onChange }) {
+      const [otherMode, setOtherMode] = useState(false);
+
+      if (options.length === 0) {
+        return (
+          <div className="form-group">
+            <label htmlFor={id}>{label}</label>
+            <input id={id} type="text" value={value} onChange={e => onChange(name, e.target.value)} required />
+          </div>
+        );
+      }
+
+      return (
+        <div className="form-group">
+          <label htmlFor={id}>{label}</label>
+          <select
+            id={id}
+            value={otherMode ? OTHER_OPTION : value}
+            onChange={e => {
+              const selected = e.target.value;
+              setOtherMode(selected === OTHER_OPTION);
+              onChange(name, selected === OTHER_OPTION ? '' : selected);
+            }}
+            required
+          >
+            <option value="" disabled>Select {label.toLowerCase()}</option>
+            {options.map(option => <option key={option} value={option}>{option}</option>)}
+            <option value={OTHER_OPTION}>Other (not listed)</option>
+          </select>
+          {otherMode && (
+            <>
+              <input
+                className="field-other"
+                type="text"
+                value={value}
+                onChange={e => onChange(name, e.target.value)}
+                placeholder={`Type the ${label.toLowerCase()}`}
+                aria-label={`${label} (not listed)`}
+                required
+                autoFocus
+              />
+              <small className="field-hint">New values go to manual review. Once an admin decides and the model is retrained, they are recognized automatically.</small>
+            </>
+          )}
+        </div>
+      );
+    }
+
     function NewRequestForm({ user, setView, refresh }) {
       const [loading, setLoading] = useState(false);
+      const [options, setOptions] = useState({});
+      const [optionsLoaded, setOptionsLoaded] = useState(false);
       const [formData, setFormData] = useState({
         empName: user.email.split('@')[0],
-        empId: 'EMP_' + Math.floor(Math.random() * 9000 + 1000), 
-        role: '', 
+        empId: '',
+        role: '',
         department: '',
-        reqType: 'Hotel Booking', 
-        destination: 'Mumbai', 
-        currency: 'INR', 
+        reqType: '',
+        destination: '',
+        currency: 'INR',
         amount: 5000
       });
 
+      useEffect(() => {
+        fetch('/api/model/form_options', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (data && data.options) setOptions(data.options); })
+          .catch(() => {})
+          .finally(() => setOptionsLoaded(true));
+
+        fetch('/api/auth/get_profile', { credentials: 'include' })
+          .then(res => res.ok ? res.json() : null)
+          .then(profile => {
+            if (profile) {
+              setFormData(prev => ({ ...prev, empName: profile.name || prev.empName, empId: profile.emp_id || prev.empId }));
+            }
+          })
+          .catch(() => {});
+      }, []);
+
       const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
+      const setField = (name, value) => setFormData(prev => ({ ...prev, [name]: value }));
 
       const handleSubmit = async (e) => {
         e.preventDefault();
@@ -310,7 +382,8 @@
         const payload = {
           Role: formData.role, Department: formData.department,
           Request_Type: formData.reqType, Destination: formData.destination,
-          Currency: formData.currency, Amount: parseFloat(formData.amount)
+          Currency: formData.currency, Amount: parseFloat(formData.amount),
+          Employee_Name: formData.empName, Employee_ID: formData.empId
         };
         try {
           const response = await fetch('/api/predict', {
@@ -350,7 +423,7 @@
               <div className="dash-banner-icon"><i className="fas fa-paper-plane"></i></div>
               <div>
                 <h3>Submit Expense</h3>
-                <p>Submit your expense and travel requests here. Our Isolation Forest AI will process them instantly.</p>
+                <p>Submit your expense and travel requests here. Our AI model scores them instantly.</p>
               </div>
             </div>
           </div>
@@ -360,6 +433,9 @@
               <i className="fas fa-arrow-left"></i> Back to Dashboard
             </button>
             <h3 className="panel-title"><i className="fas fa-edit"></i> Request Form</h3>
+            {!optionsLoaded ? (
+              <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading request form...</div>
+            ) : (
             <form onSubmit={handleSubmit}>
               <div className="form-grid">
                 <div className="form-group">
@@ -368,24 +444,12 @@
                 </div>
                 <div className="form-group">
                   <label htmlFor="nr-empId">Employee ID</label>
-                  <input id="nr-empId" type="text" name="empId" value={formData.empId} onChange={handleChange} required />
+                  <input id="nr-empId" type="text" name="empId" value={formData.empId} onChange={handleChange} required placeholder="e.g. EMP_1234" />
                 </div>
-                <div className="form-group">
-                  <label htmlFor="nr-role">Job Role</label>
-                  <input id="nr-role" type="text" name="role" value={formData.role} onChange={handleChange} required placeholder="e.g. Data Scientist" />
-                </div>
-                <div className="form-group">
-                  <label htmlFor="nr-department">Department</label>
-                  <input id="nr-department" type="text" name="department" value={formData.department} onChange={handleChange} required placeholder="e.g. IT" />
-                </div>
-                <div className="form-group">
-                  <label htmlFor="nr-reqType">Expense Type</label>
-                  <input id="nr-reqType" type="text" name="reqType" value={formData.reqType} onChange={handleChange} required />
-                </div>
-                <div className="form-group">
-                  <label htmlFor="nr-destination">Destination</label>
-                  <input id="nr-destination" type="text" name="destination" value={formData.destination} onChange={handleChange} required />
-                </div>
+                <ChoiceField id="nr-role" label="Job Role" name="role" value={formData.role} options={options.Role || []} onChange={setField} />
+                <ChoiceField id="nr-department" label="Department" name="department" value={formData.department} options={options.Department || []} onChange={setField} />
+                <ChoiceField id="nr-reqType" label="Expense Type" name="reqType" value={formData.reqType} options={options.Request_Type || []} onChange={setField} />
+                <ChoiceField id="nr-destination" label="Destination" name="destination" value={formData.destination} options={options.Destination || []} onChange={setField} />
                 <div className="form-group">
                   <label htmlFor="nr-currency">Currency</label>
                   <select id="nr-currency" name="currency" value={formData.currency} onChange={handleChange}>
@@ -405,6 +469,7 @@
                 {loading ? <span><i className="fas fa-spinner fa-spin"></i> AI is analyzing...</span> : <span><i className="fas fa-robot"></i> Submit to AI Agent</span>}
               </button>
             </form>
+            )}
           </div>
         </div>
       );
