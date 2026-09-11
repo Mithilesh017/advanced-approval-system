@@ -3,12 +3,20 @@ import secrets
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from werkzeug.security import generate_password_hash
 
 ROOT = Path(__file__).resolve().parent.parent
 PASSWORD = 'correct-horse-battery'
+
+# Set TEST_DATABASE_URL to also run every database test against PostgreSQL. Each test erases that database,
+# so its name must contain "test" to make pointing it at a real database impossible by accident.
+TEST_DATABASE_URL = os.environ.get('TEST_DATABASE_URL', '')
+if TEST_DATABASE_URL and 'test' not in urlparse(TEST_DATABASE_URL).path.lower():
+    raise RuntimeError('TEST_DATABASE_URL must name a database containing "test", because the tests erase it.')
+BACKENDS = ['sqlite', 'postgresql'] if TEST_DATABASE_URL else ['sqlite']
 
 # Tests must never touch a real database, send real email or require HTTPS cookies,
 # whatever the local .env contains. load_dotenv() does not override variables set here.
@@ -42,10 +50,33 @@ PUBLIC_ENDPOINTS = {
 }
 
 
+def erase_postgres_database(url):
+    import psycopg2
+
+    conn = psycopg2.connect(url)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('DROP SCHEMA IF EXISTS public CASCADE')
+            cursor.execute('CREATE SCHEMA public')
+    finally:
+        conn.close()
+
+
+@pytest.fixture(params=BACKENDS)
+def backend(request, tmp_path, monkeypatch):
+    """Points the app at an empty database, once per configured backend. Returns the backend name."""
+    if request.param == 'postgresql':
+        erase_postgres_database(TEST_DATABASE_URL)
+        monkeypatch.setenv('DATABASE_URL', TEST_DATABASE_URL)
+    else:
+        monkeypatch.setattr(main, 'DB_FILE', str(tmp_path / 'test.db'))
+    return request.param
+
+
 @pytest.fixture
-def app_db(tmp_path, monkeypatch):
-    """A fresh, fully migrated SQLite database for each test."""
-    monkeypatch.setattr(main, 'DB_FILE', str(tmp_path / 'test.db'))
+def app_db(backend):
+    """A fresh, fully migrated database for each test."""
     main.setup_database()
     return main
 

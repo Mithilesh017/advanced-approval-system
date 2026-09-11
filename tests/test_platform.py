@@ -31,12 +31,11 @@ def sent(app_db, monkeypatch):
     return emails
 
 
-def test_platform_owner_is_created_from_settings_outside_any_organization(tmp_path, monkeypatch):
+def test_platform_owner_is_created_from_settings_outside_any_organization(backend, monkeypatch):
     import main
 
     monkeypatch.setenv('PLATFORM_OWNER_EMAIL', 'founder@neuzem.test')
     monkeypatch.setenv('PLATFORM_OWNER_PASSWORD', PASSWORD)
-    monkeypatch.setattr(main, 'DB_FILE', str(tmp_path / 'platform.db'))
     main.setup_database()
     main.setup_database()  # A restart must not move the Platform Owner into the default organization.
 
@@ -45,12 +44,11 @@ def test_platform_owner_is_created_from_settings_outside_any_organization(tmp_pa
     ]
 
 
-def test_platform_owner_setting_never_takes_over_a_company_account(tmp_path, monkeypatch):
+def test_platform_owner_setting_never_takes_over_a_company_account(backend, monkeypatch):
     import main
 
     monkeypatch.setenv('PLATFORM_OWNER_EMAIL', SUPER_ADMIN['email'])
     monkeypatch.setenv('PLATFORM_OWNER_PASSWORD', PASSWORD)
-    monkeypatch.setattr(main, 'DB_FILE', str(tmp_path / 'takeover.db'))
     main.setup_database()
 
     assert query(main, 'SELECT role FROM Users WHERE email = ?', (SUPER_ADMIN['email'],)) == [{'role': 'SuperAdmin'}]

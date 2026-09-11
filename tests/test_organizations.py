@@ -1,23 +1,38 @@
-import sqlite3
-
 from conftest import SUPER_ADMIN, join_code_of, query
 
-LEGACY_SCHEMA = '''
-    CREATE TABLE Users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password_hash TEXT,
-        role TEXT NOT NULL, status TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE Requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, department TEXT, request_type TEXT,
-        destination TEXT, amount REAL, currency TEXT, normalized_amount REAL, xgb_score REAL,
-        iso_score REAL, svm_score REAL, risk_score REAL, final_decision TEXT, submitted_by TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    INSERT INTO Users (email, role, status) VALUES
-        ('admin@example.com', 'Admin', 'Active'), ('employee@example.com', 'User', 'Active');
-    INSERT INTO Requests (role, final_decision, submitted_by) VALUES
-        ('Junior Developer', 'APPROVED', 'employee@example.com');
-'''
+# The tables as they existed before organizations, in each backend's original form.
+LEGACY_SCHEMA = {
+    'sqlite': [
+        '''CREATE TABLE Users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password_hash TEXT,
+            role TEXT NOT NULL, status TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''',
+        '''CREATE TABLE Requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, department TEXT, request_type TEXT,
+            destination TEXT, amount REAL, currency TEXT, normalized_amount REAL, xgb_score REAL,
+            iso_score REAL, svm_score REAL, risk_score REAL, final_decision TEXT, submitted_by TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''',
+    ],
+    'postgresql': [
+        '''CREATE TABLE Users (
+            id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT, name TEXT, emp_id TEXT,
+            reset_token TEXT, reset_expiry TIMESTAMP, role TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''',
+        '''CREATE TABLE Requests (
+            id SERIAL PRIMARY KEY, role TEXT, department TEXT, request_type TEXT, destination TEXT,
+            amount NUMERIC, currency TEXT, normalized_amount NUMERIC, xgb_score NUMERIC, iso_score NUMERIC,
+            svm_score NUMERIC, risk_score NUMERIC, final_decision TEXT, submitted_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''',
+    ],
+}
+LEGACY_ROWS = [
+    "INSERT INTO Users (email, role, status) VALUES ('admin@example.com', 'Admin', 'Active')",
+    "INSERT INTO Users (email, role, status) VALUES ('employee@example.com', 'User', 'Active')",
+    "INSERT INTO Requests (role, final_decision, submitted_by) VALUES ('Junior Developer', 'APPROVED', 'employee@example.com')",
+]
 
 
 def test_fresh_database_has_one_default_organization(app_db):
@@ -38,15 +53,15 @@ def test_setup_can_run_repeatedly_without_duplicates(app_db):
     assert len(query(app_db, 'SELECT id FROM Users')) == 1
 
 
-def test_existing_data_moves_into_default_organization(tmp_path, monkeypatch):
+def test_existing_data_moves_into_default_organization(backend):
     import main
 
-    db_path = tmp_path / 'legacy.db'
-    legacy = sqlite3.connect(db_path)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.close()
+    conn = main.get_db_connection()
+    for statement in LEGACY_SCHEMA[backend] + LEGACY_ROWS:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
 
-    monkeypatch.setattr(main, 'DB_FILE', str(db_path))
     main.setup_database()
 
     org_id = main.DEFAULT_ORGANIZATION_ID
@@ -61,11 +76,10 @@ def test_super_admin_from_settings_joins_default_organization(app_db):
     assert admin == {'role': 'SuperAdmin', 'status': 'Active', 'organization_id': app_db.DEFAULT_ORGANIZATION_ID}
 
 
-def test_no_super_admin_is_created_without_a_configured_email(tmp_path, monkeypatch):
+def test_no_super_admin_is_created_without_a_configured_email(backend, monkeypatch):
     import main
 
     monkeypatch.delenv('INITIAL_SUPER_ADMIN_EMAIL')
-    monkeypatch.setattr(main, 'DB_FILE', str(tmp_path / 'no-admin.db'))
     main.setup_database()
     assert query(main, 'SELECT id FROM Users') == []
 
