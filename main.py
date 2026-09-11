@@ -1,4 +1,4 @@
-from flask import Flask, g, redirect, request, jsonify, send_from_directory
+from flask import Flask, g, redirect, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -24,6 +24,8 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
 from urllib.parse import quote
+from werkzeug.exceptions import HTTPException
+from werkzeug.utils import secure_filename
 
 load_dotenv()
 
@@ -44,6 +46,8 @@ app.config['JWT_COOKIE_SAMESITE'] = 'Lax'  # Lax allows same-origin fetch + top-
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'  # Scoped to all routes for reliable cookie delivery
 app.config['JWT_ACCESS_COOKIE_NAME'] = 'ams_access_token' # Changed name to bypass stale cookies
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=int(os.getenv('JWT_ACCESS_TOKEN_HOURS', '8')))
+# Receipts travel with requests: at most 5 files of 5 MB each, plus the form fields.
+app.config['MAX_CONTENT_LENGTH'] = 26 * 1024 * 1024
 
 jwt = JWTManager(app)
 
@@ -372,6 +376,21 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Receipts (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL REFERENCES Requests(id),
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BYTEA NOT NULL,
+                uploaded_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -478,6 +497,21 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL REFERENCES Requests(id),
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BLOB NOT NULL,
+                uploaded_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -746,9 +780,148 @@ def parse_request_dates(start_value, end_value):
 
 
 # ==========================================
+# RECEIPTS
+# ==========================================
+RECEIPT_MAX_BYTES = 5 * 1024 * 1024
+RECEIPTS_PER_REQUEST = 5
+# A receipt's type is read from its content, never from its name or what the browser claims.
+RECEIPT_SIGNATURES = (
+    (b'%PDF-', 'application/pdf', '.pdf'),
+    (b'\x89PNG\r\n\x1a\n', 'image/png', '.png'),
+    (b'\xff\xd8\xff', 'image/jpeg', '.jpg'),
+)
+RECEIPT_COUNT_SQL = '(SELECT COUNT(*) FROM Receipts WHERE Receipts.request_id = Requests.id) AS receipt_count'
+
+def read_receipt_uploads(files):
+    """Returns (receipts, None) for valid uploads, or (None, error message)."""
+    files = [upload for upload in files if upload and upload.filename]
+    if len(files) > RECEIPTS_PER_REQUEST:
+        return None, f'Attach at most {RECEIPTS_PER_REQUEST} receipts to a request.'
+    receipts = []
+    for upload in files:
+        content = upload.read(RECEIPT_MAX_BYTES + 1)
+        if not content:
+            return None, 'One of the receipt files is empty.'
+        if len(content) > RECEIPT_MAX_BYTES:
+            return None, 'Each receipt must be 5 MB or smaller.'
+        kind = next(((mime, extension) for signature, mime, extension in RECEIPT_SIGNATURES if content.startswith(signature)), None)
+        if kind is None:
+            return None, 'Receipts must be PDF, JPG or PNG files.'
+        stem = os.path.splitext(secure_filename(upload.filename))[0][:100] or 'receipt'
+        receipts.append({
+            'filename': stem + kind[1], 'content_type': kind[0], 'size': len(content),
+            'sha256': hashlib.sha256(content).hexdigest(), 'content': content,
+        })
+    return receipts, None
+
+def save_receipts(conn, organization_id, request_id, uploader, receipts):
+    for receipt in receipts:
+        receipt_id = conn.execute(
+            'INSERT INTO Receipts (organization_id, request_id, filename, content_type, size, sha256, content, uploaded_by) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
+            (organization_id, request_id, receipt['filename'], receipt['content_type'], receipt['size'],
+             receipt['sha256'], receipt['content'], uploader)
+        ).fetchall()[0][0]
+        details = {key: receipt[key] for key in ('filename', 'content_type', 'size', 'sha256')}
+        record_event(conn, 'receipt.added', organization_id=organization_id, request_id=request_id, actor=uploader,
+                     details={'receipt_id': receipt_id, **details})
+
+def can_view_request(conn, request_id):
+    # Employees see receipts on their own requests; admins see every receipt in their organization.
+    row = conn.execute(
+        'SELECT submitted_by FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])
+    ).fetchone()
+    return bool(row) and (row['submitted_by'] == g.user['email'] or g.user['role'] in ('Admin', 'SuperAdmin'))
+
+@app.errorhandler(413)
+def upload_too_large(error):
+    return jsonify({'error': f'The upload is too large. Attach at most {RECEIPTS_PER_REQUEST} receipts of 5 MB each.'}), 413
+
+@app.route('/api/auth/request_receipts', methods=['GET'])
+@require_login
+def request_receipts():
+    request_id = request.args.get('id', type=int)
+    if request_id is None:
+        return jsonify({'error': 'Request ID is required'}), 400
+
+    conn = get_db_connection()
+    try:
+        if not can_view_request(conn, request_id):
+            return jsonify({'error': 'Request not found.'}), 404
+        rows = conn.execute(
+            'SELECT id, filename, content_type, size, uploaded_by, created_at FROM Receipts '
+            'WHERE request_id = ? AND organization_id = ? ORDER BY id',
+            (request_id, g.user['organization_id'])
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({'receipts': [to_json_row(row) for row in rows]})
+
+@app.route('/api/auth/receipt', methods=['GET'])
+@require_login
+def download_receipt():
+    receipt_id = request.args.get('id', type=int)
+    if receipt_id is None:
+        return jsonify({'error': 'Receipt ID is required'}), 400
+
+    conn = get_db_connection()
+    try:
+        receipt = conn.execute(
+            'SELECT request_id, filename, content_type, content FROM Receipts WHERE id = ? AND organization_id = ?',
+            (receipt_id, g.user['organization_id'])
+        ).fetchone()
+        if not receipt or not can_view_request(conn, receipt['request_id']):
+            return jsonify({'error': 'Receipt not found.'}), 404
+    finally:
+        conn.close()
+
+    # Images open in the browser; PDFs download, so no uploaded document runs inside this site.
+    response = send_file(
+        io.BytesIO(bytes(receipt['content'])), mimetype=receipt['content_type'], download_name=receipt['filename'],
+        as_attachment=receipt['content_type'] == 'application/pdf', etag=False
+    )
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Cache-Control'] = 'private, no-store'
+    response.headers['Content-Security-Policy'] = "default-src 'none'; img-src 'self'"
+    return response
+
+@app.route('/api/auth/add_receipts', methods=['POST'])
+@limiter.limit("30 per hour")
+@require_login
+def add_receipts():
+    request_id = request.form.get('request_id', type=int)
+    if request_id is None:
+        return jsonify({'error': 'Request ID is required'}), 400
+    receipts, error = read_receipt_uploads(request.files.getlist('receipts'))
+    if error:
+        return jsonify({'error': error}), 400
+    if not receipts:
+        return jsonify({'error': 'Choose at least one receipt.'}), 400
+
+    conn = get_db_connection()
+    try:
+        target = conn.execute(
+            'SELECT id, submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            (request_id, g.user['organization_id'])
+        ).fetchone()
+        if not target or target['submitted_by'] != g.user['email']:
+            return jsonify({'error': 'Request not found.'}), 404
+        if target['final_decision'] == 'REJECTED':
+            return jsonify({'error': "Receipts can't be added to a rejected request."}), 409
+        existing = conn.execute('SELECT COUNT(*) AS total FROM Receipts WHERE request_id = ?', (target['id'],)).fetchone()['total']
+        if existing + len(receipts) > RECEIPTS_PER_REQUEST:
+            return jsonify({'error': f'A request can have at most {RECEIPTS_PER_REQUEST} receipts.'}), 409
+        save_receipts(conn, g.user['organization_id'], target['id'], g.user['email'], receipts)
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'added': len(receipts)}), 201
+
+
+# ==========================================
 # POLICY RULES
 # ==========================================
-POLICY_RULE_TYPES = ('amount_limit', 'duplicate_request', 'always_review')
+POLICY_RULE_TYPES = ('amount_limit', 'duplicate_request', 'always_review', 'receipt_required')
 POLICY_REVIEW_FIELDS = {'request_type': 'Request type', 'destination': 'Destination', 'role': 'Role', 'department': 'Department'}
 POLICY_RULES_PER_ORGANIZATION = 100
 POLICY_TEXT_MAX_LENGTH = 100
@@ -776,6 +949,12 @@ def validate_policy_config(rule_type, config):
             return None, 'window_days must be a whole number from 1 to 90.'
         return {'window_days': days}, None
 
+    if rule_type == 'receipt_required':
+        above = config.get('above_amount_inr', 0)
+        if isinstance(above, bool) or not isinstance(above, (int, float)) or not math.isfinite(above) or not 0 <= above <= 1_000_000_000:
+            return None, 'above_amount_inr must be an amount in INR, or 0 to require a receipt on every request.'
+        return {'above_amount_inr': float(above)}, None
+
     field, values = config.get('field'), config.get('values')
     if not isinstance(field, str) or field not in POLICY_REVIEW_FIELDS:
         return None, f"field must be one of: {', '.join(POLICY_REVIEW_FIELDS)}."
@@ -801,6 +980,11 @@ def policy_rule_reason(conn, rule_type, config, organization_id, submitter, fiel
         ).fetchone()['total']
         if earlier:
             return f"The same employee submitted this request type and amount within the last {config['window_days']} days."
+    elif rule_type == 'receipt_required':
+        if fields['receipt_count'] == 0 and fields['amount_inr'] > config['above_amount_inr']:
+            if config['above_amount_inr']:
+                return f"No receipt was attached for an amount above ₹{config['above_amount_inr']:,.0f}."
+            return 'No receipt was attached.'
     elif rule_type == 'always_review':
         value = str(fields[config['field']] or '').strip()
         if value.lower() in {v.lower() for v in config['values']}:
@@ -963,7 +1147,8 @@ def predict():
 
     try:
         current_email = get_jwt_identity()
-        data = request.get_json(silent=True) or {}
+        # The employee portal sends a form so receipt files travel with the request; other clients may send JSON.
+        data = request.form.to_dict() if request.mimetype == 'multipart/form-data' else (request.get_json(silent=True) or {})
         xgb_model = artifacts['xgboost_model']
         iso_forest = artifacts['isolation_forest']
         oc_svm = artifacts['one_class_svm']
@@ -1001,6 +1186,9 @@ def predict():
         expense_date, end_date, date_error = parse_request_dates(data.get('Expense_Date'), data.get('End_Date'))
         if date_error:
             return jsonify({'error': date_error}), 400
+        receipts, receipt_error = read_receipt_uploads(request.files.getlist('receipts'))
+        if receipt_error:
+            return jsonify({'error': receipt_error}), 400
 
         # Normalize Amount to INR
         rate = exchange_rates.get(currency, 1.0)
@@ -1070,7 +1258,7 @@ def predict():
         # person; rules never approve or reject on their own, and the AI's own decision is still recorded.
         violations = policy_violations(conn, g.user['organization_id'], current_email, {
             'role': role, 'department': department, 'request_type': req_type, 'destination': destination,
-            'amount': amount, 'currency': currency, 'amount_inr': normalized_inr,
+            'amount': amount, 'currency': currency, 'amount_inr': normalized_inr, 'receipt_count': len(receipts),
         })
         if violations:
             status = 'ESCALATED_RULE'
@@ -1100,6 +1288,7 @@ def predict():
                 'explanation': shap_impact,
             }
         )
+        save_receipts(conn, g.user['organization_id'], request_id, current_email, receipts)
         conn.commit()
         conn.close()
 
@@ -1112,6 +1301,8 @@ def predict():
             'normalized_inr': normalized_inr,
         })
 
+    except HTTPException:
+        raise  # For example an upload over the size limit, answered by its own handler.
     except Exception:
         app.logger.exception("Prediction failed")
         return jsonify({
@@ -1919,7 +2110,7 @@ def my_requests():
     requests = conn.execute(
         "SELECT id, role, department, request_type, destination, amount, currency, normalized_amount, "
         "CASE WHEN final_decision LIKE 'ESCALATED%' THEN 'ESCALATED' ELSE final_decision END AS final_decision, "
-        "submitted_by, employee_name, employee_id, purpose, expense_date, end_date, created_at "
+        f"submitted_by, employee_name, employee_id, purpose, expense_date, end_date, created_at, {RECEIPT_COUNT_SQL} "
         "FROM Requests WHERE submitted_by = ? AND organization_id = ? ORDER BY created_at DESC",
         (current_email, g.user['organization_id'])
     ).fetchall()
@@ -1933,7 +2124,7 @@ def my_requests():
 def pending_approval_requests():
     conn = get_db_connection()
     requests = conn.execute(
-        "SELECT * FROM Requests WHERE final_decision LIKE 'ESCALATED%' AND organization_id = ? ORDER BY created_at DESC",
+        f"SELECT *, {RECEIPT_COUNT_SQL} FROM Requests WHERE final_decision LIKE 'ESCALATED%' AND organization_id = ? ORDER BY created_at DESC",
         (g.user['organization_id'],)
     ).fetchall()
     conn.close()
@@ -1946,7 +2137,7 @@ def pending_approval_requests():
 def all_requests():
     conn = get_db_connection()
     requests = conn.execute(
-        "SELECT * FROM Requests WHERE organization_id = ? ORDER BY created_at DESC", (g.user['organization_id'],)
+        f"SELECT *, {RECEIPT_COUNT_SQL} FROM Requests WHERE organization_id = ? ORDER BY created_at DESC", (g.user['organization_id'],)
     ).fetchall()
     conn.close()
     

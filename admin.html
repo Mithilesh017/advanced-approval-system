@@ -80,7 +80,8 @@
       'request.submitted': 'Submitted',
       'request.approved': 'Approved',
       'request.rejected': 'Rejected',
-      'request.reopened': 'Moved back to pending'
+      'request.reopened': 'Moved back to pending',
+      'receipt.added': 'Receipt added'
     };
     const FEATURE_LABELS = { Role: 'Role', Department: 'Department', Request_Type: 'Request type', Destination: 'Destination', Amount_INR: 'Amount' };
 
@@ -115,6 +116,14 @@
       return parts;
     };
 
+    const receiptLink = (details) => {
+      const link = historyNode('a', 'receipt-link', [`${details.filename} (${Math.max(1, Math.round(details.size / 1024))} KB)`]);
+      link.href = `/api/auth/receipt?id=${encodeURIComponent(details.receipt_id)}`;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      return link;
+    };
+
     const buildHistory = (events) => {
       if (!events.length) {
         return historyNode('p', 'history-empty', ['No history was recorded for this request. Requests handled before the audit log was added have no history.']);
@@ -126,6 +135,7 @@
         ]),
         historyNode('div', 'history-meta', [event.actor_email ? `by ${event.actor_email}` : 'by the system']),
         ...(event.comment ? [historyNode('blockquote', 'history-comment', [event.comment])] : []),
+        ...(event.action === 'receipt.added' && event.details ? [receiptLink(event.details)] : []),
         ...(event.action === 'request.submitted' ? submissionDetails(event) : [])
       ])));
     };
@@ -189,7 +199,8 @@
               violations: parseViolations(r.policy_violations),
               purpose: r.purpose,
               expenseDate: r.expense_date,
-              endDate: r.end_date
+              endDate: r.end_date,
+              receiptCount: r.receipt_count || 0
             }));
             setAllRequests(myRequests);
           }
@@ -671,7 +682,12 @@
                         <div>{req.destination}</div>
                         {req.expenseDate && <div className="cell-secondary">{formatRequestDates(req.expenseDate, req.endDate)}</div>}
                       </td>
-                      <td className="cell-nowrap">{req.amount} {req.currency}</td>
+                      <td className="cell-nowrap">
+                        <div>{req.amount} {req.currency}</div>
+                        {req.receiptCount > 0 && (
+                          <div className="cell-secondary"><i className="fas fa-paperclip"></i> {req.receiptCount} receipt{req.receiptCount === 1 ? '' : 's'}</div>
+                        )}
+                      </td>
                       <td>
                         {req.confidence !== undefined && (
                           <span className={`badge badge-block ${req.confidence > 80 ? 'badge-green' : req.confidence < 20 ? 'badge-red' : 'badge-orange'}`}>
@@ -963,7 +979,8 @@
     const RULE_TYPE_LABELS = {
       amount_limit: 'Amount limit',
       duplicate_request: 'Duplicate request',
-      always_review: 'Always review'
+      always_review: 'Always review',
+      receipt_required: 'Receipt required'
     };
     const REVIEW_FIELD_OPTIONS = [
       { value: 'request_type', label: 'Request type', optionKey: 'Request_Type' },
@@ -971,7 +988,7 @@
       { value: 'role', label: 'Role', optionKey: 'Role' },
       { value: 'department', label: 'Department', optionKey: 'Department' }
     ];
-    const EMPTY_RULE = { rule_type: 'amount_limit', role: '', request_type: '', max_amount_inr: '', window_days: '7', field: 'request_type', value: '' };
+    const EMPTY_RULE = { rule_type: 'amount_limit', role: '', request_type: '', max_amount_inr: '', window_days: '7', field: 'request_type', value: '', above_amount_inr: '0' };
 
     const describeRule = (form) => {
       if (form.rule_type === 'amount_limit') {
@@ -979,6 +996,10 @@
       }
       if (form.rule_type === 'duplicate_request') {
         return `Same employee, request type and amount within ${form.window_days} days`;
+      }
+      if (form.rule_type === 'receipt_required') {
+        const above = Number(form.above_amount_inr);
+        return above > 0 ? `Receipt required above ₹${above.toLocaleString('en-IN')}` : 'Receipt required on every request';
       }
       const field = REVIEW_FIELD_OPTIONS.find(option => option.value === form.field);
       return `Always review ${field.label.toLowerCase()} "${form.value.trim()}"`;
@@ -989,6 +1010,7 @@
         return { role: form.role.trim() || null, request_type: form.request_type.trim() || null, max_amount_inr: Number(form.max_amount_inr) };
       }
       if (form.rule_type === 'duplicate_request') return { window_days: Number(form.window_days) };
+      if (form.rule_type === 'receipt_required') return { above_amount_inr: Number(form.above_amount_inr) };
       return { field: form.field, values: [form.value.trim()] };
     };
 
@@ -1082,6 +1104,7 @@
                   <option value="amount_limit">Amount limit</option>
                   <option value="duplicate_request">Duplicate request</option>
                   <option value="always_review">Always review</option>
+                  <option value="receipt_required">Receipt required</option>
                 </select>
               </div>
 
@@ -1099,6 +1122,13 @@
                   <input id="rule-request-type" type="text" list={listId('Request_Type')} value={form.request_type} onChange={e => setField('request_type', e.target.value)} />
                 </div>
               </>)}
+
+              {form.rule_type === 'receipt_required' && (
+                <div className="form-group">
+                  <label htmlFor="rule-receipt-above">Require a receipt above (INR, 0 for every request)</label>
+                  <input id="rule-receipt-above" type="number" min="0" step="1" value={form.above_amount_inr} onChange={e => setField('above_amount_inr', e.target.value)} required />
+                </div>
+              )}
 
               {form.rule_type === 'duplicate_request' && (
                 <div className="form-group">

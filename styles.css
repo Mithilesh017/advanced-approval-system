@@ -332,6 +332,12 @@ button { -webkit-tap-highlight-color: transparent; }
 }
 .form-group textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-ring); }
 .cell-purpose { max-width: 260px; white-space: normal; overflow-wrap: anywhere; }
+.form-group input[type="file"] { height: auto; padding: 10px 14px; }
+
+/* ---------- Receipts ---------- */
+
+.receipt-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; text-align: left; }
+.receipt-list a, .receipt-link { display: inline-block; margin-top: 4px; font-size: var(--text-sm); color: var(--accent-text); overflow-wrap: anywhere; }
 .checkbox-row { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 20px; font-size: 0.875rem; color: var(--label-2); cursor: pointer; }
 .checkbox-row input { margin-top: 3px; accent-color: var(--accent); }
 

@@ -83,7 +83,8 @@
               raw_status: r.final_decision,
               purpose: r.purpose,
               expenseDate: r.expense_date,
-              endDate: r.end_date
+              endDate: r.end_date,
+              receiptCount: r.receipt_count || 0
             }));
             setUserRequests(myRequests);
           }
@@ -190,6 +191,7 @@
                 pendingCount={pendingCount}
                 approvedCount={approvedCount}
                 rejectedCount={rejectedCount}
+                refresh={loadData}
               />
             )}
           </div>
@@ -208,7 +210,21 @@
       return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
     };
 
-    function UserTableView({ requests, currentStatus, pendingCount, approvedCount, rejectedCount }) {
+    const RECEIPT_ACCEPT = '.pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png';
+    const RECEIPT_TYPES = ['application/pdf', 'image/jpeg', 'image/png'];
+    const MAX_RECEIPTS = 5;
+
+    // A quick check in the browser; the server checks each file's real content again.
+    const checkReceiptFiles = (files) => {
+      if (files.length > MAX_RECEIPTS) return `Attach at most ${MAX_RECEIPTS} receipts.`;
+      if (files.some(file => file.size > 5 * 1024 * 1024)) return 'Each receipt must be 5 MB or smaller.';
+      if (files.some(file => !RECEIPT_TYPES.includes(file.type))) return 'Receipts must be PDF, JPG or PNG files.';
+      return null;
+    };
+
+    const toFileArray = (value) => (value instanceof FileList ? Array.from(value) : value ? [value] : []);
+
+    function UserTableView({ requests, currentStatus, pendingCount, approvedCount, rejectedCount, refresh }) {
       const tableRef = useRef(null);
       const filteredRequests = requests.filter(r => r.status === currentStatus);
       const tableKey = currentStatus + "_" + JSON.stringify(filteredRequests);
@@ -231,6 +247,72 @@
            dt.destroy();
         };
       }, [tableKey]);
+
+      const manageReceipts = async (req) => {
+        let receipts = [];
+        try {
+          const res = await fetch(`/api/auth/request_receipts?id=${encodeURIComponent(req.id)}`, { credentials: 'include' });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The receipts could not be loaded.');
+          receipts = data.receipts;
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Receipts Unavailable', text: err.message });
+          return;
+        }
+
+        // Built from DOM nodes so file names are never treated as HTML.
+        const list = document.createElement('ul');
+        list.className = 'receipt-list';
+        receipts.forEach(receipt => {
+          const item = document.createElement('li');
+          const link = document.createElement('a');
+          link.href = `/api/auth/receipt?id=${encodeURIComponent(receipt.id)}`;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.textContent = `${receipt.filename} (${Math.max(1, Math.round(receipt.size / 1024))} KB)`;
+          item.append(link);
+          list.append(item);
+        });
+        if (!receipts.length) {
+          const empty = document.createElement('li');
+          empty.textContent = 'No receipts attached yet.';
+          list.append(empty);
+        }
+
+        const canAdd = req.status !== 'Rejected' && receipts.length < MAX_RECEIPTS;
+        const result = await Swal.fire({
+          title: `${req.reqId} Receipts`,
+          html: list,
+          ...(canAdd ? {
+            input: 'file',
+            inputAttributes: { multiple: 'multiple', accept: RECEIPT_ACCEPT, 'aria-label': 'Add receipts' },
+            showCancelButton: true,
+            confirmButtonText: 'Upload',
+            inputValidator: (value) => {
+              const chosen = toFileArray(value);
+              if (!chosen.length) return 'Choose at least one receipt.';
+              if (receipts.length + chosen.length > MAX_RECEIPTS) return `A request can have at most ${MAX_RECEIPTS} receipts.`;
+              return checkReceiptFiles(chosen) || undefined;
+            }
+          } : { confirmButtonText: 'Close' })
+        });
+        if (!canAdd || !result.isConfirmed) return;
+
+        const body = new FormData();
+        body.append('request_id', req.id);
+        toFileArray(result.value).forEach(file => body.append('receipts', file));
+        try {
+          const res = await fetch('/api/auth/add_receipts', { method: 'POST', body, credentials: 'include' });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The receipts could not be uploaded.');
+          refresh();
+          Swal.fire({ icon: 'success', title: 'Receipts Added', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Upload Failed', text: err.message });
+        }
+      };
 
       const getStatusBadge = (status) => {
         if(status === 'Pending') return <span className="status-badge status-pending">Pending</span>;
@@ -279,6 +361,7 @@
                     <th>Expense Type</th>
                     <th>Destination</th>
                     <th>Amount</th>
+                    <th>Receipts</th>
                     <th>Status</th>
                   </tr>
                 </thead>
@@ -300,6 +383,11 @@
                         {req.expenseDate && <div className="cell-secondary">{formatRequestDates(req.expenseDate, req.endDate)}</div>}
                       </td>
                       <td className="cell-nowrap">{req.amount} {req.currency}</td>
+                      <td>
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => manageReceipts(req)} aria-label={`Receipts for ${req.reqId}`}>
+                          <i className="fas fa-paperclip"></i> {req.receiptCount}
+                        </button>
+                      </td>
                       <td>{getStatusBadge(req.status)}</td>
                     </tr>
                   ))}
@@ -365,6 +453,7 @@
       const [loading, setLoading] = useState(false);
       const [options, setOptions] = useState({});
       const [optionsLoaded, setOptionsLoaded] = useState(false);
+      const [receiptFiles, setReceiptFiles] = useState([]);
       const [formData, setFormData] = useState({
         empName: user.email.split('@')[0],
         empId: '',
@@ -409,10 +498,20 @@
           Employee_Name: formData.empName, Employee_ID: formData.empId,
           Purpose: formData.purpose, Expense_Date: formData.expenseDate, End_Date: formData.endDate || null
         };
+        const receiptProblem = checkReceiptFiles(receiptFiles);
+        if (receiptProblem) {
+          Swal.fire({ icon: 'error', title: 'Check Your Receipts', text: receiptProblem });
+          setLoading(false);
+          return;
+        }
+        // Sent as a form so receipt files travel with the request.
+        const body = new FormData();
+        Object.entries(payload).forEach(([key, value]) => { if (value !== null && value !== undefined) body.append(key, value); });
+        receiptFiles.forEach(file => body.append('receipts', file));
         try {
           const response = await fetch('/api/predict', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            method: 'POST',
+            body,
             credentials: 'include'
           });
           if (isSessionExpired(response)) { setLoading(false); return; }
@@ -501,6 +600,11 @@
                 <label htmlFor="nr-purpose">Business purpose</label>
                 <textarea id="nr-purpose" name="purpose" value={formData.purpose} onChange={handleChange} required minLength={10} maxLength={500} rows={3} placeholder="e.g. Client workshop at the Mumbai office" />
                 <small className="field-hint">Explain why this expense is needed. Your approvers see this.</small>
+              </div>
+              <div className="form-group">
+                <label htmlFor="nr-receipts">Receipts (optional)</label>
+                <input id="nr-receipts" type="file" multiple accept={RECEIPT_ACCEPT} onChange={e => setReceiptFiles(Array.from(e.target.files))} />
+                <small className="field-hint">PDF, JPG or PNG, up to 5 files of 5 MB each. Your company may require a receipt above a set amount.</small>
               </div>
               <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={loading}>
                 {loading ? <span><i className="fas fa-spinner fa-spin"></i> AI is analyzing...</span> : <span><i className="fas fa-robot"></i> Submit to AI Agent</span>}
