@@ -313,6 +313,25 @@ button { -webkit-tap-highlight-color: transparent; }
 .history-item .shap-box { margin-top: 8px; }
 .history-empty { margin: 0; text-align: left; color: var(--label-3); }
 .history-violation { color: var(--red-text); }
+.history-summary { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--separator); text-align: left; }
+.history-purpose { font-size: 0.875rem; color: var(--label); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---------- Request details ---------- */
+
+.form-group textarea {
+  width: 100%;
+  padding: 10px 14px;
+  font: inherit;
+  font-size: var(--text-base);
+  color: var(--label);
+  background-color: var(--surface);
+  border: 1px solid var(--separator-strong);
+  border-radius: 10px;
+  outline: none;
+  resize: vertical;
+}
+.form-group textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-ring); }
+.cell-purpose { max-width: 260px; white-space: normal; overflow-wrap: anywhere; }
 .checkbox-row { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 20px; font-size: 0.875rem; color: var(--label-2); cursor: pointer; }
 .checkbox-row input { margin-top: 3px; accent-color: var(--accent); }
 

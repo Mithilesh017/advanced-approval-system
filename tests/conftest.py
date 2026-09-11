@@ -2,6 +2,7 @@ import os
 import secrets
 import sys
 import tempfile
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -11,6 +12,9 @@ from werkzeug.security import generate_password_hash
 
 ROOT = Path(__file__).resolve().parent.parent
 PASSWORD = 'correct-horse-battery'
+
+# The details every submitted request must include, on top of the fields the AI scores.
+REQUEST_DETAILS = {'Purpose': 'Client workshop at the Mumbai office', 'Expense_Date': date.today().isoformat()}
 
 # Set TEST_DATABASE_URL to also run every database test against PostgreSQL. Each test erases that database,
 # so its name must contain "test" to make pointing it at a real database impossible by accident.

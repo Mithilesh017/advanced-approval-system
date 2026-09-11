@@ -4,12 +4,12 @@ import json
 import pytest
 
 from conftest import (
-    SUPER_ADMIN, create_organization, create_platform_owner, create_user, execute, login, query, use_model_score,
+    REQUEST_DETAILS, SUPER_ADMIN, create_organization, create_platform_owner, create_user, execute, login, query, use_model_score,
 )
 
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
 }
 UPDATE_SETTINGS = '/api/auth/update_approval_settings'
 

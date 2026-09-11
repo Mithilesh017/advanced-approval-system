@@ -3,11 +3,11 @@ import json
 
 import pytest
 
-from conftest import SUPER_ADMIN, add_request, create_organization, create_platform_owner, create_user, login, query
+from conftest import REQUEST_DETAILS, SUPER_ADMIN, add_request, create_organization, create_platform_owner, create_user, login, query
 
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
 }
 HISTORY = '/api/auth/request_history'
 

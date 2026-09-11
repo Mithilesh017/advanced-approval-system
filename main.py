@@ -15,7 +15,7 @@ import time
 import email_service
 import model_pipeline
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 import pandas as pd
 import joblib
@@ -492,6 +492,10 @@ REQUEST_EXTRA_COLUMNS = {
     'ai_decision': 'TEXT',
     'approval_mode': 'TEXT',
     'policy_violations': 'TEXT',
+    # Dates are stored as ISO text (YYYY-MM-DD) so SQLite and PostgreSQL return the same value.
+    'purpose': 'TEXT',
+    'expense_date': 'TEXT',
+    'end_date': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -704,6 +708,41 @@ APPROVAL_MODES = ('shadow', 'automatic')
 def organization_auto_approve_threshold(organization):
     value = organization.get('auto_approve_above')
     return AUTO_APPROVE_THRESHOLD if value is None else max(AUTO_APPROVE_THRESHOLD, float(value))
+
+
+# ==========================================
+# REQUEST DETAILS
+# ==========================================
+PURPOSE_MIN_LENGTH = 10
+PURPOSE_MAX_LENGTH = 500
+REQUEST_DATE_WINDOW = timedelta(days=366)
+TRIP_MAX_DAYS = 90
+
+def parse_request_dates(start_value, end_value):
+    """Returns (expense date, end date or None, None) as ISO strings, or (None, None, error message)."""
+    def parse(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError:
+            return None
+
+    start = parse(start_value)
+    if start is None:
+        return None, None, 'Please give the expense date, for example 2026-09-12.'
+    today = datetime.utcnow().date()
+    if not today - REQUEST_DATE_WINDOW <= start <= today + REQUEST_DATE_WINDOW:
+        return None, None, 'The expense date must be within a year of today.'
+
+    if end_value in (None, ''):
+        return start.isoformat(), None, None
+    end = parse(end_value)
+    if end is None:
+        return None, None, 'The end date must be a date, for example 2026-09-14.'
+    if not start <= end <= start + timedelta(days=TRIP_MAX_DAYS):
+        return None, None, f'The end date must be on or after the expense date and within {TRIP_MAX_DAYS} days of it.'
+    return start.isoformat(), end.isoformat(), None
 
 
 # ==========================================
@@ -956,6 +995,13 @@ def predict():
         except (TypeError, ValueError):
             return jsonify({'error': 'Amount must be a positive number.'}), 400
 
+        purpose = str(data.get('Purpose') or '').strip() if isinstance(data.get('Purpose'), (str, type(None))) else ''
+        if not PURPOSE_MIN_LENGTH <= len(purpose) <= PURPOSE_MAX_LENGTH:
+            return jsonify({'error': f'Please describe the business purpose in {PURPOSE_MIN_LENGTH} to {PURPOSE_MAX_LENGTH} characters.'}), 400
+        expense_date, end_date, date_error = parse_request_dates(data.get('Expense_Date'), data.get('End_Date'))
+        if date_error:
+            return jsonify({'error': date_error}), 400
+
         # Normalize Amount to INR
         rate = exchange_rates.get(currency, 1.0)
         normalized_inr = amount * rate
@@ -1033,12 +1079,12 @@ def predict():
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
                 final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode,
-                policy_violations
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
+                policy_violations, purpose, expense_date, end_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
              status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode,
-             json.dumps(violations) if violations else None)
+             json.dumps(violations) if violations else None, purpose, expense_date, end_date)
         ).fetchall()[0][0]
         record_event(
             conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
@@ -1873,7 +1919,7 @@ def my_requests():
     requests = conn.execute(
         "SELECT id, role, department, request_type, destination, amount, currency, normalized_amount, "
         "CASE WHEN final_decision LIKE 'ESCALATED%' THEN 'ESCALATED' ELSE final_decision END AS final_decision, "
-        "submitted_by, employee_name, employee_id, created_at "
+        "submitted_by, employee_name, employee_id, purpose, expense_date, end_date, created_at "
         "FROM Requests WHERE submitted_by = ? AND organization_id = ? ORDER BY created_at DESC",
         (current_email, g.user['organization_id'])
     ).fetchall()

@@ -80,7 +80,10 @@
               destination: r.destination,
               currency: r.currency,
               email: r.submitted_by,
-              raw_status: r.final_decision
+              raw_status: r.final_decision,
+              purpose: r.purpose,
+              expenseDate: r.expense_date,
+              endDate: r.end_date
             }));
             setUserRequests(myRequests);
           }
@@ -194,6 +197,17 @@
       );
     }
 
+    // Dates are plain YYYY-MM-DD values, so they are read as local dates to avoid shifting across time zones.
+    const formatRequestDates = (start, end) => {
+      const format = (value) => new Date(`${value}T00:00:00`).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return end && end !== start ? `${format(start)} to ${format(end)}` : format(start);
+    };
+
+    const localToday = () => {
+      const now = new Date();
+      return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+    };
+
     function UserTableView({ requests, currentStatus, pendingCount, approvedCount, rejectedCount }) {
       const tableRef = useRef(null);
       const filteredRequests = requests.filter(r => r.status === currentStatus);
@@ -277,8 +291,14 @@
                         <div className="cell-secondary">{req.empId || 'N/A'}</div>
                       </td>
                       <td>{req.department}</td>
-                      <td>{req.reqType}</td>
-                      <td>{req.destination}</td>
+                      <td>
+                        <div>{req.reqType}</div>
+                        {req.purpose && <div className="cell-secondary cell-purpose" title={req.purpose}>{req.purpose}</div>}
+                      </td>
+                      <td>
+                        <div>{req.destination}</div>
+                        {req.expenseDate && <div className="cell-secondary">{formatRequestDates(req.expenseDate, req.endDate)}</div>}
+                      </td>
                       <td className="cell-nowrap">{req.amount} {req.currency}</td>
                       <td>{getStatusBadge(req.status)}</td>
                     </tr>
@@ -353,7 +373,10 @@
         reqType: '',
         destination: '',
         currency: 'INR',
-        amount: 5000
+        amount: 5000,
+        purpose: '',
+        expenseDate: localToday(),
+        endDate: ''
       });
 
       useEffect(() => {
@@ -383,7 +406,8 @@
           Role: formData.role, Department: formData.department,
           Request_Type: formData.reqType, Destination: formData.destination,
           Currency: formData.currency, Amount: parseFloat(formData.amount),
-          Employee_Name: formData.empName, Employee_ID: formData.empId
+          Employee_Name: formData.empName, Employee_ID: formData.empId,
+          Purpose: formData.purpose, Expense_Date: formData.expenseDate, End_Date: formData.endDate || null
         };
         try {
           const response = await fetch('/api/predict', {
@@ -464,6 +488,19 @@
                   <label htmlFor="nr-amount">Amount</label>
                   <input id="nr-amount" type="number" name="amount" value={formData.amount} onChange={handleChange} required min="1" />
                 </div>
+                <div className="form-group">
+                  <label htmlFor="nr-expenseDate">Expense date (or trip start)</label>
+                  <input id="nr-expenseDate" type="date" name="expenseDate" value={formData.expenseDate} onChange={handleChange} required />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="nr-endDate">Trip end date (optional)</label>
+                  <input id="nr-endDate" type="date" name="endDate" value={formData.endDate} min={formData.expenseDate || undefined} onChange={handleChange} />
+                </div>
+              </div>
+              <div className="form-group">
+                <label htmlFor="nr-purpose">Business purpose</label>
+                <textarea id="nr-purpose" name="purpose" value={formData.purpose} onChange={handleChange} required minLength={10} maxLength={500} rows={3} placeholder="e.g. Client workshop at the Mumbai office" />
+                <small className="field-hint">Explain why this expense is needed. Your approvers see this.</small>
               </div>
               <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={loading}>
                 {loading ? <span><i className="fas fa-spinner fa-spin"></i> AI is analyzing...</span> : <span><i className="fas fa-robot"></i> Submit to AI Agent</span>}

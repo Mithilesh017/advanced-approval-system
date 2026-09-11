@@ -1,9 +1,9 @@
-from conftest import add_request, create_user, login, query
+from conftest import REQUEST_DETAILS, add_request, create_user, login, query
 
 SCORE_FIELDS = {'xgb_score', 'iso_score', 'svm_score', 'risk_score'}
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
-    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR',
+    'Destination': 'Mumbai', 'Amount': 5000, 'Currency': 'INR', **REQUEST_DETAILS,
 }
 
 

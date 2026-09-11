@@ -130,13 +130,24 @@
       ])));
     };
 
+    // Dates are plain YYYY-MM-DD values, so they are read as local dates to avoid shifting across time zones.
+    const formatRequestDates = (start, end) => {
+      const format = (value) => new Date(`${value}T00:00:00`).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return end && end !== start ? `${format(start)} to ${format(end)}` : format(start);
+    };
+
+    const requestSummary = (req) => historyNode('div', 'history-summary', [
+      historyNode('div', 'history-purpose', [req.purpose || 'No business purpose was recorded for this request.']),
+      ...(req.expenseDate ? [historyNode('div', 'history-meta', [`Dates: ${formatRequestDates(req.expenseDate, req.endDate)}`])] : [])
+    ]);
+
     const showRequestHistory = async (req) => {
       try {
         const res = await fetch(`/api/auth/request_history?id=${encodeURIComponent(req.id)}`, { credentials: 'include' });
         if (isSessionExpired(res)) return;
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || 'The history could not be loaded.');
-        Swal.fire({ title: `${req.reqId} History`, html: buildHistory(data.events), width: 640, confirmButtonText: 'Close' });
+        Swal.fire({ title: `${req.reqId} History`, html: historyNode('div', '', [requestSummary(req), buildHistory(data.events)]), width: 640, confirmButtonText: 'Close' });
       } catch (err) {
         Swal.fire({ icon: 'error', title: 'History Unavailable', text: err.message });
       }
@@ -175,7 +186,10 @@
               confidence: r.xgb_score == null ? undefined : Math.round(r.xgb_score * 1000) / 10,
               reason: DECISION_LABELS[r.final_decision],
               shadowRecommendation: r.approval_mode === 'shadow' ? r.ai_decision : null,
-              violations: parseViolations(r.policy_violations)
+              violations: parseViolations(r.policy_violations),
+              purpose: r.purpose,
+              expenseDate: r.expense_date,
+              endDate: r.end_date
             }));
             setAllRequests(myRequests);
           }
@@ -649,8 +663,14 @@
                       </td>
                       <td>{req.department}</td>
                       <td>{req.role}</td>
-                      <td>{req.reqType}</td>
-                      <td>{req.destination}</td>
+                      <td>
+                        <div>{req.reqType}</div>
+                        {req.purpose && <div className="cell-secondary cell-purpose" title={req.purpose}>{req.purpose}</div>}
+                      </td>
+                      <td>
+                        <div>{req.destination}</div>
+                        {req.expenseDate && <div className="cell-secondary">{formatRequestDates(req.expenseDate, req.endDate)}</div>}
+                      </td>
                       <td className="cell-nowrap">{req.amount} {req.currency}</td>
                       <td>
                         {req.confidence !== undefined && (
