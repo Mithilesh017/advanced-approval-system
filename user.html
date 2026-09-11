@@ -42,6 +42,16 @@
         });
     };
 
+    let sessionExpiredNotified = false;
+    const isSessionExpired = (res) => {
+      if (res.status !== 401 && res.status !== 422) return false;
+      if (!sessionExpiredNotified) {
+        sessionExpiredNotified = true;
+        Swal.fire({ icon: 'warning', title: 'Session Expired', text: 'Please log in again to continue.', allowOutsideClick: false }).then(signOut);
+      }
+      return true;
+    };
+
     function EmployeePortal() {
       const [view, setView] = useState('pending');
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'user@gmail.com'});
@@ -50,6 +60,7 @@
       const loadData = async () => {
         try {
           const res = await fetch('/api/auth/my_requests', { credentials: 'include' });
+          if (isSessionExpired(res)) return;
           if (res.ok) {
             const data = await res.json();
             
@@ -61,6 +72,7 @@
               amount: r.amount,
               status: r.final_decision.startsWith('ESCALATED') ? 'Pending' : (r.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'),
               category: r.request_type,
+              reqType: r.request_type,
               role: r.role,
               department: r.department,
               destination: r.destination,
@@ -306,18 +318,19 @@
             body: JSON.stringify(payload),
             credentials: 'include'
           });
+          if (isSessionExpired(response)) { setLoading(false); return; }
           const result = await response.json();
           if (response.ok) {
             if (result.status === "APPROVED") {
               // Auto-approved by AI
               Swal.fire({ icon: 'success', title: 'Auto-Approved!', text: 'Your request was approved instantly by the AI.' }).then(() => {
-                  loadData();
+                  refresh();
                   setView('approved');
               });
             } else {
               // Escalated for review
               Swal.fire({ icon: 'warning', title: 'Sent for Manual Review', text: 'This request requires HR approval.' }).then(() => {
-                  loadData();
+                  refresh();
                   setView('pending');
               });
             }
@@ -325,7 +338,7 @@
             Swal.fire({ icon: 'error', title: 'API Error', text: result.error });
           }
         } catch (error) {
-          Swal.fire({ icon: 'error', title: 'Connection Failed', text: 'Is your Python server.py running on port 5000?' });
+          Swal.fire({ icon: 'error', title: 'Connection Failed', text: 'Could not reach the server. Please try again.' });
         }
         setLoading(false);
       };
@@ -402,10 +415,10 @@
       const [profileData, setProfileData] = useState({ name: '', emp_id: '' });
 
       useEffect(() => {
-        fetch(`/api/auth/get_profile?email=${user.email}`, { credentials: 'include' })
-          .then(res => res.json())
+        fetch('/api/auth/get_profile', { credentials: 'include' })
+          .then(res => isSessionExpired(res) ? null : res.json())
           .then(data => {
-            if(!data.error) {
+            if(data && !data.error) {
               setProfileData({ name: data.name || '', emp_id: data.emp_id || '' });
             }
           });
@@ -423,6 +436,7 @@
             body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id }),
             credentials: 'include'
           });
+          if (isSessionExpired(res)) { setLoading(false); return; }
           const data = await res.json();
           if(res.ok) {
              Swal.fire({ title: 'Updated!', text: data.message, icon: 'success' });

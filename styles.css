@@ -954,6 +954,7 @@ select:disabled {
 .panel-title i { font-size: 16px; color: var(--accent); }
 .panel-title.is-danger i { color: var(--red-text); }
 .panel-subtitle { max-width: 70ch; margin-bottom: 20px; font-size: 0.875rem; color: var(--label-3); }
+.panel-subtitle code { padding: 1px 6px; border-radius: 6px; font-family: var(--font-mono); font-size: var(--text-sm); color: var(--label-2); background: var(--fill-soft); }
 .panel-title + form, .panel-title + .form-grid { margin-top: 18px; }
 
 .divider { height: 1px; margin: 28px 0; border: 0; background: var(--separator); }

@@ -43,6 +43,23 @@
         });
     };
 
+    let sessionExpiredNotified = false;
+    const isSessionExpired = (res) => {
+      if (res.status !== 401 && res.status !== 422) return false;
+      if (!sessionExpiredNotified) {
+        sessionExpiredNotified = true;
+        Swal.fire({ icon: 'warning', title: 'Session Expired', text: 'Please log in again to continue.', allowOutsideClick: false }).then(signOut);
+      }
+      return true;
+    };
+
+    const DECISION_LABELS = {
+      ESCALATED_UNKNOWN: 'Unrecognized category',
+      ESCALATED_ANOMALY: 'Anomaly detected',
+      ESCALATED_POLICY: 'Low AI confidence',
+      ESCALATED_MANUAL_REVIEW: 'Needs manual review'
+    };
+
     function AdminPortal() {
       const [view, setView] = useState('dashboard');
       const [allRequests, setAllRequests] = useState([]);
@@ -51,6 +68,7 @@
       const loadData = async () => {
         try {
           const res = await fetch('/api/auth/all_requests', { credentials: 'include' });
+          if (isSessionExpired(res)) return;
           if (res.ok) {
             const data = await res.json();
             
@@ -61,13 +79,16 @@
               amount: r.amount,
               status: r.final_decision.startsWith('ESCALATED') ? 'Pending' : (r.final_decision === 'APPROVED' ? 'Approved' : 'Rejected'),
               category: r.request_type,
+              reqType: r.request_type,
               role: r.role,
               department: r.department,
               destination: r.destination,
               currency: r.currency,
               email: r.submitted_by,
               raw_status: r.final_decision,
-              aiScore: (r.xgb_score * 100).toFixed(1) + '%'
+              aiScore: (r.xgb_score * 100).toFixed(1) + '%',
+              confidence: r.xgb_score == null ? undefined : Math.round(r.xgb_score * 1000) / 10,
+              reason: DECISION_LABELS[r.final_decision]
             }));
             setAllRequests(myRequests);
           }
@@ -202,6 +223,19 @@
     function DashboardView({ requests, userEmail, setView, userRole }) {
       const pieRef = useRef(null);
       const barRef = useRef(null);
+      const [activeUsers, setActiveUsers] = useState(null);
+
+      useEffect(() => {
+        fetch('/api/auth/users', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => {
+            if (Array.isArray(data)) {
+              const visible = userRole === 'SuperAdmin' ? data : data.filter(u => u.role !== 'SuperAdmin');
+              setActiveUsers(visible.filter(u => u.status === 'Active').length);
+            }
+          })
+          .catch(() => {});
+      }, [userRole]);
 
       const pending = requests.filter(r => r.status === 'Pending').length;
       const approved = requests.filter(r => r.status === 'Approved').length;
@@ -320,8 +354,8 @@
           <div className="stats-grid-3">
             <div className="stat-card blue">
               <div className="stat-icon"><i className="fas fa-users"></i></div>
-              <div className="stat-value">2</div>
-              <div className="stat-label">Total Users</div>
+              <div className="stat-value">{activeUsers ?? '—'}</div>
+              <div className="stat-label">Active Users</div>
             </div>
             <div className="stat-card purple">
               <div className="stat-icon"><i className="fas fa-building"></i></div>
@@ -365,12 +399,26 @@
 
     function TableView({ requests, currentStatus, refresh }) {
       const tableRef = useRef(null);
-      const filteredRequests = requests.filter(r => r.status === currentStatus);
+      const [department, setDepartment] = useState('');
+      const [reqType, setReqType] = useState('');
+      const [roleQuery, setRoleQuery] = useState('');
+
+      const uniqueSorted = (key) => [...new Set(requests.map(r => r[key]).filter(Boolean))].sort();
+      const departmentOptions = uniqueSorted('department');
+      const typeOptions = uniqueSorted('reqType');
+      const normalizedRoleQuery = roleQuery.trim().toLowerCase();
+      const filteredRequests = requests.filter(r =>
+        r.status === currentStatus &&
+        (!department || r.department === department) &&
+        (!reqType || r.reqType === reqType) &&
+        (!normalizedRoleQuery || (r.role || '').toLowerCase().includes(normalizedRoleQuery))
+      );
       const tableKey = currentStatus + "_" + JSON.stringify(filteredRequests);
+      const clearFilters = () => { setDepartment(''); setReqType(''); setRoleQuery(''); };
 
       useEffect(() => {
         if (!tableRef.current) return;
-        
+
         const dt = $(tableRef.current).DataTable({
           dom: 'Bfrtip',
           buttons: [
@@ -389,43 +437,30 @@
       }, [tableKey]); // Re-run only when the tableKey changes (full remount)
 
       const handleAction = async (id, newStatus) => {
-        let endpoint = '';
-        if (newStatus === 'Approved') endpoint = '/api/auth/approve_request';
-        else if (newStatus === 'Rejected') endpoint = '/api/auth/reject_request';
-        else return; // Moving back to pending not supported in this version
+        const endpoints = {
+          Approved: '/api/auth/approve_request',
+          Rejected: '/api/auth/reject_request',
+          Pending: '/api/auth/reopen_request'
+        };
 
         try {
-          const res = await fetch(endpoint, {
+          const res = await fetch(endpoints[newStatus], {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: id }),
             credentials: 'include'
           });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
           if (res.ok) {
             refresh();
-            Swal.fire({ icon: 'success', title: `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+            Swal.fire({ icon: 'success', title: newStatus === 'Pending' ? 'Moved to Pending' : `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+          } else {
+            Swal.fire({ icon: 'error', title: 'Update Failed', text: data.error || data.msg || 'The request could not be updated.' });
           }
         } catch (e) {
           Swal.fire({ icon: 'error', title: 'API Error', text: 'Failed to update request.' });
         }
-      };
-
-      const handleClearHistory = () => {
-        Swal.fire({
-          title: 'Are you sure?',
-          text: "You won't be able to revert this!",
-          icon: 'warning',
-          showCancelButton: true,
-          confirmButtonColor: '#d70015',
-          cancelButtonColor: '#6c757d',
-          confirmButtonText: 'Yes, clear all!'
-        }).then((result) => {
-          if (result.isConfirmed) {
-            localStorage.removeItem('ams_requests');
-            refresh();
-            Swal.fire('Cleared!', 'All request history has been deleted.', 'success');
-          }
-        });
       };
 
       const getStatusBadge = (status) => {
@@ -462,19 +497,25 @@
           <div className="table-card">
             <div className="filters-row">
               <div className="form-group">
-                <label><i className="fas fa-building"></i> Department</label>
-                <select><option>All Departments</option><option>Engineering</option><option>Sales</option><option>Marketing</option></select>
+                <label htmlFor="flt-department"><i className="fas fa-building"></i> Department</label>
+                <select id="flt-department" value={department} onChange={e => setDepartment(e.target.value)}>
+                  <option value="">All Departments</option>
+                  {departmentOptions.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
               </div>
               <div className="form-group">
-                <label><i className="fas fa-tag"></i> Expense Type</label>
-                <select><option>All Types</option><option>Hotel Booking</option><option>Flight Ticket</option></select>
+                <label htmlFor="flt-type"><i className="fas fa-tag"></i> Expense Type</label>
+                <select id="flt-type" value={reqType} onChange={e => setReqType(e.target.value)}>
+                  <option value="">All Types</option>
+                  {typeOptions.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
               </div>
               <div className="form-group">
-                <label><i className="fas fa-user"></i> Person Role</label>
-                <input type="text" placeholder="Search by role..." />
+                <label htmlFor="flt-role"><i className="fas fa-user"></i> Person Role</label>
+                <input id="flt-role" type="text" placeholder="Search by role..." value={roleQuery} onChange={e => setRoleQuery(e.target.value)} />
               </div>
               <div>
-                <button type="button" className="btn btn-tinted-danger" onClick={handleClearHistory}><i className="fas fa-trash"></i> Reset Database</button>
+                <button type="button" className="btn btn-secondary" onClick={clearFilters} disabled={!department && !reqType && !roleQuery}><i className="fas fa-rotate-left"></i> Clear Filters</button>
               </div>
             </div>
 
@@ -513,7 +554,7 @@
                             <i className="fas fa-brain"></i> Confidence: {req.confidence}%
                           </span>
                         )}
-                        <span className="badge badge-block badge-accent">{req.reason || req.aiScore}</span>
+                        {req.reason && <span className="badge badge-block badge-accent">{req.reason}</span>}
                         {req.shap && (
                           <div className="shap-box">
                             <div className="shap-title">SHAP Impact</div>
@@ -553,105 +594,94 @@
     }
 
     function MlopsView() {
-      const [training, setTraining] = useState(false);
-      const [logs, setLogs] = useState([
-        "[SYSTEM] Model loaded successfully.",
-        "[SYSTEM] Awaiting retrain trigger..."
-      ]);
+      const [info, setInfo] = useState(null);
+      const [loadError, setLoadError] = useState('');
 
-      const [lastRetrainTime, setLastRetrainTime] = useState(
-        parseInt(localStorage.getItem('ams_last_retrain')) || (Date.now() - 2 * 24 * 60 * 60 * 1000)
-      );
-      const [currentTime, setCurrentTime] = useState(Date.now());
-      
       useEffect(() => {
-        const interval = setInterval(() => {
-          setCurrentTime(Date.now());
-        }, 1000);
-        return () => clearInterval(interval);
+        fetch('/api/model/info', { credentials: 'include' })
+          .then(res => {
+            if (isSessionExpired(res)) return null;
+            if (!res.ok) throw new Error('Model info request failed');
+            return res.json();
+          })
+          .then(data => { if (data) setInfo(data); })
+          .catch(() => setLoadError('Could not load model details from the server.'));
       }, []);
 
-      const getElapsedTime = () => {
-        const diff = Math.floor((currentTime - lastRetrainTime) / 1000);
-        if (diff < 60) return diff + " seconds ago";
-        if (diff < 3600) return Math.floor(diff / 60) + " minutes ago";
-        if (diff < 86400) return Math.floor(diff / 3600) + " hours ago";
-        return Math.floor(diff / 86400) + " days ago";
-      };
-
-      const triggerRetrain = () => {
-        Swal.fire({
-          title: 'Trigger Batch Retrain?',
-          text: "This will feed recent overrides back into the ML pipeline.",
-          icon: 'warning',
-          showCancelButton: true,
-          confirmButtonColor: 'var(--navy-primary)',
-          cancelButtonColor: '#6c757d',
-          confirmButtonText: 'Yes, Retrain Now!'
-        }).then((result) => {
-          if (result.isConfirmed) {
-            setTraining(true);
-            setLogs(prev => [...prev, "[JOB] Nightly Batch Retrain started..."]);
-            setTimeout(() => {
-              setLogs(prev => [...prev, "[JOB] Processing new manual overrides..."]);
-            }, 1000);
-            setTimeout(() => {
-              setLogs(prev => [...prev, "[JOB] Updating gradient weights & vocabulary..."]);
-            }, 2500);
-            setTimeout(() => {
-              setLogs(prev => [...prev, "[JOB] Success! Accuracy improved by 0.24%."]);
-              setTraining(false);
-              const now = Date.now();
-              setLastRetrainTime(now);
-              localStorage.setItem('ams_last_retrain', now);
-              Swal.fire('Retrained!', 'The ML Model has been successfully updated.', 'success');
-            }, 4000);
-          }
-        });
-      };
+      const categoryCount = info && info.vocabulary ? Object.values(info.vocabulary).reduce((sum, n) => sum + n, 0) : null;
+      const updatedLabel = info && info.trained_at
+        ? new Date(info.trained_at).toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' })
+        : '—';
 
       return (
         <div>
           <div className="dash-banner is-dark">
             <div className="dash-banner-left">
-               <div className="dash-banner-icon"><i className="fas fa-robot"></i></div>
+              <div className="dash-banner-icon"><i className="fas fa-robot"></i></div>
               <div>
                 <h3>MLOps Control Center</h3>
-                <p>Manage, retrain, and monitor the AI Approval Agent directly from this dashboard.</p>
+                <p>Inspect the AI approval model that is currently scoring requests.</p>
               </div>
             </div>
           </div>
-          
+
           <div className="stats-grid-3">
             <div className="stat-card blue">
               <div className="stat-icon"><i className="fas fa-microchip"></i></div>
-              <div className="stat-value is-compact">Isolation Forest</div>
-              <div className="stat-label">Active Model Architecture</div>
+              <div className="stat-value is-compact">{info ? (info.ready ? 'XGBoost Ensemble' : 'Unavailable') : '—'}</div>
+              <div className="stat-label">Active Model</div>
             </div>
             <div className="stat-card green">
-              <div className="stat-icon"><i className="fas fa-bullseye"></i></div>
-              <div className="stat-value">94.2%</div>
-              <div className="stat-label">Current Accuracy Score</div>
+              <div className="stat-icon"><i className="fas fa-tags"></i></div>
+              <div className="stat-value">{categoryCount ?? '—'}</div>
+              <div className="stat-label">Known Categories</div>
             </div>
             <div className="stat-card purple">
               <div className="stat-icon"><i className="fas fa-history"></i></div>
-              <div className="stat-value is-compact">{getElapsedTime()}</div>
-              <div className="stat-label">Last Retrain Date</div>
+              <div className="stat-value is-compact">{updatedLabel}</div>
+              <div className="stat-label">Model File Updated</div>
             </div>
           </div>
 
           <div className="panel">
-             <h3 className="panel-title"><i className="fas fa-cogs"></i> Retrain Pipeline</h3>
-             <p className="panel-subtitle">
-               Triggering this job will fetch all manual overrides (when an admin changed an AI decision) and retrain the model to learn from those corrections.
-             </p>
-             <button type="button" onClick={triggerRetrain} disabled={training} className="btn btn-primary btn-lg">
-               {training ? <span><i className="fas fa-spinner fa-spin"></i> Retraining in progress...</span> : <span><i className="fas fa-bolt"></i> Trigger Nightly Batch Retrain</span>}
-             </button>
-             
-             <div className="console" role="log" aria-live="polite">
-               {logs.map((log, i) => <div key={i}>{log}</div>)}
-             </div>
+            <h3 className="panel-title"><i className="fas fa-cogs"></i> Decision Pipeline</h3>
+            {loadError && <p className="panel-subtitle">{loadError}</p>}
+            {!info && !loadError && <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading model details...</div>}
+            {info && !info.ready && (
+              <p className="panel-subtitle">The model files failed to load on the server, so new requests cannot be scored until this is fixed.</p>
+            )}
+            {info && info.ready && (
+              <>
+                <p className="panel-subtitle">
+                  Requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% are auto-approved. Unknown categories, detected anomalies, and lower scores are escalated for manual review.
+                </p>
+                <div className="table-scroll">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Component</th>
+                        <th>What it does</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {info.components.map(c => (
+                        <tr key={c.name}>
+                          <td className="cell-primary">{c.name}</td>
+                          <td className="cell-muted">{c.purpose}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="panel">
+            <h3 className="panel-title"><i className="fas fa-bolt"></i> Retraining</h3>
+            <p className="panel-subtitle">
+              Retraining runs offline: run <code>train_ensemble_model.py</code> on the latest data, commit the new <code>ensemble_ai_model.pkl</code>, and redeploy.
+            </p>
           </div>
         </div>
       );
@@ -665,6 +695,7 @@
       const fetchUsers = async () => {
         try {
           const res = await fetch('/api/auth/users', { credentials: 'include' });
+          if (isSessionExpired(res)) return;
           const data = await res.json();
           if (Array.isArray(data)) {
             let filteredData = data;
@@ -673,11 +704,7 @@
             }
             setAllUsers(filteredData);
           } else {
-            if (res.status === 401 || res.status === 403 || data.msg) {
-               Swal.fire('Session Expired', 'Please log in again to manage users.', 'warning').then(() => { window.location.href = 'index.html'; });
-            } else {
-               Swal.fire({ title: 'Error', text: data.error || data.msg || 'Could not fetch users from Auth API', icon: 'error' });
-            }
+            Swal.fire({ title: 'Error', text: data.error || data.msg || 'Could not fetch users from Auth API', icon: 'error' });
             setAllUsers([]);
           }
         } catch (err) {
@@ -701,6 +728,7 @@
             body: JSON.stringify({ email: email }),
             credentials: 'include'
           });
+          if (isSessionExpired(res)) return;
           const data = await res.json();
           if (res.ok) {
             Swal.fire({ title: 'Approved!', text: data.message, icon: 'success' });
@@ -722,6 +750,7 @@
             body: JSON.stringify({ email: email }),
             credentials: 'include'
           });
+          if (isSessionExpired(res)) return;
           const data = await res.json();
           if (res.ok) {
             Swal.fire({ title: 'Rejected!', text: data.message, icon: 'success' });
@@ -752,6 +781,7 @@
                 body: JSON.stringify({ email: email }),
                 credentials: 'include'
               });
+              if (isSessionExpired(res)) return;
               const data = await res.json();
               if (res.ok) {
                 Swal.fire({ title: 'Deleted!', text: data.message, icon: 'success' });
@@ -885,10 +915,10 @@
       const [profileData, setProfileData] = useState({ name: '', emp_id: '' });
 
       useEffect(() => {
-        fetch(`/api/auth/get_profile?email=${user.email}`, { credentials: 'include' })
-          .then(res => res.json())
+        fetch('/api/auth/get_profile', { credentials: 'include' })
+          .then(res => isSessionExpired(res) ? null : res.json())
           .then(data => {
-            if(!data.error) {
+            if(data && !data.error) {
               setProfileData({ name: data.name || '', emp_id: data.emp_id || '' });
             }
           });
@@ -906,6 +936,7 @@
             body: JSON.stringify({ email: user.email, name: profileData.name, emp_id: profileData.emp_id }),
             credentials: 'include'
           });
+          if (isSessionExpired(res)) { setLoading(false); return; }
           const data = await res.json();
           if(res.ok) {
              Swal.fire({ title: 'Updated!', text: data.message, icon: 'success' });

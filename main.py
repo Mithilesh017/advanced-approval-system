@@ -10,7 +10,7 @@ import sqlite3
 import os
 import email_service
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import pandas as pd
 import joblib
@@ -37,6 +37,7 @@ app.config['JWT_COOKIE_CSRF_PROTECT'] = False  # Mitigated via SameSite
 app.config['JWT_COOKIE_SAMESITE'] = 'Lax'  # Lax allows same-origin fetch + top-level navigations
 app.config['JWT_ACCESS_COOKIE_PATH'] = '/'  # Scoped to all routes for reliable cookie delivery
 app.config['JWT_ACCESS_COOKIE_NAME'] = 'ams_access_token' # Changed name to bypass stale cookies
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=int(os.getenv('JWT_ACCESS_TOKEN_HOURS', '8')))
 
 jwt = JWTManager(app)
 
@@ -308,6 +309,9 @@ exchange_rates = {
     'SGD': 61.30
 }
 
+AUTO_APPROVE_THRESHOLD = 0.8
+ESCALATE_THRESHOLD = 0.2
+
 
 # ==========================================
 # 3. STATIC FILE ROUTING (FRONTEND)
@@ -415,10 +419,10 @@ def predict():
         elif is_severe_anomaly:
             status = "ESCALATED_ANOMALY"
             message = "Unusual data distribution detected by Anomaly Detectors. Flagged as anomaly."
-        elif xgb_prob > 0.8:
+        elif xgb_prob > AUTO_APPROVE_THRESHOLD:
             status = "APPROVED"
             message = "Auto-Approved based on high confidence."
-        elif xgb_prob < 0.2:
+        elif xgb_prob < ESCALATE_THRESHOLD:
             status = "ESCALATED_POLICY"  
             message = "Auto-Rejected based on low confidence. Manual review / policy enforcement required."
         else:
@@ -455,6 +459,28 @@ def predict():
             'status': 'ESCALATED_SYSTEM_ERROR',
             'message': 'An internal system error occurred during AI processing.'
         }), 500
+
+
+@app.route('/api/model/info', methods=['GET'])
+@require_role('SuperAdmin')
+def model_info():
+    if not MODEL_READY:
+        return jsonify({'ready': False})
+
+    updated_at = datetime.fromtimestamp(os.path.getmtime('ensemble_ai_model.pkl'), timezone.utc)
+    return jsonify({
+        'ready': True,
+        'components': [
+            {'name': 'XGBoost classifier', 'purpose': 'Scores how likely a request is to be approved'},
+            {'name': 'Isolation Forest', 'purpose': 'Flags requests with unusual patterns'},
+            {'name': 'One-Class SVM', 'purpose': 'Second anomaly detector for unusual requests'},
+            {'name': 'SHAP explainer', 'purpose': 'Explains which fields drove each score'},
+        ],
+        'features': list(features),
+        'vocabulary': {col: len(encoders[col].classes_) for col in ['Role', 'Department', 'Request_Type', 'Destination']},
+        'thresholds': {'auto_approve_above': AUTO_APPROVE_THRESHOLD, 'escalate_below': ESCALATE_THRESHOLD},
+        'trained_at': updated_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+    })
 
 
 # ==========================================
@@ -806,6 +832,23 @@ def reject_request():
         
     conn = get_db_connection()
     cursor = conn.execute("UPDATE Requests SET final_decision = 'REJECTED' WHERE id = ?", (req_id,))
+    conn.commit()
+    updated = cursor.rowcount
+    conn.close()
+    if not updated:
+        return jsonify({'error': 'Request not found.'}), 404
+    return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/reopen_request', methods=['POST'])
+@require_role('Admin')
+def reopen_request():
+    data = request.get_json(silent=True) or {}
+    req_id = data.get('id')
+    if not req_id:
+        return jsonify({'error': 'Request ID is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.execute("UPDATE Requests SET final_decision = 'ESCALATED_MANUAL_REVIEW' WHERE id = ?", (req_id,))
     conn.commit()
     updated = cursor.rowcount
     conn.close()
