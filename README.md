@@ -8,6 +8,11 @@
 ![scikit--learn](https://img.shields.io/badge/scikit--learn-1.8-F7931E?logo=scikitlearn&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL%20%7C%20SQLite-supported-4169E1?logo=postgresql&logoColor=white)
+![License](https://img.shields.io/badge/License-Proprietary-B91C1C)
+
+> [!IMPORTANT]
+> **Proprietary software of [Neuzem](https://neuzem.com). All rights reserved.**
+> This repository is confidential and intended only for people Neuzem has authorized. No license is granted to download, clone, copy, run, modify, deploy or distribute any part of it without prior written permission from Neuzem. See [License](#license).
 
 ---
 
@@ -193,17 +198,19 @@ advanced-approval-system/
 └── .env.example
 ```
 
-## Getting started
+## Development setup (authorized team members only)
+
+> Access to the source code is restricted to Neuzem team members and parties with written permission from Neuzem. The steps below are internal development instructions and do not grant any right to use the software.
 
 ### Prerequisites
 - Python 3.11 or newer
-- Git
+- Repository access granted by Neuzem
 
 ### Run locally
 
+From the project folder, create a virtual environment:
+
 ```bash
-git clone https://github.com/Mithilesh017/advanced-approval-system.git
-cd advanced-approval-system
 python -m venv .venv
 ```
 
@@ -253,7 +260,7 @@ python train_ensemble_model.py
 
 ## Deployment
 
-AAMS runs on any platform that supports Python web services, such as Render with a managed PostgreSQL database.
+Production deployments are managed by Neuzem. For internal reference, AAMS runs on any Python web host, such as Render with a managed PostgreSQL database.
 
 1. Create a PostgreSQL database and copy its connection string.
 2. Create a web service from this repository.
@@ -341,6 +348,14 @@ Retrained model versions are stored in the database, so they persist across depl
 - The frontend compiles JSX in the browser for zero-build simplicity. A bundler would improve load time for large deployments.
 - An automated test suite is not yet included in the repository.
 
-## Author
+## License
 
-Built by **Mithilesh** ([@Mithilesh017](https://github.com/Mithilesh017)).
+**Proprietary. Copyright © 2026 Neuzem. All rights reserved.**
+
+This software, including its source code, trained models, documentation and design, is confidential and the exclusive property of Neuzem. No license or right is granted, by implication or otherwise, to download, clone, copy, install, run, modify, deploy, sublicense or distribute any part of it without prior written permission from Neuzem.
+
+For demonstrations, evaluations or licensing enquiries, contact Neuzem through [neuzem.com](https://neuzem.com).
+
+## Ownership
+
+Developed by **Mithilesh** ([@Mithilesh017](https://github.com/Mithilesh017)) for **[Neuzem](https://neuzem.com)**.
