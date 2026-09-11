@@ -1,4 +1,4 @@
-from flask import Flask, g, request, jsonify, send_from_directory
+from flask import Flask, g, redirect, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -23,6 +23,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
+from urllib.parse import quote
 
 load_dotenv()
 
@@ -549,6 +550,10 @@ def serve_static(filename):
 def index():
     return send_from_directory('.', 'index.html')
 
+@app.route('/join/<code>')
+def join_page(code):
+    return redirect(f"/index.html?join={quote(code, safe='')}")
+
 
 # ==========================================
 # 4. MACHINE LEARNING API ROUTES
@@ -948,6 +953,53 @@ def login():
     return jsonify({'error': 'Unknown status'}), 500
 
 
+JOIN_LINK_INVALID_MESSAGE = 'This join link is not valid. Ask your company administrator for a current link.'
+
+def active_organization_by_join_code(conn, code):
+    if not isinstance(code, str) or not code:
+        return None
+    return conn.execute("SELECT id, name FROM Organizations WHERE join_code = ? AND status = 'Active'", (code,)).fetchone()
+
+def organization_name_of(email):
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            'SELECT Organizations.name FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
+            (email,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row['name'] if row else None
+
+@app.route('/api/auth/join_info', methods=['GET'])
+@limiter.limit("30 per minute")
+def join_info():
+    conn = get_db_connection()
+    try:
+        organization = active_organization_by_join_code(conn, request.args.get('code'))
+    finally:
+        conn.close()
+    if not organization:
+        return jsonify({'error': JOIN_LINK_INVALID_MESSAGE}), 404
+    return jsonify({'organization_name': organization['name']})
+
+@app.route('/api/auth/organization', methods=['GET'])
+@require_login
+def current_organization():
+    conn = get_db_connection()
+    try:
+        organization = conn.execute('SELECT name, join_code FROM Organizations WHERE id = ?', (g.user['organization_id'],)).fetchone()
+    finally:
+        conn.close()
+
+    # Admins approve access requests, so only they hand out the join link.
+    is_admin = g.user['role'] in ('Admin', 'SuperAdmin')
+    return jsonify({
+        'name': organization['name'],
+        'join_link': f"{public_base_url()}/join/{quote(organization['join_code'], safe='')}" if is_admin else None,
+        'can_manage_model': g.user['role'] == 'SuperAdmin' and g.user['organization_id'] == DEFAULT_ORGANIZATION_ID,
+    })
+
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
 def request_access():
@@ -965,6 +1017,10 @@ def request_access():
         return jsonify({'error': 'Invalid role requested.'}), 400
 
     conn = get_db_connection()
+    organization = active_organization_by_join_code(conn, data.get('join_code'))
+    if not organization:
+        conn.close()
+        return jsonify({'error': JOIN_LINK_INVALID_MESSAGE}), 400
     existing_user = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
     if existing_user and existing_user['role'] == 'SuperAdmin':
         conn.close()
@@ -973,10 +1029,9 @@ def request_access():
         conn.close()
         return jsonify({'error': 'Email already exists or is pending.'}), 409
     try:
-        # Until join links exist, every access request joins the default organization.
         conn.execute(
             'INSERT INTO Users (email, role, status, organization_id) VALUES (?, ?, ?, ?)',
-            (email, role, 'Pending', DEFAULT_ORGANIZATION_ID)
+            (email, role, 'Pending', organization['id'])
         )
         conn.commit()
     except DB_INTEGRITY_ERRORS:
@@ -988,25 +1043,25 @@ def request_access():
         conn = get_db_connection()
         super_admins = conn.execute(
             "SELECT email FROM Users WHERE role = 'SuperAdmin' AND status = 'Active' AND organization_id = ?",
-            (DEFAULT_ORGANIZATION_ID,)
+            (organization['id'],)
         ).fetchall()
         conn.close()
         for sa in super_admins:
-            email_service.sendAdminRegistrationNotification(sa['email'], email)
+            email_service.sendAdminRegistrationNotification(sa['email'], email, organization['name'])
     else:
         conn = get_db_connection()
         active_admins = conn.execute(
             "SELECT email FROM Users WHERE role IN ('Admin', 'SuperAdmin') AND status = 'Active' AND organization_id = ?",
-            (DEFAULT_ORGANIZATION_ID,)
+            (organization['id'],)
         ).fetchall()
         conn.close()
         
         all_notifiers = [a['email'] for a in active_admins]
         
         for notify_email in all_notifiers:
-            email_service.sendUserRegistrationNotification(notify_email, email, role)
+            email_service.sendUserRegistrationNotification(notify_email, email, role, organization['name'])
 
-    return jsonify({'status': 'SUCCESS', 'message': 'Access request submitted successfully. Awaiting approval.'})
+    return jsonify({'status': 'SUCCESS', 'message': f"Your request to join {organization['name']} was sent. An administrator will review it."})
 
 
 @app.route('/api/auth/setup_password', methods=['POST'])
@@ -1037,7 +1092,7 @@ def setup_password():
     conn.commit()
     conn.close()
 
-    email_service.sendWelcomeEmail(email, email.split('@')[0])
+    email_service.sendWelcomeEmail(email, email.split('@')[0], organization_name_of(email))
 
     redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
     resp = jsonify({
@@ -1137,9 +1192,9 @@ def approve_user():
             name = email.split('@')[0]
             setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
             if user['role'] == 'Admin':
-                email_service.sendAdminApprovedEmail(email, name, setup_link)
+                email_service.sendAdminApprovedEmail(email, name, setup_link, organization_name_of(email))
             else:
-                email_service.sendUserApprovedEmail(email, name, setup_link)
+                email_service.sendUserApprovedEmail(email, name, setup_link, organization_name_of(email))
                 
     conn.close()
     
@@ -1177,9 +1232,9 @@ def reject_user():
         if user:
             name = email.split('@')[0]
             if user['role'] == 'Admin':
-                email_service.sendAdminRejectedEmail(email, name)
+                email_service.sendAdminRejectedEmail(email, name, organization_name_of(email))
             else:
-                email_service.sendUserRejectedEmail(email, name)
+                email_service.sendUserRejectedEmail(email, name, organization_name_of(email))
                 
     conn.close()
     
@@ -1337,9 +1392,9 @@ def request_password_reset():
         conn.close()
         name = email.split('@')[0]
         if user['role'] == 'Admin':
-            email_service.sendAdminApprovedEmail(email, name, setup_link)
+            email_service.sendAdminApprovedEmail(email, name, setup_link, organization_name_of(email))
         else:
-            email_service.sendUserApprovedEmail(email, name, setup_link)
+            email_service.sendUserApprovedEmail(email, name, setup_link, organization_name_of(email))
         return jsonify({'status': 'SUCCESS', 'message': 'If the email exists, a password reset request has been generated.'})
 
     if user['status'] != 'Active':

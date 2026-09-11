@@ -19,6 +19,7 @@ os.environ.update({
     'SMTP_USERNAME': '',
     'SMTP_PASSWORD': '',
     'RENDER': '',
+    'APP_BASE_URL': '',
     'ENVIRONMENT': '',
     'JWT_SECRET_KEY': 'test-only-secret-key-with-enough-length-for-hs256',
     'INITIAL_SUPER_ADMIN_EMAIL': 'owner@example.com',
@@ -74,6 +75,11 @@ def create_organization(module, name, status='Active'):
         (name, secrets.token_urlsafe(9), status)
     )
     return rows[0][0]
+
+
+def join_code_of(module, organization_id):
+    [row] = query(module, 'SELECT join_code FROM Organizations WHERE id = ?', (organization_id,))
+    return row['join_code']
 
 
 def create_user(module, email, role='User', organization_id=None, status='Active'):

@@ -1,6 +1,6 @@
 import sqlite3
 
-from conftest import SUPER_ADMIN, query
+from conftest import SUPER_ADMIN, join_code_of, query
 
 LEGACY_SCHEMA = '''
     CREATE TABLE Users (
@@ -70,8 +70,10 @@ def test_no_super_admin_is_created_without_a_configured_email(tmp_path, monkeypa
     assert query(main, 'SELECT id FROM Users') == []
 
 
-def test_access_request_joins_default_organization(client, app_db):
-    response = client.post('/api/auth/request_access', json={'email': 'new.hire@example.com', 'role': 'User'})
+def test_access_request_with_the_default_join_link_joins_default_organization(client, app_db):
+    response = client.post('/api/auth/request_access', json={
+        'email': 'new.hire@example.com', 'role': 'User', 'join_code': join_code_of(app_db, app_db.DEFAULT_ORGANIZATION_ID),
+    })
     assert response.status_code == 200
     [user] = query(app_db, 'SELECT organization_id FROM Users WHERE email = ?', ('new.hire@example.com',))
     assert user['organization_id'] == app_db.DEFAULT_ORGANIZATION_ID

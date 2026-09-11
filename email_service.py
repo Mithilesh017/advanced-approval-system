@@ -131,11 +131,15 @@ def _action_button(link, label):
         f'{escape(label)}</a></div>'
     )
 
-def sendUserRegistrationNotification(admin_email, user_email, requested_role):
+def _organization(name):
+    # Organization names are typed by people, so they are escaped like any other user input.
+    return f"<strong>{escape(name)}</strong>" if name else "your organization"
+
+def sendUserRegistrationNotification(admin_email, user_email, requested_role, organization_name):
     subject = "New User Registration Request"
     content = f"""
     <h3>Hello Admin,</h3>
-    <p>A new user has requested access to the Advanced Approval Management System.</p>
+    <p>A new user has requested access to {_organization(organization_name)} on the Advanced Approval Management System.</p>
     <h4>User Information</h4>
     <ul>
         <li><strong>Email:</strong> {escape(user_email)}</li>
@@ -149,12 +153,12 @@ def sendUserRegistrationNotification(admin_email, user_email, requested_role):
     html = _get_base_template(content)
     _send_email_async(admin_email, subject, html)
 
-def sendUserApprovedEmail(user_email, user_name, setup_link):
+def sendUserApprovedEmail(user_email, user_name, setup_link, organization_name):
     subject = "Your Account Has Been Approved"
     content = f"""
     <h3>Hello {escape(user_name)},</h3>
     <p>Congratulations.</p>
-    <p>Your account has been approved by the Administrator.</p>
+    <p>Your request to join {_organization(organization_name)} has been approved by an administrator.</p>
     <p>Create your password using the secure link below to activate your account. The link expires in 72 hours.</p>
     {_action_button(setup_link, 'Set Up Your Password')}
     <p>After that, you can log in and begin submitting approval requests.</p>
@@ -163,23 +167,23 @@ def sendUserApprovedEmail(user_email, user_name, setup_link):
     html = _get_base_template(content)
     _send_email_async(user_email, subject, html)
 
-def sendUserRejectedEmail(user_email, user_name):
+def sendUserRejectedEmail(user_email, user_name, organization_name):
     subject = "Account Registration Update"
     content = f"""
     <h3>Hello {escape(user_name)},</h3>
-    <p>Your registration request has been reviewed.</p>
+    <p>Your request to join {_organization(organization_name)} has been reviewed.</p>
     <p>Unfortunately, your account has not been approved.</p>
-    <p>If you believe this is an error, please contact the system administrator.</p>
+    <p>If you believe this is an error, please contact your organization's administrator.</p>
     <p>Thank you.</p>
     """
     html = _get_base_template(content)
     _send_email_async(user_email, subject, html)
 
-def sendAdminRegistrationNotification(superadmin_email, admin_email):
+def sendAdminRegistrationNotification(superadmin_email, admin_email, organization_name):
     subject = "New Administrator Registration Request"
     content = f"""
     <h3>Hello Super Admin,</h3>
-    <p>A new administrator account has been requested.</p>
+    <p>A new administrator account has been requested for {_organization(organization_name)}.</p>
     <h4>Applicant Details</h4>
     <ul>
         <li><strong>Email:</strong> {escape(admin_email)}</li>
@@ -192,12 +196,12 @@ def sendAdminRegistrationNotification(superadmin_email, admin_email):
     html = _get_base_template(content)
     _send_email_async(superadmin_email, subject, html)
 
-def sendAdminApprovedEmail(admin_email, admin_name, setup_link):
+def sendAdminApprovedEmail(admin_email, admin_name, setup_link, organization_name):
     subject = "Administrator Access Approved"
     content = f"""
     <h3>Hello {escape(admin_name)},</h3>
     <p>Congratulations.</p>
-    <p>Your administrator account has been approved.</p>
+    <p>Your administrator account for {_organization(organization_name)} has been approved.</p>
     <p>Create your password using the secure link below to activate your account. The link expires in 72 hours.</p>
     {_action_button(setup_link, 'Set Up Your Password')}
     <p>After that, you can access the Admin Dashboard.</p>
@@ -206,11 +210,11 @@ def sendAdminApprovedEmail(admin_email, admin_name, setup_link):
     html = _get_base_template(content)
     _send_email_async(admin_email, subject, html)
 
-def sendAdminRejectedEmail(admin_email, admin_name):
+def sendAdminRejectedEmail(admin_email, admin_name, organization_name):
     subject = "Administrator Registration Update"
     content = f"""
     <h3>Hello {escape(admin_name)},</h3>
-    <p>Your administrator registration request has been reviewed.</p>
+    <p>Your administrator registration request for {_organization(organization_name)} has been reviewed.</p>
     <p>Unfortunately, your request has been rejected.</p>
     <p>Please contact the Super Administrator if additional information is required.</p>
     <p>Thank you.</p>
@@ -218,11 +222,11 @@ def sendAdminRejectedEmail(admin_email, admin_name):
     html = _get_base_template(content)
     _send_email_async(admin_email, subject, html)
 
-def sendWelcomeEmail(user_email, user_name):
+def sendWelcomeEmail(user_email, user_name, organization_name):
     subject = "Welcome to the Advanced Approval Management System"
     content = f"""
     <h3>Hello {escape(user_name)},</h3>
-    <p>Welcome to the Advanced Approval Management System.</p>
+    <p>Welcome to {_organization(organization_name)} on the Advanced Approval Management System.</p>
     <p>We are pleased to have you onboard.</p>
     <p>Thank you.</p>
     """

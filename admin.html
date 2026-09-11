@@ -64,6 +64,7 @@
       const [view, setView] = useState('dashboard');
       const [allRequests, setAllRequests] = useState([]);
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'admin@gmail.com'});
+      const [organization, setOrganization] = useState(null);
 
       const loadData = async () => {
         try {
@@ -101,6 +102,10 @@
 
       useEffect(() => {
         loadData();
+        fetch('/api/auth/organization', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (data) setOrganization(data); })
+          .catch(() => {});
       }, []);
 
       const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
@@ -136,6 +141,7 @@
                 {user.email.charAt(0).toUpperCase()}
               </div>
               <div className="sidebar-user-meta">
+                {organization && <div className="sidebar-org" title={organization.name}>{organization.name}</div>}
                 <div className="email" title={user.email}>{user.email}</div>
                 <span className={`badge ${user.role === 'SuperAdmin' ? 'badge-purple' : 'badge-accent'}`}>{user.role === 'SuperAdmin' ? 'Super Admin' : 'Admin'}</span>
               </div>
@@ -166,7 +172,7 @@
                   <span className="count secondary">{rejectedCount}</span>
                 </button>
               </li>
-              {user.role === 'SuperAdmin' && (
+              {user.role === 'SuperAdmin' && organization?.can_manage_model && (
                 <li>
                   <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
                     <i className="fas fa-brain"></i> ML Agent
@@ -214,8 +220,8 @@
                     refresh={loadData} 
                 />
             }
-            {user.role === 'SuperAdmin' && view === 'mlops' && <MlopsView />}
-            {view === 'users' && <UsersView userRole={user.role} />}
+            {user.role === 'SuperAdmin' && organization?.can_manage_model && view === 'mlops' && <MlopsView />}
+            {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
             {view === 'profile' && <ProfileView user={user} />}
           </div>
         </div>
@@ -863,7 +869,7 @@
       );
     }
 
-    function UsersView({ userRole }) {
+    function UsersView({ userRole, organization }) {
       const [allUsers, setAllUsers] = useState([]);
       const [loading, setLoading] = useState(true);
       const [activeRoleFilter, setActiveRoleFilter] = useState('All');
@@ -972,6 +978,15 @@
         });
       };
 
+      const copyJoinLink = async () => {
+        try {
+          await navigator.clipboard.writeText(organization.join_link);
+          Swal.fire({ icon: 'success', title: 'Join link copied', timer: 1200, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'info', title: 'Copy this join link', input: 'text', inputValue: organization.join_link, inputAttributes: { readonly: true } });
+        }
+      };
+
       const pendingUsers = allUsers.filter(u => u.status === 'Pending');
       const activeUsers = allUsers.filter(u => u.status !== 'Pending' && (activeRoleFilter === 'All' || u.role === activeRoleFilter));
 
@@ -979,6 +994,22 @@
         <div className="panel">
           <h3 className="panel-title"><i className="fas fa-users-cog"></i> Manage Employee Requests</h3>
           <p className="panel-subtitle">Approve pending access requests for new standard User accounts. Once approved, they will be prompted to create a password.</p>
+
+          {organization?.join_link && (
+            <div className="callout callout-info join-link">
+              <i className="fas fa-link" aria-hidden="true"></i>
+              <div className="join-link-body">
+                <strong>Invite people to {organization.name}</strong>
+                <div>Share this join link with new employees. Their access requests appear below for approval.</div>
+                <div className="join-link-row">
+                  <input type="text" readOnly value={organization.join_link} aria-label="Join link" onFocus={e => e.target.select()} />
+                  <button type="button" className="btn btn-primary btn-sm" onClick={copyJoinLink}>
+                    <i className="fas fa-copy"></i> Copy
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
           
           {loading ? (
              <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading employees...</div>

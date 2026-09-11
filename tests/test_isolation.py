@@ -1,7 +1,7 @@
 """Organization A must never see or change Organization B's people or requests."""
 import pytest
 
-from conftest import SUPER_ADMIN, add_request, create_organization, create_user, login, query
+from conftest import SUPER_ADMIN, add_request, create_organization, create_user, join_code_of, login, query
 
 VALID_REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
@@ -91,9 +91,11 @@ def test_access_requests_only_notify_that_organizations_admins(app_db, orgs, mon
     monkeypatch.setattr(app_db.email_service, 'sendAdminRegistrationNotification', lambda to, *args: notified.append(to))
 
     client = app_db.app.test_client()
-    assert client.post('/api/auth/request_access', json={'email': 'hire@example.com', 'role': 'User'}).status_code == 200
-    assert client.post('/api/auth/request_access', json={'email': 'lead@example.com', 'role': 'Admin'}).status_code == 200
-    assert notified == [SUPER_ADMIN['email'], SUPER_ADMIN['email']]
+    code = join_code_of(app_db, orgs['a']['org'])
+    assert client.post('/api/auth/request_access', json={'email': 'hire@example.com', 'role': 'User', 'join_code': code}).status_code == 200
+    assert client.post('/api/auth/request_access', json={'email': 'lead@example.com', 'role': 'Admin', 'join_code': code}).status_code == 200
+    # Employee requests reach Org A's admins and Super Admins; administrator requests only its Super Admins.
+    assert sorted(notified) == ['admin@a.test', 'super@a.test', 'super@a.test']
 
 
 def test_only_default_organization_super_admins_manage_the_shared_model(app_db, orgs):

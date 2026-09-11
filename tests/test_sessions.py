@@ -3,7 +3,7 @@ from flask_jwt_extended import create_access_token, decode_token
 from conftest import PASSWORD, SUPER_ADMIN, create_organization, create_user, execute, login
 
 PUBLIC_ENDPOINTS = {
-    'login', 'logout', 'request_access', 'setup_password',
+    'login', 'logout', 'request_access', 'setup_password', 'join_info',
     'request_password_reset', 'reset_password', 'reject_reset',
 }
 
