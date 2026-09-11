@@ -83,6 +83,17 @@ def create_user(module, email, role='User', organization_id=None, status='Active
     )
 
 
+def add_request(module, organization_id, submitted_by, final_decision='ESCALATED_MANUAL_REVIEW'):
+    rows = execute(
+        module,
+        'INSERT INTO Requests (role, department, request_type, destination, amount, currency, normalized_amount, '
+        'xgb_score, final_decision, submitted_by, organization_id) '
+        "VALUES ('Junior Developer', 'Engineering', 'Hotel Booking', 'Mumbai', 5000, 'INR', 5000, 0.5, ?, ?, ?) RETURNING id",
+        (final_decision, submitted_by, organization_id)
+    )
+    return rows[0][0]
+
+
 def login(client, email, password=PASSWORD):
     response = client.post('/api/auth/login', json={'email': email, 'password': password})
     assert response.status_code == 200, response.get_json()

@@ -101,6 +101,17 @@ def require_role(role):
         return decorator
     return wrapper
 
+def require_model_admin(fn):
+    # The model is shared by every organization. Until the Platform Owner role exists,
+    # only Super Admins of the default organization may retrain it or switch versions.
+    @wraps(fn)
+    @require_role('SuperAdmin')
+    def decorator(*args, **kwargs):
+        if g.user['organization_id'] != DEFAULT_ORGANIZATION_ID:
+            return jsonify({"error": "Insufficient permissions"}), 403
+        return fn(*args, **kwargs)
+    return decorator
+
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
 SETUP_TOKEN_TTL = timedelta(hours=72)
 RESET_TOKEN_TTL = timedelta(minutes=15)
@@ -559,7 +570,6 @@ def predict():
         xgb_model = artifacts['xgboost_model']
         iso_forest = artifacts['isolation_forest']
         oc_svm = artifacts['one_class_svm']
-        explainer = artifacts['shap_explainer']
         encoders = artifacts['encoders']
         scaler = artifacts['scaler']
         features = artifacts['features']
@@ -619,33 +629,23 @@ def predict():
 
         # XGBoost Probabilities
         xgb_prob = float(xgb_model.predict_proba(X_input)[0][1])
-        confidence_pct = round(xgb_prob * 100, 1)
         
         # Anomaly Detection
         iso_pred = int(iso_forest.predict(X_input)[0])
         svm_pred = int(oc_svm.predict(X_input)[0])
         is_severe_anomaly = (iso_pred == -1) or (svm_pred == -1)
         
-        # SHAP Explainability
-        shap_values = explainer.shap_values(X_input)
-        shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
-
         # Decision Routing Logic (Confidence Based Triage)
         if is_unknown_category:
             status = "ESCALATED_UNKNOWN"
-            message = "Unrecognized category detected (Out-Of-Vocabulary). Manual review required."
         elif is_severe_anomaly:
             status = "ESCALATED_ANOMALY"
-            message = "Unusual data distribution detected by Anomaly Detectors. Flagged as anomaly."
         elif xgb_prob > AUTO_APPROVE_THRESHOLD:
             status = "APPROVED"
-            message = "Auto-Approved based on high confidence."
         elif xgb_prob < ESCALATE_THRESHOLD:
-            status = "ESCALATED_POLICY"  
-            message = "Auto-Rejected based on low confidence. Manual review / policy enforcement required."
+            status = "ESCALATED_POLICY"
         else:
             status = "ESCALATED_MANUAL_REVIEW"
-            message = "Marginal confidence score. Sent to HR for manual review (Grey Area)."
 
         # Persist to DB
         conn = get_db_connection()
@@ -654,20 +654,21 @@ def predict():
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
                 final_decision, submitted_by, employee_name, employee_id, organization_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT organization_id FROM Users WHERE email = ?))''',
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
-             status, current_email, employee_name, employee_id, current_email)
+             status, current_email, employee_name, employee_id, g.user['organization_id'])
         )
         conn.commit()
         conn.close()
 
+        # Employees only learn the outcome. Scores and escalation reasons stay with administrators,
+        # so nobody can map the model's boundaries by resubmitting variations of a request.
+        approved = status == 'APPROVED'
         return jsonify({
-            'status': status,
-            'message': message,
-            'confidence': confidence_pct,
+            'status': 'APPROVED' if approved else 'PENDING_REVIEW',
+            'message': 'Your request was approved.' if approved else 'Your request was sent to an administrator for review.',
             'normalized_inr': normalized_inr,
-            'shap_explanations': shap_impact
         })
 
     except Exception:
@@ -680,7 +681,7 @@ def predict():
 
 
 @app.route('/api/model/info', methods=['GET'])
-@require_role('SuperAdmin')
+@require_model_admin
 def model_info():
     artifacts, version_id = get_active_model()
     if artifacts is None:
@@ -808,7 +809,7 @@ def run_training_job(job_id, started_by):
 
 @app.route('/api/model/retrain', methods=['POST'])
 @limiter.limit("10 per hour")
-@require_role('SuperAdmin')
+@require_model_admin
 def retrain_model():
     started_by = get_jwt_identity()
     conn = get_db_connection()
@@ -834,7 +835,7 @@ def retrain_model():
 
 
 @app.route('/api/model/jobs/latest', methods=['GET'])
-@require_role('SuperAdmin')
+@require_model_admin
 def latest_training_job():
     conn = get_db_connection()
     row = conn.execute('SELECT * FROM TrainingJobs ORDER BY id DESC LIMIT 1').fetchone()
@@ -843,7 +844,7 @@ def latest_training_job():
 
 
 @app.route('/api/model/versions', methods=['GET'])
-@require_role('SuperAdmin')
+@require_model_admin
 def model_versions():
     conn = get_db_connection()
     rows = conn.execute('SELECT id, metrics, created_by, is_active, created_at FROM ModelVersions ORDER BY id DESC').fetchall()
@@ -866,7 +867,7 @@ def model_versions():
 
 
 @app.route('/api/model/activate', methods=['POST'])
-@require_role('SuperAdmin')
+@require_model_admin
 def activate_model_version():
     data = request.get_json(silent=True) or {}
     version_id = data.get('version_id')
@@ -985,13 +986,19 @@ def request_access():
 
     if role == 'Admin':
         conn = get_db_connection()
-        super_admins = conn.execute("SELECT email FROM Users WHERE role = 'SuperAdmin' AND status = 'Active'").fetchall()
+        super_admins = conn.execute(
+            "SELECT email FROM Users WHERE role = 'SuperAdmin' AND status = 'Active' AND organization_id = ?",
+            (DEFAULT_ORGANIZATION_ID,)
+        ).fetchall()
         conn.close()
         for sa in super_admins:
             email_service.sendAdminRegistrationNotification(sa['email'], email)
     else:
         conn = get_db_connection()
-        active_admins = conn.execute("SELECT email FROM Users WHERE role IN ('Admin', 'SuperAdmin') AND status = 'Active'").fetchall()
+        active_admins = conn.execute(
+            "SELECT email FROM Users WHERE role IN ('Admin', 'SuperAdmin') AND status = 'Active' AND organization_id = ?",
+            (DEFAULT_ORGANIZATION_ID,)
+        ).fetchall()
         conn.close()
         
         all_notifiers = [a['email'] for a in active_admins]
@@ -1047,7 +1054,10 @@ def setup_password():
 @require_role('Admin')
 def get_pending_users():
     conn = get_db_connection()
-    users = conn.execute('SELECT id, email, role, status, created_at FROM Users WHERE status = "Pending"').fetchall()
+    users = conn.execute(
+        'SELECT id, email, role, status, created_at FROM Users WHERE status = "Pending" AND organization_id = ?',
+        (g.user['organization_id'],)
+    ).fetchall()
     conn.close()
     
     users_list = [to_json_row(u) for u in users]
@@ -1057,7 +1067,9 @@ def get_pending_users():
 @require_role('Admin')
 def get_all_users():
     conn = get_db_connection()
-    users = conn.execute('SELECT id, email, name, role, status, created_at FROM Users').fetchall()
+    users = conn.execute(
+        'SELECT id, email, name, role, status, created_at FROM Users WHERE organization_id = ?', (g.user['organization_id'],)
+    ).fetchall()
     conn.close()
     
     users_list = [to_json_row(u) for u in users]
@@ -1076,12 +1088,14 @@ def delete_user():
         return jsonify({'status': 'ERROR', 'message': 'You cannot delete your own account.'}), 403
 
     conn = get_db_connection()
-    target = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
+    target = conn.execute(
+        'SELECT role FROM Users WHERE email = ? AND organization_id = ?', (email, g.user['organization_id'])
+    ).fetchone()
     if target and g.user['role'] != 'SuperAdmin' and target['role'] != 'User':
         conn.close()
         return jsonify({'status': 'ERROR', 'message': 'Admins can only remove employee accounts.'}), 403
 
-    cursor = conn.execute('DELETE FROM Users WHERE email = ?', (email,))
+    cursor = conn.execute('DELETE FROM Users WHERE email = ? AND organization_id = ?', (email, g.user['organization_id']))
     conn.commit()
     conn.close()
     
@@ -1100,14 +1114,20 @@ def approve_user():
         return jsonify({'error': 'Email is required'}), 400
 
     conn = get_db_connection()
-    target = conn.execute('SELECT role FROM Users WHERE email = ? AND status = "Pending"', (email,)).fetchone()
-    if target and target['role'] == 'Admin' and g.user['role'] != 'SuperAdmin':
+    target = conn.execute(
+        'SELECT role FROM Users WHERE email = ? AND status = "Pending" AND organization_id = ?',
+        (email, g.user['organization_id'])
+    ).fetchone()
+    if not target:
+        conn.close()
+        return jsonify({'error': 'No pending access request was found for this email.'}), 404
+    if target['role'] == 'Admin' and g.user['role'] != 'SuperAdmin':
         conn.close()
         return jsonify({'error': 'Only a Super Admin can approve administrator requests.'}), 403
 
     cursor = conn.execute(
-        'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending"',
-        ('Approved_Awaiting_Password', email)
+        'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending" AND organization_id = ?',
+        ('Approved_Awaiting_Password', email, g.user['organization_id'])
     )
     conn.commit()
     
@@ -1135,14 +1155,20 @@ def reject_user():
         return jsonify({'error': 'Email is required'}), 400
 
     conn = get_db_connection()
-    target = conn.execute('SELECT role FROM Users WHERE email = ? AND status = "Pending"', (email,)).fetchone()
-    if target and target['role'] == 'Admin' and g.user['role'] != 'SuperAdmin':
+    target = conn.execute(
+        'SELECT role FROM Users WHERE email = ? AND status = "Pending" AND organization_id = ?',
+        (email, g.user['organization_id'])
+    ).fetchone()
+    if not target:
+        conn.close()
+        return jsonify({'error': 'No pending access request was found for this email.'}), 404
+    if target['role'] == 'Admin' and g.user['role'] != 'SuperAdmin':
         conn.close()
         return jsonify({'error': 'Only a Super Admin can reject administrator requests.'}), 403
 
     cursor = conn.execute(
-        'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending"',
-        ('Rejected', email)
+        'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending" AND organization_id = ?',
+        ('Rejected', email, g.user['organization_id'])
     )
     conn.commit()
     
@@ -1195,7 +1221,14 @@ def update_profile():
 def my_requests():
     current_email = get_jwt_identity()
     conn = get_db_connection()
-    requests = conn.execute('SELECT * FROM Requests WHERE submitted_by = ? ORDER BY created_at DESC', (current_email,)).fetchall()
+    # Scores and escalation reasons are for administrators only.
+    requests = conn.execute(
+        "SELECT id, role, department, request_type, destination, amount, currency, normalized_amount, "
+        "CASE WHEN final_decision LIKE 'ESCALATED%' THEN 'ESCALATED' ELSE final_decision END AS final_decision, "
+        "submitted_by, employee_name, employee_id, created_at "
+        "FROM Requests WHERE submitted_by = ? AND organization_id = ? ORDER BY created_at DESC",
+        (current_email, g.user['organization_id'])
+    ).fetchall()
     conn.close()
     
     requests_list = [to_json_row(r) for r in requests]
@@ -1205,7 +1238,10 @@ def my_requests():
 @require_role('Admin')
 def pending_approval_requests():
     conn = get_db_connection()
-    requests = conn.execute("SELECT * FROM Requests WHERE final_decision LIKE 'ESCALATED%' ORDER BY created_at DESC").fetchall()
+    requests = conn.execute(
+        "SELECT * FROM Requests WHERE final_decision LIKE 'ESCALATED%' AND organization_id = ? ORDER BY created_at DESC",
+        (g.user['organization_id'],)
+    ).fetchall()
     conn.close()
     
     requests_list = [to_json_row(r) for r in requests]
@@ -1215,71 +1251,69 @@ def pending_approval_requests():
 @require_role('Admin')
 def all_requests():
     conn = get_db_connection()
-    requests = conn.execute("SELECT * FROM Requests ORDER BY created_at DESC").fetchall()
+    requests = conn.execute(
+        "SELECT * FROM Requests WHERE organization_id = ? ORDER BY created_at DESC", (g.user['organization_id'],)
+    ).fetchall()
     conn.close()
     
     requests_list = [to_json_row(r) for r in requests]
     return jsonify(requests_list)
 
-@app.route('/api/auth/approve_request', methods=['POST'])
-@require_role('Admin')
-def approve_request():
+def is_awaiting_review(decision):
+    return (decision or '').startswith('ESCALATED')
+
+def is_decided(decision):
+    return decision in ('APPROVED', 'REJECTED')
+
+def change_request_decision(new_decision, allowed_from, conflict_message):
     data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
         return jsonify({'error': 'Request ID is required'}), 400
-        
+
     conn = get_db_connection()
-    cursor = conn.execute(
-        "UPDATE Requests SET final_decision = 'APPROVED', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (get_jwt_identity(), req_id)
-    )
-    conn.commit()
-    updated = cursor.rowcount
-    conn.close()
-    if not updated:
-        return jsonify({'error': 'Request not found.'}), 404
+    try:
+        target = conn.execute(
+            'SELECT submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            (req_id, g.user['organization_id'])
+        ).fetchone()
+        if not target:
+            return jsonify({'error': 'Request not found.'}), 404
+        if target['submitted_by'] == g.user['email']:
+            return jsonify({'error': 'You cannot review your own request.'}), 403
+        if not allowed_from(target['final_decision']):
+            return jsonify({'error': conflict_message}), 409
+
+        reviewer = g.user['email'] if is_decided(new_decision) else None
+        # Matching the status that was checked stops two admins acting at once from overwriting each other.
+        cursor = conn.execute(
+            f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'} "
+            'WHERE id = ? AND organization_id = ? AND final_decision = ?',
+            (new_decision, reviewer, req_id, g.user['organization_id'], target['final_decision'])
+        )
+        conn.commit()
+        if not cursor.rowcount:
+            return jsonify({'error': conflict_message}), 409
+    finally:
+        conn.close()
     return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/approve_request', methods=['POST'])
+@require_role('Admin')
+def approve_request():
+    return change_request_decision('APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.')
 
 @app.route('/api/auth/reject_request', methods=['POST'])
 @require_role('Admin')
 def reject_request():
-    data = request.get_json(silent=True) or {}
-    req_id = data.get('id')
-    if not req_id:
-        return jsonify({'error': 'Request ID is required'}), 400
-        
-    conn = get_db_connection()
-    cursor = conn.execute(
-        "UPDATE Requests SET final_decision = 'REJECTED', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (get_jwt_identity(), req_id)
-    )
-    conn.commit()
-    updated = cursor.rowcount
-    conn.close()
-    if not updated:
-        return jsonify({'error': 'Request not found.'}), 404
-    return jsonify({'status': 'SUCCESS'})
+    return change_request_decision('REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.')
 
 @app.route('/api/auth/reopen_request', methods=['POST'])
 @require_role('Admin')
 def reopen_request():
-    data = request.get_json(silent=True) or {}
-    req_id = data.get('id')
-    if not req_id:
-        return jsonify({'error': 'Request ID is required'}), 400
-
-    conn = get_db_connection()
-    cursor = conn.execute(
-        "UPDATE Requests SET final_decision = 'ESCALATED_MANUAL_REVIEW', reviewed_by = NULL, reviewed_at = NULL WHERE id = ?",
-        (req_id,)
+    return change_request_decision(
+        'ESCALATED_MANUAL_REVIEW', is_decided, 'Only approved or rejected requests can be moved back to pending.'
     )
-    conn.commit()
-    updated = cursor.rowcount
-    conn.close()
-    if not updated:
-        return jsonify({'error': 'Request not found.'}), 404
-    return jsonify({'status': 'SUCCESS'})
 
 @app.route('/api/auth/request_password_reset', methods=['POST'])
 @limiter.limit("3 per hour")
