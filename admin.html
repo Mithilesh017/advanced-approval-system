@@ -2,8 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>HR Admin Portal - AI Approval</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&display=swap">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
   
@@ -24,6 +27,7 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div id="root"></div>
@@ -92,15 +96,18 @@
         <div className="app-container">
           <div className="sidebar">
             <div className="sidebar-header">
-              <span style={{color: 'black', fontSize: '14px', lineHeight: '1.3', whiteSpace: 'normal'}}>ADVANCED APPROVAL MANAGEMENT SYSTEM</span>
+              <div className="brand-mark brand-mark-sm" aria-hidden="true"><i className="fas fa-shield-halved"></i></div>
+              <span className="brand-name">ADVANCED APPROVAL MANAGEMENT SYSTEM</span>
             </div>
             
             <div className="sidebar-user">
               <div className="avatar-circle">
                 {user.email.charAt(0).toUpperCase()}
               </div>
-              <div className="email">{user.email}</div>
-              <span className="badge">{user.role === 'SuperAdmin' ? 'Super Admin' : 'Admin'}</span>
+              <div className="sidebar-user-meta">
+                <div className="email" title={user.email}>{user.email}</div>
+                <span className={`badge ${user.role === 'SuperAdmin' ? 'badge-purple' : 'badge-accent'}`}>{user.role === 'SuperAdmin' ? 'Super Admin' : 'Admin'}</span>
+              </div>
             </div>
 
             <div className="nav-label">Navigation</div>
@@ -212,14 +219,18 @@
       const barPending = barLabels.map(k => expenseTypes[k].pending);
 
       useEffect(() => {
+        Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+        Chart.defaults.color = '#6e6e73';
+        const legendStyle = { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle', boxWidth: 8, boxHeight: 8, padding: 16 } };
+
         const ctxPie = pieRef.current.getContext('2d');
         const pieChart = new Chart(ctxPie, {
           type: 'doughnut',
           data: {
             labels: ['Approved', 'Pending', 'Disapproved'],
-            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#28a745', '#ffc107', '#dc3545'] }]
+            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#34c759', '#ff9f0a', '#ff3b30'], borderWidth: 0, spacing: 2, borderRadius: 4 }]
           },
-          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+          options: { responsive: true, maintainAspectRatio: false, cutout: '68%', plugins: { legend: legendStyle } }
         });
 
         const ctxBar = barRef.current.getContext('2d');
@@ -228,11 +239,20 @@
           data: {
             labels: barLabels.length > 0 ? barLabels : ['No Data'],
             datasets: [
-              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#28a745' },
-              { label: 'Pending', data: barLabels.length > 0 ? barPending : [0], backgroundColor: '#ffc107' }
+              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#34c759', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 },
+              { label: 'Pending', data: barLabels.length > 0 ? barPending : [0], backgroundColor: '#ff9f0a', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 }
             ]
           },
-          options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y', stacked: true }
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            indexAxis: 'y',
+            scales: {
+              x: { stacked: true, beginAtZero: true, grid: { color: 'rgba(60, 60, 67, 0.08)' }, border: { display: false }, ticks: { precision: 0 } },
+              y: { stacked: true, grid: { display: false }, border: { display: false } }
+            },
+            plugins: { legend: legendStyle }
+          }
         });
 
         return () => { pieChart.destroy(); barChart.destroy(); }
@@ -258,12 +278,12 @@
             </div>
           </div>
 
-          <h4 style={{marginBottom: '15px', color: '#555'}}><i className="fas fa-bolt"></i> Quick Actions</h4>
+          <h4 className="section-title"><i className="fas fa-bolt"></i> Quick Actions</h4>
           <div className="quick-actions">
-            <div className="qa-card qa-new" onClick={() => Swal.fire('Info', 'As an admin, you can view requests. Employees submit new requests from their portal.', 'info')}><i className="fas fa-plus-circle"></i> New Request</div>
-            <div className="qa-card qa-pending" onClick={() => setView('pending')}><i className="fas fa-clock"></i> View Pending ({pending})</div>
-            <div className="qa-card qa-approved" onClick={() => setView('approved')}><i className="fas fa-check-circle"></i> View Approved ({approved})</div>
-            <div className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</div>
+            <button type="button" className="qa-card qa-new" onClick={() => Swal.fire('Info', 'As an admin, you can view requests. Employees submit new requests from their portal.', 'info')}><i className="fas fa-plus-circle"></i> New Request</button>
+            <button type="button" className="qa-card qa-pending" onClick={() => setView('pending')}><i className="fas fa-clock"></i> View Pending ({pending})</button>
+            <button type="button" className="qa-card qa-approved" onClick={() => setView('approved')}><i className="fas fa-check-circle"></i> View Approved ({approved})</button>
+            <button type="button" className="qa-card qa-users" onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
           </div>
 
           <div className="stats-grid-4">
@@ -301,7 +321,8 @@
               <div className="stat-label">Departments</div>
             </div>
             <div className="stat-card teal">
-              <div className="stat-value" style={{marginTop: '45px', color: 'var(--info)'}}>{approvalRate}%</div>
+              <div className="stat-icon"><i className="fas fa-percent"></i></div>
+              <div className="stat-value">{approvalRate}%</div>
               <div className="stat-label">Approval Rate</div>
             </div>
           </div>
@@ -323,11 +344,11 @@
           <div className="charts-grid">
             <div className="chart-card">
               <h4>Status Distribution</h4>
-              <div style={{height: '250px'}}><canvas ref={pieRef}></canvas></div>
+              <div className="chart-box"><canvas ref={pieRef}></canvas></div>
             </div>
             <div className="chart-card">
               <h4>Expense Types (Requests)</h4>
-              <div style={{height: '250px'}}><canvas ref={barRef}></canvas></div>
+              <div className="chart-box"><canvas ref={barRef}></canvas></div>
             </div>
           </div>
         </div>
@@ -387,7 +408,7 @@
           text: "You won't be able to revert this!",
           icon: 'warning',
           showCancelButton: true,
-          confirmButtonColor: '#ea4335',
+          confirmButtonColor: '#d70015',
           cancelButtonColor: '#6c757d',
           confirmButtonText: 'Yes, clear all!'
         }).then((result) => {
@@ -408,23 +429,23 @@
       return (
         <div>
           <div className="stats-grid-3">
-            <div className="stat-card yellow">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-clock"></i></div>
-              <div style={{float:'left'}}>
+            <div className="stat-card yellow is-inline">
+              <div className="stat-icon"><i className="fas fa-clock"></i></div>
+              <div className="stat-body">
                 <div className="stat-value">{requests.filter(r=>r.status==='Pending').length}</div>
                 <div className="stat-label">Total Pending</div>
               </div>
             </div>
-            <div className="stat-card green">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-check-circle"></i></div>
-              <div style={{float:'left'}}>
+            <div className="stat-card green is-inline">
+              <div className="stat-icon"><i className="fas fa-check-circle"></i></div>
+              <div className="stat-body">
                 <div className="stat-value">{requests.filter(r=>r.status==='Approved').length}</div>
                 <div className="stat-label">Approved Requests</div>
               </div>
             </div>
-            <div className="stat-card red">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-times-circle"></i></div>
-              <div style={{float:'left'}}>
+            <div className="stat-card red is-inline">
+              <div className="stat-icon"><i className="fas fa-times-circle"></i></div>
+              <div className="stat-body">
                 <div className="stat-value">{requests.filter(r=>r.status==='Rejected').length}</div>
                 <div className="stat-label">Disapproved Requests</div>
               </div>
@@ -445,11 +466,11 @@
                 <input type="text" placeholder="Search by role..." />
               </div>
               <div>
-                <button className="btn btn-secondary" onClick={handleClearHistory}><i className="fas fa-trash"></i> Reset Database</button>
+                <button type="button" className="btn btn-tinted-danger" onClick={handleClearHistory}><i className="fas fa-trash"></i> Reset Database</button>
               </div>
             </div>
 
-            <div key={tableKey} style={{overflowX: 'auto'}}>
+            <div key={tableKey} className="table-scroll">
               <table ref={tableRef} className="display">
                 <thead>
                   <tr>
@@ -470,30 +491,30 @@
                     <tr key={req.id}>
                       <td><strong>{req.id}</strong></td>
                       <td>
-                        <div style={{fontWeight: 'bold'}}>{req.empName || req.email || 'Unknown'}</div>
-                        <div style={{fontSize: '11px', color: '#666'}}>{req.empId || 'N/A'}</div>
+                        <div className="cell-primary">{req.empName || req.email || 'Unknown'}</div>
+                        <div className="cell-secondary">{req.empId || 'N/A'}</div>
                       </td>
                       <td>{req.department}</td>
                       <td>{req.role}</td>
                       <td>{req.reqType}</td>
                       <td>{req.destination}</td>
-                      <td>{req.amount} {req.currency}</td>
+                      <td className="cell-nowrap">{req.amount} {req.currency}</td>
                       <td>
                         {req.confidence !== undefined && (
-                          <span className="badge" style={{background: req.confidence > 80 ? 'var(--success)' : req.confidence < 20 ? '#ea4335' : '#fbbc05', color: 'white', display: 'block', marginBottom: '5px', fontSize: '11px', whiteSpace: 'normal', lineHeight: '1.2'}}>
+                          <span className={`badge badge-block ${req.confidence > 80 ? 'badge-green' : req.confidence < 20 ? 'badge-red' : 'badge-orange'}`}>
                             <i className="fas fa-brain"></i> Confidence: {req.confidence}%
                           </span>
                         )}
-                        <span className="badge" style={{background: 'var(--navy-primary)', color: 'white', display: 'block', marginBottom: '5px', fontSize: '11px', whiteSpace: 'normal', lineHeight: '1.2'}}>{req.reason || req.aiScore}</span>
+                        <span className="badge badge-block badge-accent">{req.reason || req.aiScore}</span>
                         {req.shap && (
-                          <div style={{background: '#f8f9fa', border: '1px solid #ddd', padding: '5px', borderRadius: '4px', fontSize: '11px', minWidth: '150px'}}>
-                            <div style={{fontWeight: 'bold', marginBottom: '3px', color: '#555', borderBottom: '1px solid #ddd', paddingBottom: '2px'}}>SHAP Impact</div>
+                          <div className="shap-box">
+                            <div className="shap-title">SHAP Impact</div>
                             {Object.entries(req.shap).map(([feature, impact]) => {
                               const isPositive = impact > 0;
                               return (
-                                <div key={feature} style={{display: 'flex', justifyContent: 'space-between', marginBottom: '2px'}}>
-                                  <span style={{color: '#666'}}>{feature.replace('_', ' ')}:</span>
-                                  <strong style={{color: isPositive ? '#34a853' : '#ea4335'}}>
+                                <div key={feature} className="shap-row">
+                                  <span>{feature.replace('_', ' ')}:</span>
+                                  <strong className={isPositive ? 'is-positive' : 'is-negative'}>
                                     {isPositive ? '+' : ''}{impact.toFixed(3)}
                                   </strong>
                                 </div>
@@ -503,14 +524,14 @@
                         )}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
-                      <td>
+                      <td className="cell-nowrap">
                         {req.status === 'Pending' ? (
                           <>
-                            <button className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve"><i className="fas fa-check-square"></i></button>
-                            <button className="action-btn delete" onClick={() => handleAction(req.id, 'Rejected')} title="Reject"><i className="fas fa-trash-alt"></i></button>
+                            <button type="button" className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve" aria-label="Approve"><i className="fas fa-check"></i></button>
+                            <button type="button" className="action-btn delete" onClick={() => handleAction(req.id, 'Rejected')} title="Reject" aria-label="Reject"><i className="fas fa-xmark"></i></button>
                           </>
                         ) : (
-                          <button className="action-btn" onClick={() => handleAction(req.id, 'Pending')} title="Move to Pending" style={{color: 'var(--info)'}}><i className="fas fa-undo"></i></button>
+                          <button type="button" className="action-btn info" onClick={() => handleAction(req.id, 'Pending')} title="Move to Pending" aria-label="Move to Pending"><i className="fas fa-undo"></i></button>
                         )}
                       </td>
                     </tr>
@@ -583,7 +604,7 @@
 
       return (
         <div>
-          <div className="dash-banner" style={{ background: 'linear-gradient(135deg, #1e3c72 0%, #2a5298 100%)', color: 'white' }}>
+          <div className="dash-banner is-dark">
             <div className="dash-banner-left">
                <div className="dash-banner-icon"><i className="fas fa-robot"></i></div>
               <div>
@@ -596,7 +617,7 @@
           <div className="stats-grid-3">
             <div className="stat-card blue">
               <div className="stat-icon"><i className="fas fa-microchip"></i></div>
-              <div className="stat-value" style={{fontSize: '20px'}}>Isolation Forest</div>
+              <div className="stat-value is-compact">Isolation Forest</div>
               <div className="stat-label">Active Model Architecture</div>
             </div>
             <div className="stat-card green">
@@ -606,21 +627,21 @@
             </div>
             <div className="stat-card purple">
               <div className="stat-icon"><i className="fas fa-history"></i></div>
-              <div className="stat-value">{getElapsedTime()}</div>
+              <div className="stat-value is-compact">{getElapsedTime()}</div>
               <div className="stat-label">Last Retrain Date</div>
             </div>
           </div>
 
-          <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', marginTop: '20px' }}>
-             <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-cogs"></i> Retrain Pipeline</h3>
-             <p style={{color: '#666', marginBottom: '20px'}}>
+          <div className="panel">
+             <h3 className="panel-title"><i className="fas fa-cogs"></i> Retrain Pipeline</h3>
+             <p className="panel-subtitle">
                Triggering this job will fetch all manual overrides (when an admin changed an AI decision) and retrain the model to learn from those corrections.
              </p>
-             <button onClick={triggerRetrain} disabled={training} className="btn btn-primary" style={{padding: '15px 30px', fontSize: '16px', borderRadius: '5px', background: training ? '#6c757d' : 'var(--navy-primary)', border: 'none', color: 'white', cursor: training ? 'not-allowed' : 'pointer' }}>
+             <button type="button" onClick={triggerRetrain} disabled={training} className="btn btn-primary btn-lg">
                {training ? <span><i className="fas fa-spinner fa-spin"></i> Retraining in progress...</span> : <span><i className="fas fa-bolt"></i> Trigger Nightly Batch Retrain</span>}
              </button>
              
-             <div style={{ background: '#1e1e1e', color: '#00ff00', padding: '20px', borderRadius: '5px', marginTop: '25px', fontFamily: 'monospace', height: '200px', overflowY: 'auto' }}>
+             <div className="console" role="log" aria-live="polite">
                {logs.map((log, i) => <div key={i}>{log}</div>)}
              </div>
           </div>
@@ -713,7 +734,7 @@
           icon: 'warning',
           showCancelButton: true,
           confirmButtonText: 'Yes, delete entirely',
-          confirmButtonColor: '#dc3545'
+          confirmButtonColor: '#d70015'
         }).then(async (result) => {
           if (result.isConfirmed) {
             try {
@@ -741,46 +762,49 @@
       const activeUsers = allUsers.filter(u => u.status !== 'Pending' && (activeRoleFilter === 'All' || u.role === activeRoleFilter));
 
       return (
-        <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-          <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-users-cog"></i> Manage Employee Requests</h3>
-          <p style={{color: '#666', marginBottom: '20px'}}>Approve pending access requests for new standard User accounts. Once approved, they will be prompted to create a password.</p>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-users-cog"></i> Manage Employee Requests</h3>
+          <p className="panel-subtitle">Approve pending access requests for new standard User accounts. Once approved, they will be prompted to create a password.</p>
           
           {loading ? (
-             <div><i className="fas fa-spinner fa-spin"></i> Loading employees...</div>
+             <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading employees...</div>
           ) : (
             <>
               {pendingUsers.length === 0 ? (
-                 <div style={{padding: '20px', background: '#f8f9fa', borderRadius: '5px', textAlign: 'center', color: '#666', marginBottom: '30px'}}><i className="fas fa-check-circle" style={{fontSize: '24px', color: '#28a745', marginBottom: '10px', display: 'block'}}></i>No pending employees found. Everything is up to date!</div>
+                 <div className="empty-state"><i className="fas fa-check-circle"></i>No pending employees found. Everything is up to date!</div>
               ) : (
-                <div style={{overflowX: 'auto', marginBottom: '30px'}}>
-                  <table style={{width: '100%', borderCollapse: 'collapse', marginTop: '10px'}}>
+                <div className="table-scroll">
+                  <table className="data-table">
                     <thead>
-                      <tr style={{borderBottom: '2px solid #eee', textAlign: 'left'}}>
-                        <th style={{padding: '12px 10px'}}>Email Address</th>
-                        <th style={{padding: '12px 10px'}}>Requested Role</th>
-                        <th style={{padding: '12px 10px'}}>Request Date</th>
-                        <th style={{padding: '12px 10px'}}>Action</th>
+                      <tr>
+                        <th>Email Address</th>
+                        <th>Requested Role</th>
+                        <th>Request Date</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
                       {pendingUsers.map(u => (
-                        <tr key={u.id} style={{borderBottom: '1px solid #eee'}}>
-                          <td style={{padding: '12px 10px', fontWeight: 'bold', color: '#333'}}>
-                            {u.email} <br/><small style={{color: '#888', fontWeight: 'normal'}}>{u.name ? `Name: ${u.name}` : ''}</small>
+                        <tr key={u.id}>
+                          <td>
+                            <div className="cell-primary">{u.email}</div>
+                            <div className="cell-secondary">{u.name ? `Name: ${u.name}` : ''}</div>
                           </td>
-                          <td style={{padding: '12px 10px'}}>
-                            <span className="badge" style={{background: '#6c757d', color: 'white', display: 'inline-block', padding: '4px 8px', borderRadius: '4px', fontSize: '11px'}}>{u.role}</span>
+                          <td>
+                            <span className={`badge ${u.role === 'Admin' ? 'badge-accent' : ''}`}>{u.role}</span>
                           </td>
-                          <td style={{padding: '12px 10px', color: '#666', fontSize: '13px'}}>
+                          <td className="cell-muted">
                             {new Date(u.created_at.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                           </td>
-                          <td style={{padding: '12px 10px', display: 'flex', gap: '10px'}}>
-                            <button onClick={() => handleApprove(u.email)} className="btn btn-primary" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px'}}>
-                              <i className="fas fa-check"></i> Approve
-                            </button>
-                            <button onClick={() => handleReject(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
-                              <i className="fas fa-times"></i> Reject
-                            </button>
+                          <td>
+                            <div className="cell-actions">
+                              <button type="button" onClick={() => handleApprove(u.email)} className="btn btn-primary btn-sm">
+                                <i className="fas fa-check"></i> Approve
+                              </button>
+                              <button type="button" onClick={() => handleReject(u.email)} className="btn btn-tinted-danger btn-sm">
+                                <i className="fas fa-times"></i> Reject
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -789,48 +813,49 @@
                 </div>
               )}
 
-              <hr style={{border: '0', borderTop: '1px solid #eee', margin: '30px 0'}} />
+              <hr className="divider" />
               
-              <h3 style={{color: 'var(--navy-primary)', marginBottom: '15px'}}><i className="fas fa-users"></i> Current Active Employees</h3>
-              <p style={{color: '#666', marginBottom: '20px'}}>Manage existing user accounts in the system. You can remove user access entirely.</p>
+              <h3 className="panel-title"><i className="fas fa-users"></i> Current Active Employees</h3>
+              <p className="panel-subtitle">Manage existing user accounts in the system. You can remove user access entirely.</p>
               
-              <div style={{marginBottom: '20px', display: 'flex', gap: '10px'}}>
-                <button className={`btn ${activeRoleFilter === 'All' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('All')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>All</button>
-                <button className={`btn ${activeRoleFilter === 'User' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('User')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>Users</button>
-                <button className={`btn ${activeRoleFilter === 'Admin' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('Admin')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>Admins</button>
+              <div className="segmented">
+                <button type="button" className={`segment ${activeRoleFilter === 'All' ? 'is-active' : ''}`} onClick={() => setActiveRoleFilter('All')}>All</button>
+                <button type="button" className={`segment ${activeRoleFilter === 'User' ? 'is-active' : ''}`} onClick={() => setActiveRoleFilter('User')}>Users</button>
+                <button type="button" className={`segment ${activeRoleFilter === 'Admin' ? 'is-active' : ''}`} onClick={() => setActiveRoleFilter('Admin')}>Admins</button>
                 {userRole === 'SuperAdmin' && (
-                  <button className={`btn ${activeRoleFilter === 'SuperAdmin' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setActiveRoleFilter('SuperAdmin')} style={{padding: '6px 15px', borderRadius: '20px', border: 'none', cursor: 'pointer', fontWeight: 'bold'}}>SuperAdmins</button>
+                  <button type="button" className={`segment ${activeRoleFilter === 'SuperAdmin' ? 'is-active' : ''}`} onClick={() => setActiveRoleFilter('SuperAdmin')}>SuperAdmins</button>
                 )}
               </div>
               
               {activeUsers.length === 0 ? (
-                 <div style={{padding: '20px', background: '#f8f9fa', borderRadius: '5px', textAlign: 'center', color: '#666'}}>No active employees found.</div>
+                 <div className="empty-state is-neutral"><i className="fas fa-user-slash"></i>No active employees found.</div>
               ) : (
-                <div style={{overflowX: 'auto'}}>
-                  <table style={{width: '100%', borderCollapse: 'collapse', marginTop: '10px'}}>
+                <div className="table-scroll">
+                  <table className="data-table">
                     <thead>
-                      <tr style={{borderBottom: '2px solid #eee', textAlign: 'left'}}>
-                        <th style={{padding: '12px 10px'}}>Email Address</th>
-                        <th style={{padding: '12px 10px'}}>Role</th>
-                        <th style={{padding: '12px 10px'}}>Status</th>
-                        <th style={{padding: '12px 10px'}}>Action</th>
+                      <tr>
+                        <th>Email Address</th>
+                        <th>Role</th>
+                        <th>Status</th>
+                        <th>Action</th>
                       </tr>
                     </thead>
                     <tbody>
                       {activeUsers.map(u => (
-                        <tr key={u.id} style={{borderBottom: '1px solid #eee'}}>
-                          <td style={{padding: '12px 10px', fontWeight: 'bold', color: '#333'}}>
-                            {u.email} <br/><small style={{color: '#888', fontWeight: 'normal'}}>{u.name ? `Name: ${u.name}` : ''}</small>
+                        <tr key={u.id}>
+                          <td>
+                            <div className="cell-primary">{u.email}</div>
+                            <div className="cell-secondary">{u.name ? `Name: ${u.name}` : ''}</div>
                           </td>
-                          <td style={{padding: '12px 10px'}}>
-                            <span className="badge" style={{background: '#6c757d', color: 'white', display: 'inline-block', padding: '4px 8px', borderRadius: '4px', fontSize: '11px'}}>{u.role}</span>
+                          <td>
+                            <span className={`badge ${u.role === 'SuperAdmin' ? 'badge-purple' : u.role === 'Admin' ? 'badge-accent' : ''}`}>{u.role}</span>
                           </td>
-                          <td style={{padding: '12px 10px', color: '#666', fontSize: '13px'}}>
-                            <span style={{color: u.status === 'Active' ? '#28a745' : u.status === 'Rejected' ? '#dc3545' : '#ffc107'}}>{u.status}</span>
+                          <td>
+                            <span className={`status-badge ${u.status === 'Active' ? 'status-approved' : u.status === 'Rejected' ? 'status-rejected' : 'status-pending'}`}>{u.status}</span>
                           </td>
-                          <td style={{padding: '12px 10px'}}>
+                          <td>
                             {(userRole === 'SuperAdmin' || (userRole === 'Admin' && u.role === 'User')) && (
-                              <button onClick={() => handleDelete(u.email)} className="btn btn-danger" style={{padding: '6px 12px', fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px', background: '#dc3545', border: 'none', color: 'white', borderRadius: '4px', cursor: 'pointer'}}>
+                              <button type="button" onClick={() => handleDelete(u.email)} className="btn btn-tinted-danger btn-sm">
                                 <i className="fas fa-trash-alt"></i> Remove
                               </button>
                             )}
@@ -919,33 +944,41 @@
       };
 
       return (
-        <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-          <h3 style={{color: 'var(--navy-primary)', marginBottom: '20px'}}><i className="fas fa-user-circle"></i> User Profile</h3>
-          
-          <form onSubmit={handleUpdate} style={{maxWidth: '500px', marginBottom: '40px'}}>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-user-circle"></i> User Profile</h3>
+
+          <div className="profile-hero">
+            <div className="avatar-circle">{user.email.charAt(0).toUpperCase()}</div>
+            <div>
+              <div className="profile-hero-name">{profileData.name || user.email.split('@')[0]}</div>
+              <div className="profile-hero-sub">{user.email}</div>
+            </div>
+          </div>
+
+          <form onSubmit={handleUpdate} className="profile-form">
             <div className="form-group">
-              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Email Address (Read Only)</label>
-              <input type="email" value={user.email} disabled style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px', background: '#f5f5f5'}} />
+              <label htmlFor="pf-email">Email Address (Read Only)</label>
+              <input id="pf-email" type="email" value={user.email} disabled />
             </div>
             <div className="form-group">
-              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Full Name / Username</label>
-              <input type="text" name="name" value={profileData.name} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., John Doe" />
+              <label htmlFor="pf-name">Full Name / Username</label>
+              <input id="pf-name" type="text" name="name" value={profileData.name} onChange={handleChange} placeholder="e.g., John Doe" />
             </div>
             <div className="form-group">
-              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee ID</label>
-              <input type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., EMP_1234" />
+              <label htmlFor="pf-empid">Employee ID</label>
+              <input id="pf-empid" type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} placeholder="e.g., EMP_1234" />
             </div>
-            <button type="submit" className="btn btn-primary" disabled={loading} style={{padding: '10px 20px', borderRadius: '4px', border: 'none', background: 'var(--navy-primary)', color: 'white', cursor: 'pointer'}}>
+            <button type="submit" className="btn btn-primary" disabled={loading}>
                {loading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-save"></i>} Update Profile
             </button>
           </form>
 
-          <hr style={{border: '0', borderTop: '1px solid #eee', marginBottom: '30px'}} />
+          <hr className="divider" />
 
-          <h4 style={{color: '#dc3545', marginBottom: '15px'}}><i className="fas fa-shield-alt"></i> Security</h4>
-          <p style={{fontSize: '13px', color: '#666', marginBottom: '15px'}}>Need to update your password? Request a secure password reset link to your email.</p>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <button type="button" onClick={handleResetPassword} className="btn btn-danger" style={{background: '#dc3545', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+          <h4 className="panel-title is-danger"><i className="fas fa-shield-alt"></i> Security</h4>
+          <p className="panel-subtitle">Need to update your password? Request a secure password reset link to your email.</p>
+          <div className="button-row">
+            <button type="button" onClick={handleResetPassword} className="btn btn-tinted-danger">
               <i className="fas fa-key"></i> Reset Password
             </button>
             <button type="button" onClick={() => {
@@ -961,7 +994,7 @@
                     window.location.href = 'index.html';
                   }
                 });
-            }} className="btn btn-secondary" style={{background: '#6c757d', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+            }} className="btn btn-secondary">
               <i className="fas fa-sign-out-alt"></i> Logout
             </button>
           </div>
@@ -970,12 +1003,6 @@
     }
 
     ReactDOM.createRoot(document.getElementById('root')).render(<AdminPortal />);
-  </script>
-  <script>
-    document.addEventListener('mousemove', function(e) {
-      document.body.style.setProperty('--mouse-x', e.clientX + 'px');
-      document.body.style.setProperty('--mouse-y', e.clientY + 'px');
-    });
   </script>
 </body>
 </html>

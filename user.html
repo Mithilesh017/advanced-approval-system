@@ -2,8 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Employee Portal - AI Approval</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&display=swap">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
   
@@ -23,6 +26,7 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div id="root"></div>
@@ -76,7 +80,7 @@
           text: "Are you sure you want to log out?",
           icon: 'warning',
           showCancelButton: true,
-          confirmButtonColor: '#0056b3',
+          confirmButtonColor: '#0071e3',
           cancelButtonColor: '#6c757d',
           confirmButtonText: 'Yes, log me out'
         }).then((result) => {
@@ -91,14 +95,17 @@
         <div className="app-container">
           <div className="sidebar">
             <div className="sidebar-header">
-              <span style={{color: 'black', fontSize: '14px', lineHeight: '1.3', whiteSpace: 'normal'}}>ADVANCED APPROVAL MANAGEMENT SYSTEM</span>
+              <div className="brand-mark brand-mark-sm" aria-hidden="true"><i className="fas fa-shield-halved"></i></div>
+              <span className="brand-name">ADVANCED APPROVAL MANAGEMENT SYSTEM</span>
             </div>
             <div className="sidebar-user">
               <div className="avatar-circle">
                 {user.email.charAt(0).toUpperCase()}
               </div>
-              <div className="email">{user.email}</div>
-              <span className="badge" style={{background: 'var(--success)'}}>Employee</span>
+              <div className="sidebar-user-meta">
+                <div className="email" title={user.email}>{user.email}</div>
+                <span className="badge badge-green">Employee</span>
+              </div>
             </div>
             <div className="nav-label">Navigation</div>
             <ul className="nav-menu">
@@ -129,7 +136,7 @@
           </div>
           
           <div className="main-content">
-            <div className="top-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+            <div className="top-header">
               <h2>
                 {view === 'pending' && <><i className="fas fa-clock"></i> Pending Requests</>}
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
@@ -137,10 +144,10 @@
                 {view === 'new' && <><i className="fas fa-plus-circle"></i> Submit Expense</>}
                 {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
               </h2>
-              <div style={{display: 'flex', alignItems: 'center', gap: '20px'}}>
+              <div className="header-actions">
                  <div className="user-welcome">Welcome, {user.email}</div>
                  {view !== 'new' && (
-                    <button className="btn btn-primary" onClick={() => setView('new')} style={{padding: '8px 15px'}}>
+                    <button type="button" className="btn btn-primary" onClick={() => setView('new')}>
                       <i className="fas fa-plus"></i> Add New
                     </button>
                  )}
@@ -198,38 +205,38 @@
       return (
         <div>
           <div className="stats-grid-3">
-            <div className="stat-card yellow">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-clock"></i></div>
-              <div style={{float:'left'}}>
+            <div className="stat-card yellow is-inline">
+              <div className="stat-icon"><i className="fas fa-clock"></i></div>
+              <div className="stat-body">
                 <div className="stat-value">{pendingCount}</div>
                 <div className="stat-label">TOTAL PENDING</div>
               </div>
             </div>
-            <div className="stat-card green">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-check-circle"></i></div>
-              <div style={{float:'left'}}>
+            <div className="stat-card green is-inline">
+              <div className="stat-icon"><i className="fas fa-check-circle"></i></div>
+              <div className="stat-body">
                 <div className="stat-value">{approvedCount}</div>
                 <div className="stat-label">APPROVED</div>
               </div>
             </div>
-            <div className="stat-card red">
-              <div className="stat-icon" style={{marginBottom:0, float:'left', marginRight:'15px'}}><i className="fas fa-times-circle"></i></div>
-              <div style={{float:'left'}}>
+            <div className="stat-card red is-inline">
+              <div className="stat-icon"><i className="fas fa-times-circle"></i></div>
+              <div className="stat-body">
                 <div className="stat-value">{rejectedCount}</div>
                 <div className="stat-label">DISAPPROVED</div>
               </div>
             </div>
           </div>
 
-          <div className="table-card" style={{marginTop: '20px'}}>
-            <div className="filters-row" style={{marginBottom: '20px', paddingBottom: '20px', borderBottom: '2px solid var(--bg-light)'}}>
-              <h4 style={{color: 'var(--navy-primary)'}}><i className="fas fa-filter"></i> Filters</h4>
+          <div className="table-card">
+            <div className="filters-row is-heading">
+              <h4><i className="fas fa-filter"></i> Filters</h4>
             </div>
 
-            <div key={tableKey} style={{overflowX: 'auto'}}>
+            <div key={tableKey} className="table-scroll">
               <table ref={tableRef} className="display">
                 <thead>
-                  <tr style={{background: 'var(--navy-dark)', color: 'white'}}>
+                  <tr>
                     <th>ID</th>
                     <th>Employee</th>
                     <th>Department</th>
@@ -244,13 +251,13 @@
                     <tr key={req.id}>
                       <td><strong>{req.id}</strong></td>
                       <td>
-                        <div style={{fontWeight: 'bold'}}>{req.empName || req.email || 'Unknown'}</div>
-                        <div style={{fontSize: '11px', color: '#666'}}>{req.empId || 'N/A'}</div>
+                        <div className="cell-primary">{req.empName || req.email || 'Unknown'}</div>
+                        <div className="cell-secondary">{req.empId || 'N/A'}</div>
                       </td>
                       <td>{req.department}</td>
                       <td>{req.reqType}</td>
                       <td>{req.destination}</td>
-                      <td>{req.amount} {req.currency}</td>
+                      <td className="cell-nowrap">{req.amount} {req.currency}</td>
                       <td>{getStatusBadge(req.status)}</td>
                     </tr>
                   ))}
@@ -327,40 +334,40 @@
             </div>
           </div>
           
-          <div style={{background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)'}}>
-            <button className="btn btn-secondary" onClick={() => setView('pending')} style={{marginBottom: '20px'}}>
+          <div className="panel">
+            <button type="button" className="btn btn-secondary btn-sm back-link" onClick={() => setView('pending')}>
               <i className="fas fa-arrow-left"></i> Back to Dashboard
             </button>
-            <h3 style={{color: 'var(--navy-primary)', marginBottom: '20px'}}><i className="fas fa-edit"></i> Request Form</h3>
+            <h3 className="panel-title"><i className="fas fa-edit"></i> Request Form</h3>
             <form onSubmit={handleSubmit}>
-              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px'}}>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee Name</label>
-                  <input type="text" name="empName" value={formData.empName} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+              <div className="form-grid">
+                <div className="form-group">
+                  <label htmlFor="nr-empName">Employee Name</label>
+                  <input id="nr-empName" type="text" name="empName" value={formData.empName} onChange={handleChange} required />
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee ID</label>
-                  <input type="text" name="empId" value={formData.empId} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                <div className="form-group">
+                  <label htmlFor="nr-empId">Employee ID</label>
+                  <input id="nr-empId" type="text" name="empId" value={formData.empId} onChange={handleChange} required />
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Job Role</label>
-                  <input type="text" name="role" value={formData.role} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g. Data Scientist" />
+                <div className="form-group">
+                  <label htmlFor="nr-role">Job Role</label>
+                  <input id="nr-role" type="text" name="role" value={formData.role} onChange={handleChange} required placeholder="e.g. Data Scientist" />
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Department</label>
-                  <input type="text" name="department" value={formData.department} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g. IT" />
+                <div className="form-group">
+                  <label htmlFor="nr-department">Department</label>
+                  <input id="nr-department" type="text" name="department" value={formData.department} onChange={handleChange} required placeholder="e.g. IT" />
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Expense Type</label>
-                  <input type="text" name="reqType" value={formData.reqType} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                <div className="form-group">
+                  <label htmlFor="nr-reqType">Expense Type</label>
+                  <input id="nr-reqType" type="text" name="reqType" value={formData.reqType} onChange={handleChange} required />
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Destination</label>
-                  <input type="text" name="destination" value={formData.destination} onChange={handleChange} required style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                <div className="form-group">
+                  <label htmlFor="nr-destination">Destination</label>
+                  <input id="nr-destination" type="text" name="destination" value={formData.destination} onChange={handleChange} required />
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Currency</label>
-                  <select name="currency" value={formData.currency} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}}>
+                <div className="form-group">
+                  <label htmlFor="nr-currency">Currency</label>
+                  <select id="nr-currency" name="currency" value={formData.currency} onChange={handleChange}>
                     <option value="INR">INR (₹)</option>
                     <option value="USD">USD ($)</option>
                     <option value="EUR">EUR (€)</option>
@@ -368,12 +375,12 @@
                     <option value="SGD">SGD (S$)</option>
                   </select>
                 </div>
-                <div className="form-group" style={{margin: 0}}>
-                  <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Amount</label>
-                  <input type="number" name="amount" value={formData.amount} onChange={handleChange} required min="1" style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} />
+                <div className="form-group">
+                  <label htmlFor="nr-amount">Amount</label>
+                  <input id="nr-amount" type="number" name="amount" value={formData.amount} onChange={handleChange} required min="1" />
                 </div>
               </div>
-              <button type="submit" className="btn btn-primary" style={{width: '100%', padding: '15px'}} disabled={loading}>
+              <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={loading}>
                 {loading ? <span><i className="fas fa-spinner fa-spin"></i> AI is analyzing...</span> : <span><i className="fas fa-robot"></i> Submit to AI Agent</span>}
               </button>
             </form>
@@ -454,33 +461,41 @@
       };
 
       return (
-        <div style={{ background: 'white', padding: '30px', borderRadius: '8px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-          <h3 style={{color: 'var(--navy-primary)', marginBottom: '20px'}}><i className="fas fa-user-circle"></i> User Profile</h3>
-          
-          <form onSubmit={handleUpdate} style={{maxWidth: '500px', marginBottom: '40px'}}>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-user-circle"></i> User Profile</h3>
+
+          <div className="profile-hero">
+            <div className="avatar-circle">{user.email.charAt(0).toUpperCase()}</div>
+            <div>
+              <div className="profile-hero-name">{profileData.name || user.email.split('@')[0]}</div>
+              <div className="profile-hero-sub">{user.email}</div>
+            </div>
+          </div>
+
+          <form onSubmit={handleUpdate} className="profile-form">
             <div className="form-group">
-              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Email Address (Read Only)</label>
-              <input type="email" value={user.email} disabled style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px', background: '#f5f5f5'}} />
+              <label htmlFor="pf-email">Email Address (Read Only)</label>
+              <input id="pf-email" type="email" value={user.email} disabled />
             </div>
             <div className="form-group">
-              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Full Name / Username</label>
-              <input type="text" name="name" value={profileData.name} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., John Doe" />
+              <label htmlFor="pf-name">Full Name / Username</label>
+              <input id="pf-name" type="text" name="name" value={profileData.name} onChange={handleChange} placeholder="e.g., John Doe" />
             </div>
             <div className="form-group">
-              <label style={{display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#666', marginBottom: '5px'}}>Employee ID</label>
-              <input type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} style={{width: '100%', padding: '10px', border: '1px solid #ccc', borderRadius: '4px'}} placeholder="e.g., EMP_1234" />
+              <label htmlFor="pf-empid">Employee ID</label>
+              <input id="pf-empid" type="text" name="emp_id" value={profileData.emp_id} onChange={handleChange} placeholder="e.g., EMP_1234" />
             </div>
-            <button type="submit" className="btn btn-primary" disabled={loading} style={{padding: '10px 20px', borderRadius: '4px', border: 'none', background: 'var(--navy-primary)', color: 'white', cursor: 'pointer'}}>
+            <button type="submit" className="btn btn-primary" disabled={loading}>
                {loading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-save"></i>} Update Profile
             </button>
           </form>
 
-          <hr style={{border: '0', borderTop: '1px solid #eee', marginBottom: '30px'}} />
+          <hr className="divider" />
 
-          <h4 style={{color: '#dc3545', marginBottom: '15px'}}><i className="fas fa-shield-alt"></i> Security</h4>
-          <p style={{fontSize: '13px', color: '#666', marginBottom: '15px'}}>Need to update your password? Request a secure password reset link to your email.</p>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <button type="button" onClick={handleResetPassword} className="btn btn-danger" style={{background: '#dc3545', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+          <h4 className="panel-title is-danger"><i className="fas fa-shield-alt"></i> Security</h4>
+          <p className="panel-subtitle">Need to update your password? Request a secure password reset link to your email.</p>
+          <div className="button-row">
+            <button type="button" onClick={handleResetPassword} className="btn btn-tinted-danger">
               <i className="fas fa-key"></i> Reset Password
             </button>
             <button type="button" onClick={() => {
@@ -496,7 +511,7 @@
                     window.location.href = 'index.html';
                   }
                 });
-            }} className="btn btn-secondary" style={{background: '#6c757d', border: 'none', color: 'white', padding: '10px 20px', borderRadius: '4px', cursor: 'pointer'}}>
+            }} className="btn btn-secondary">
               <i className="fas fa-sign-out-alt"></i> Logout
             </button>
           </div>
@@ -505,12 +520,6 @@
     }
 
     ReactDOM.createRoot(document.getElementById('root')).render(<EmployeePortal />);
-  </script>
-  <script>
-    document.addEventListener('mousemove', function(e) {
-      document.body.style.setProperty('--mouse-x', e.clientX + 'px');
-      document.body.style.setProperty('--mouse-y', e.clientY + 'px');
-    });
   </script>
 </body>
 </html>
