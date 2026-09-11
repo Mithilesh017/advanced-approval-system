@@ -68,8 +68,8 @@ def test_changing_a_decision_goes_through_pending(app_db):
         [row] = query(app_db, 'SELECT final_decision, reviewed_by FROM Requests WHERE id = ?', (decided,))
         return row
 
-    assert admin.post('/api/auth/reopen_request', json={'id': decided}).status_code == 200
+    assert admin.post('/api/auth/reopen_request', json={'id': decided, 'comment': 'Receipt was missing'}).status_code == 200
     assert state() == {'final_decision': 'ESCALATED_MANUAL_REVIEW', 'reviewed_by': None}
 
-    assert admin.post('/api/auth/reject_request', json={'id': decided}).status_code == 200
+    assert admin.post('/api/auth/reject_request', json={'id': decided, 'comment': 'Over the hotel limit'}).status_code == 200
     assert state() == {'final_decision': 'REJECTED', 'reviewed_by': 'manager@example.com'}

@@ -60,6 +60,74 @@
       ESCALATED_MANUAL_REVIEW: 'Needs manual review'
     };
 
+    const DECISION_PROMPTS = {
+      Approved: { title: 'Approve this request?', inputLabel: 'Note (optional)', confirmButtonText: 'Approve', reasonRequired: false },
+      Rejected: { title: 'Reject this request?', inputLabel: 'Reason for rejecting (required)', confirmButtonText: 'Reject', reasonRequired: true },
+      Pending: { title: 'Move this request back to pending?', inputLabel: 'Reason for reopening (required)', confirmButtonText: 'Move to pending', reasonRequired: true }
+    };
+
+    const HISTORY_ACTIONS = {
+      'request.submitted': 'Submitted',
+      'request.approved': 'Approved',
+      'request.rejected': 'Rejected',
+      'request.reopened': 'Moved back to pending'
+    };
+    const FEATURE_LABELS = { Role: 'Role', Department: 'Department', Request_Type: 'Request type', Destination: 'Destination', Amount_INR: 'Amount' };
+
+    // The history is built from DOM nodes with text content, so nothing typed by users is rendered as HTML.
+    const historyNode = (tag, className, children = []) => {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      element.append(...children);
+      return element;
+    };
+
+    const formatHistoryTime = (value) => new Date(value).toLocaleString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+    const submissionDetails = (event) => {
+      const details = event.details || {};
+      const outcome = event.to_status === 'APPROVED' ? 'Approved automatically' : (DECISION_LABELS[event.to_status] || event.to_status);
+      const model = details.model_version ? `model version ${details.model_version}` : 'original model';
+      const parts = [historyNode('div', 'history-meta', [`Outcome: ${outcome} · AI approval score ${(details.approval_score * 100).toFixed(1)}% · ${model}`])];
+      if (details.explanation) {
+        const rows = Object.entries(details.explanation)
+          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+          .map(([feature, impact]) => historyNode('div', 'shap-row', [
+            historyNode('span', '', [`${FEATURE_LABELS[feature] || feature}:`]),
+            historyNode('strong', impact > 0 ? 'is-positive' : 'is-negative', [`${impact > 0 ? '+' : ''}${impact.toFixed(3)}`])
+          ]));
+        parts.push(historyNode('div', 'shap-box', [historyNode('div', 'shap-title', ['What influenced the AI score']), ...rows]));
+      }
+      return parts;
+    };
+
+    const buildHistory = (events) => {
+      if (!events.length) {
+        return historyNode('p', 'history-empty', ['No history was recorded for this request. Requests handled before the audit log was added have no history.']);
+      }
+      return historyNode('ol', 'history-list', events.map(event => historyNode('li', 'history-item', [
+        historyNode('div', 'history-head', [
+          historyNode('strong', '', [HISTORY_ACTIONS[event.action] || event.action]),
+          historyNode('span', 'history-time', [formatHistoryTime(event.created_at)])
+        ]),
+        historyNode('div', 'history-meta', [event.actor_email ? `by ${event.actor_email}` : 'by the system']),
+        ...(event.comment ? [historyNode('blockquote', 'history-comment', [event.comment])] : []),
+        ...(event.action === 'request.submitted' ? submissionDetails(event) : [])
+      ])));
+    };
+
+    const showRequestHistory = async (req) => {
+      try {
+        const res = await fetch(`/api/auth/request_history?id=${encodeURIComponent(req.id)}`, { credentials: 'include' });
+        if (isSessionExpired(res)) return;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'The history could not be loaded.');
+        Swal.fire({ title: `${req.reqId} History`, html: buildHistory(data.events), width: 640, confirmButtonText: 'Close' });
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'History Unavailable', text: err.message });
+      }
+    };
+
     function AdminPortal() {
       const [view, setView] = useState('dashboard');
       const [allRequests, setAllRequests] = useState([]);
@@ -436,6 +504,18 @@
       }, [tableKey]); // Re-run only when the tableKey changes (full remount)
 
       const handleAction = async (id, newStatus) => {
+        const decisionPrompt = DECISION_PROMPTS[newStatus];
+        const answer = await Swal.fire({
+          title: decisionPrompt.title,
+          input: 'textarea',
+          inputLabel: decisionPrompt.inputLabel,
+          inputAttributes: { maxlength: '1000' },
+          showCancelButton: true,
+          confirmButtonText: decisionPrompt.confirmButtonText,
+          inputValidator: (value) => (decisionPrompt.reasonRequired && !value.trim() ? 'Please give a reason. It is saved in the request history.' : undefined)
+        });
+        if (!answer.isConfirmed) return;
+
         const endpoints = {
           Approved: '/api/auth/approve_request',
           Rejected: '/api/auth/reject_request',
@@ -446,7 +526,7 @@
           const res = await fetch(endpoints[newStatus], {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: id }),
+            body: JSON.stringify({ id: id, comment: answer.value.trim() }),
             credentials: 'include'
           });
           if (isSessionExpired(res)) return;
@@ -554,22 +634,6 @@
                           </span>
                         )}
                         {req.reason && <span className="badge badge-block badge-accent">{req.reason}</span>}
-                        {req.shap && (
-                          <div className="shap-box">
-                            <div className="shap-title">SHAP Impact</div>
-                            {Object.entries(req.shap).map(([feature, impact]) => {
-                              const isPositive = impact > 0;
-                              return (
-                                <div key={feature} className="shap-row">
-                                  <span>{feature.replace('_', ' ')}:</span>
-                                  <strong className={isPositive ? 'is-positive' : 'is-negative'}>
-                                    {isPositive ? '+' : ''}{impact.toFixed(3)}
-                                  </strong>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
                       <td className="cell-nowrap">
@@ -581,6 +645,7 @@
                         ) : (
                           <button type="button" className="action-btn info" onClick={() => handleAction(req.id, 'Pending')} title="Move to Pending" aria-label="Move to Pending"><i className="fas fa-undo"></i></button>
                         )}
+                        <button type="button" className="action-btn info" onClick={() => showRequestHistory(req)} title="History" aria-label="History"><i className="fas fa-clock-rotate-left"></i></button>
                       </td>
                     </tr>
                   ))}

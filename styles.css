@@ -301,6 +301,17 @@ button { -webkit-tap-highlight-color: transparent; }
 .platform-page { max-width: 1180px; margin: 0 auto; padding: 0 var(--content-padding) 56px; }
 .platform-header-actions { display: flex; align-items: center; gap: 12px; }
 .platform-tabs { margin: 4px 0 20px; }
+
+/* ---------- Request history ---------- */
+
+.history-list { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; text-align: left; }
+.history-item { padding-left: 14px; border-left: 3px solid var(--separator-strong); }
+.history-head { display: flex; justify-content: space-between; gap: 12px; font-size: 0.875rem; color: var(--label); }
+.history-time { font-size: var(--text-xs); color: var(--label-3); white-space: nowrap; }
+.history-meta { margin-top: 2px; font-size: var(--text-sm); color: var(--label-3); }
+.history-comment { margin: 6px 0 0; padding: 6px 10px; border-radius: var(--radius-sm); background: var(--fill-soft); font-size: var(--text-sm); color: var(--label-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-item .shap-box { margin-top: 8px; }
+.history-empty { margin: 0; text-align: left; color: var(--label-3); }
 .checkbox-row { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 20px; font-size: 0.875rem; color: var(--label-2); cursor: pointer; }
 .checkbox-row input { margin-top: 3px; accent-color: var(--accent); }
 

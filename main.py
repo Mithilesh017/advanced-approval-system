@@ -177,6 +177,17 @@ def to_json_row(row):
         result[key] = value
     return result
 
+def record_event(conn, action, *, organization_id=None, request_id=None, actor=None,
+                 from_status=None, to_status=None, comment=None, details=None):
+    # The audit log is append-only: the database itself refuses to change or delete these rows.
+    # Callers write the event in the same transaction as the change it describes.
+    conn.execute(
+        'INSERT INTO AuditEvents (organization_id, request_id, actor_email, action, from_status, to_status, comment, details) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (organization_id, request_id, actor, action, from_status, to_status, comment,
+         json.dumps(details) if details is not None else None)
+    )
+
 # ==========================================
 # 1. AUTHENTICATION & DATABASE CONFIGURATION
 # ==========================================
@@ -235,6 +246,11 @@ class PostgresWrapper:
 # At most one organization can be the default, even when several workers start at once.
 ORGANIZATIONS_SINGLE_DEFAULT_INDEX = (
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_single_default ON Organizations (is_default) WHERE is_default = 1'
+)
+
+AUDIT_EVENT_INDEXES = (
+    'CREATE INDEX IF NOT EXISTS idx_audit_events_request ON AuditEvents (request_id)',
+    'CREATE INDEX IF NOT EXISTS idx_audit_events_organization ON AuditEvents (organization_id)',
 )
 
 def init_db():
@@ -312,6 +328,39 @@ def init_db():
             )
         ''')
         cursor.execute(ORGANIZATIONS_SINGLE_DEFAULT_INDEX)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS AuditEvents (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER REFERENCES Organizations(id),
+                request_id INTEGER REFERENCES Requests(id),
+                actor_email TEXT,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                comment TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'reject_audit_event_changes') THEN
+                    CREATE FUNCTION reject_audit_event_changes() RETURNS trigger AS $body$
+                    BEGIN
+                        RAISE EXCEPTION 'Audit events cannot be changed or deleted';
+                    END;
+                    $body$ LANGUAGE plpgsql;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'audit_events_append_only') THEN
+                    CREATE TRIGGER audit_events_append_only BEFORE UPDATE OR DELETE ON AuditEvents
+                        FOR EACH ROW EXECUTE FUNCTION reject_audit_event_changes();
+                END IF;
+            END
+            $$
+        ''')
+        for statement in AUDIT_EVENT_INDEXES:
+            cursor.execute(statement)
         conn.commit()
         conn.close()
     else:
@@ -382,6 +431,29 @@ def init_db():
             )
         ''')
         cursor.execute(ORGANIZATIONS_SINGLE_DEFAULT_INDEX)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS AuditEvents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER REFERENCES Organizations(id),
+                request_id INTEGER REFERENCES Requests(id),
+                actor_email TEXT,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                comment TEXT,
+                details TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        for operation in ('UPDATE', 'DELETE'):
+            cursor.execute(f'''
+                CREATE TRIGGER IF NOT EXISTS audit_events_no_{operation.lower()} BEFORE {operation} ON AuditEvents
+                BEGIN
+                    SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted');
+                END
+            ''')
+        for statement in AUDIT_EVENT_INDEXES:
+            cursor.execute(statement)
         conn.commit()
         conn.close()
 
@@ -615,7 +687,7 @@ def join_page(code):
 @limiter.limit("20 per minute")
 @require_login
 def predict():
-    artifacts, _ = get_active_model()
+    artifacts, model_version_id = get_active_model()
     if artifacts is None:
         return jsonify({
             'error': 'The AI model is currently unavailable. Please try again later.',
@@ -692,6 +764,10 @@ def predict():
         iso_pred = int(iso_forest.predict(X_input)[0])
         svm_pred = int(oc_svm.predict(X_input)[0])
         is_severe_anomaly = (iso_pred == -1) or (svm_pred == -1)
+
+        # SHAP values show administrators which fields pushed the score up or down.
+        shap_values = artifacts['shap_explainer'].shap_values(X_input)
+        shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
         
         # Decision Routing Logic (Confidence Based Triage)
         if is_unknown_category:
@@ -707,15 +783,26 @@ def predict():
 
         # Persist to DB
         conn = get_db_connection()
-        conn.execute(
+        request_id = conn.execute(
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
                 final_decision, submitted_by, employee_name, employee_id, organization_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
              status, current_email, employee_name, employee_id, g.user['organization_id'])
+        ).fetchall()[0][0]
+        record_event(
+            conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
+            actor=current_email, to_status=status, details={
+                'model_version': model_version_id,
+                'approval_score': round(xgb_prob, 4),
+                'unrecognized_category': is_unknown_category,
+                'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
+                'thresholds': {'auto_approve_above': AUTO_APPROVE_THRESHOLD, 'escalate_below': ESCALATE_THRESHOLD},
+                'explanation': shap_impact,
+            }
         )
         conn.commit()
         conn.close()
@@ -916,6 +1003,7 @@ def retrain_model():
         "INSERT INTO TrainingJobs (status, step, started_by) VALUES ('running', 'queued', ?) RETURNING id",
         (started_by,)
     ).fetchall()[0][0]
+    record_event(conn, 'model.retrain_started', actor=started_by, details={'job_id': job_id})
     conn.commit()
     conn.close()
 
@@ -976,6 +1064,7 @@ def activate_model_version():
             conn.close()
             return jsonify({'error': 'Model version not found.'}), 404
         conn.execute('UPDATE ModelVersions SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END', (version_id,))
+    record_event(conn, 'model.activated', actor=g.user['email'], details={'version_id': version_id})
     conn.commit()
     conn.close()
 
@@ -1048,6 +1137,8 @@ def platform_create_organization():
             'INSERT INTO Users (email, role, status, organization_id) VALUES (?, ?, ?, ?)',
             (email, 'SuperAdmin', 'Approved_Awaiting_Password', organization_id)
         )
+        record_event(conn, 'organization.created', organization_id=organization_id, actor=g.user['email'],
+                     details={'name': name, 'super_admin_email': email, 'allow_training_data': allow_training_data})
         conn.commit()
         # The setup link goes only to the Super Admin's inbox, so Neuzem never knows their password.
         setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
@@ -1093,6 +1184,8 @@ def platform_update_organization():
         # Column names come from the fixed keys above, never from the request.
         assignments = ', '.join(f'{column} = ?' for column in changes)
         conn.execute(f'UPDATE Organizations SET {assignments} WHERE id = ?', (*changes.values(), organization_id))
+        record_event(conn, 'organization.updated', organization_id=organization_id, actor=g.user['email'],
+                     details={'changes': {column: data[column] for column in changes}})
         conn.commit()
     finally:
         conn.close()
@@ -1350,6 +1443,9 @@ def delete_user():
         return jsonify({'status': 'ERROR', 'message': 'Admins can only remove employee accounts.'}), 403
 
     cursor = conn.execute('DELETE FROM Users WHERE email = ? AND organization_id = ?', (email, g.user['organization_id']))
+    if cursor.rowcount:
+        record_event(conn, 'user.deleted', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'email': email, 'role': target['role'] if target else None})
     conn.commit()
     conn.close()
     
@@ -1383,6 +1479,9 @@ def approve_user():
         'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending" AND organization_id = ?',
         ('Approved_Awaiting_Password', email, g.user['organization_id'])
     )
+    if cursor.rowcount:
+        record_event(conn, 'user.approved', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'email': email, 'role': target['role']})
     conn.commit()
     
     if cursor.rowcount > 0:
@@ -1424,6 +1523,9 @@ def reject_user():
         'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending" AND organization_id = ?',
         ('Rejected', email, g.user['organization_id'])
     )
+    if cursor.rowcount:
+        record_event(conn, 'user.rejected', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'email': email, 'role': target['role']})
     conn.commit()
     
     if cursor.rowcount > 0:
@@ -1519,16 +1621,22 @@ def is_awaiting_review(decision):
 def is_decided(decision):
     return decision in ('APPROVED', 'REJECTED')
 
-def change_request_decision(new_decision, allowed_from, conflict_message):
+COMMENT_MAX_LENGTH = 1000
+
+def change_request_decision(new_decision, allowed_from, conflict_message, action, reason_required=False):
     data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
         return jsonify({'error': 'Request ID is required'}), 400
+    comment = data.get('comment')
+    if comment is not None and not isinstance(comment, str):
+        return jsonify({'error': 'The comment must be text.'}), 400
+    comment = (comment or '').strip()[:COMMENT_MAX_LENGTH] or None
 
     conn = get_db_connection()
     try:
         target = conn.execute(
-            'SELECT submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            'SELECT id, submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
             (req_id, g.user['organization_id'])
         ).fetchone()
         if not target:
@@ -1537,17 +1645,24 @@ def change_request_decision(new_decision, allowed_from, conflict_message):
             return jsonify({'error': 'You cannot review your own request.'}), 403
         if not allowed_from(target['final_decision']):
             return jsonify({'error': conflict_message}), 409
+        if reason_required and not comment:
+            return jsonify({'error': 'Please give a reason. It is saved in the request history.'}), 400
 
         reviewer = g.user['email'] if is_decided(new_decision) else None
         # Matching the status that was checked stops two admins acting at once from overwriting each other.
         cursor = conn.execute(
             f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'} "
             'WHERE id = ? AND organization_id = ? AND final_decision = ?',
-            (new_decision, reviewer, req_id, g.user['organization_id'], target['final_decision'])
+            (new_decision, reviewer, target['id'], g.user['organization_id'], target['final_decision'])
         )
-        conn.commit()
         if not cursor.rowcount:
             return jsonify({'error': conflict_message}), 409
+        # The decision and its history entry are saved together, or neither is.
+        record_event(
+            conn, action, organization_id=g.user['organization_id'], request_id=target['id'], actor=g.user['email'],
+            from_status=target['final_decision'], to_status=new_decision, comment=comment
+        )
+        conn.commit()
     finally:
         conn.close()
     return jsonify({'status': 'SUCCESS'})
@@ -1555,19 +1670,50 @@ def change_request_decision(new_decision, allowed_from, conflict_message):
 @app.route('/api/auth/approve_request', methods=['POST'])
 @require_role('Admin')
 def approve_request():
-    return change_request_decision('APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.')
+    return change_request_decision(
+        'APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.', 'request.approved'
+    )
 
 @app.route('/api/auth/reject_request', methods=['POST'])
 @require_role('Admin')
 def reject_request():
-    return change_request_decision('REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.')
+    return change_request_decision(
+        'REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.', 'request.rejected', reason_required=True
+    )
 
 @app.route('/api/auth/reopen_request', methods=['POST'])
 @require_role('Admin')
 def reopen_request():
     return change_request_decision(
-        'ESCALATED_MANUAL_REVIEW', is_decided, 'Only approved or rejected requests can be moved back to pending.'
+        'ESCALATED_MANUAL_REVIEW', is_decided, 'Only approved or rejected requests can be moved back to pending.',
+        'request.reopened', reason_required=True
     )
+
+@app.route('/api/auth/request_history', methods=['GET'])
+@require_role('Admin')
+def request_history():
+    request_id = request.args.get('id', type=int)
+    if request_id is None:
+        return jsonify({'error': 'Request ID is required'}), 400
+
+    conn = get_db_connection()
+    try:
+        if not conn.execute('SELECT id FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])).fetchone():
+            return jsonify({'error': 'Request not found.'}), 404
+        rows = conn.execute(
+            'SELECT action, actor_email, from_status, to_status, comment, details, created_at FROM AuditEvents '
+            'WHERE request_id = ? AND organization_id = ? ORDER BY id',
+            (request_id, g.user['organization_id'])
+        ).fetchall()
+    finally:
+        conn.close()
+
+    events = []
+    for row in rows:
+        event = to_json_row(row)
+        event['details'] = json.loads(event['details']) if event['details'] else None
+        events.append(event)
+    return jsonify({'events': events})
 
 @app.route('/api/auth/request_password_reset', methods=['POST'])
 @limiter.limit("3 per hour")
