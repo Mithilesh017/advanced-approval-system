@@ -224,6 +224,15 @@ python main.py
 
 On Windows Command Prompt use `copy .env.example .env` instead of `cp`. Open **http://localhost:5000**.
 
+### Run the tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Tests always use a temporary SQLite database with email delivery disabled, whatever your `.env` contains.
+
 On first start the app creates its database tables and a Super Admin account using the credentials from your environment settings. Configure email (SMTP or SendGrid) to receive the account setup links that new users need. Without it, emails are only logged to the console.
 
 ### Configuration
@@ -234,8 +243,9 @@ Settings are read from environment variables or a `.env` file. See [`.env.exampl
 | --- | --- | --- |
 | `JWT_SECRET_KEY` | Production | Signs login sessions. Without it a random key is generated and sessions reset on every restart. |
 | `JWT_ACCESS_TOKEN_HOURS` | Optional | Session length in hours. Default `8`. |
-| `DATABASE_URL` | Production | PostgreSQL connection string. When unset, a local SQLite file `auth.db` is used. |
-| `INITIAL_SUPER_ADMIN_EMAIL` | Optional | Email of the Super Admin created on first start. Defaults to the address in `main.py`. |
+| `DATABASE_URL` | Production | PostgreSQL connection string. When unset, a local SQLite file is used. |
+| `SQLITE_PATH` | Optional | Path of the local SQLite file. Default `auth.db`. |
+| `INITIAL_SUPER_ADMIN_EMAIL` | First start | Email of the Super Admin created on first start. No account is created when it is unset. |
 | `INITIAL_SUPER_ADMIN_PASSWORD` or `SUPER_ADMIN_PASSWORD` | First start | Password for that Super Admin account. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | For email | SMTP delivery. A Gmail app password works. |
 | `SENDGRID_API_KEY` | Optional | Send email through SendGrid's HTTP API, useful on hosts that block SMTP. |
@@ -346,7 +356,7 @@ Retrained model versions are stored in the database, so they persist across depl
 
 - Exchange rates are fixed values in `main.py` rather than a live feed.
 - The frontend compiles JSX in the browser for zero-build simplicity. A bundler would improve load time for large deployments.
-- An automated test suite is not yet included in the repository.
+- The automated test suite is small so far and covers database setup and organization assignment.
 
 ## License
 

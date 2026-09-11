@@ -119,8 +119,20 @@ def evaluate(artifacts, frame):
 
 
 def form_options(frame):
-    usable = frame[frame['source'].astype(str) != 'external']
+    # Only the base corporate vocabulary is offered to every organization; organizations' own values stay private.
+    usable = frame[frame['source'].astype(str) == 'corporate']
     return {col: sorted(usable[col].astype(str).unique().tolist()) for col in CATEGORICAL_FEATURES}
+
+
+def standard_form_options(artifacts):
+    # Derived from the stored base data rather than the saved form options, so models trained before
+    # organizations existed also stop offering one organization's values to another.
+    if '_standard_form_options' not in artifacts:
+        if artifacts.get('training_data') is not None:
+            artifacts['_standard_form_options'] = form_options(unpack_training_data(artifacts['training_data']))
+        else:
+            artifacts['_standard_form_options'] = artifacts.get('form_options') or {col: [] for col in CATEGORICAL_FEATURES}
+    return artifacts['_standard_form_options']
 
 
 def train_ensemble(base, feedback=None):

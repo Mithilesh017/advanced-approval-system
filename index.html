@@ -52,7 +52,11 @@
 
       <!-- REQUEST ACCESS SECTION -->
       <div id="registerSection" class="auth-section">
-        <form id="registerForm">
+        <div id="joinNotice" class="callout callout-info" hidden>
+          <i class="fas fa-building" aria-hidden="true"></i>
+          <div><strong></strong> <span></span></div>
+        </div>
+        <form id="registerForm" hidden>
           <div class="form-group">
             <label for="regEmail">Email Address</label>
             <div class="input-wrap">
@@ -171,6 +175,40 @@
       document.getElementById('setupSection').classList.add('active');
     }
 
+    // Access requests go to the organization named by the join link an administrator shared.
+    const joinCode = urlParams.get('join');
+
+    function showJoinNotice(kind, title, text) {
+      const notice = document.getElementById('joinNotice');
+      notice.className = `callout callout-${kind}`;
+      notice.querySelector('strong').textContent = title;
+      notice.querySelector('span').textContent = text;
+      notice.hidden = false;
+    }
+
+    async function loadJoinLink() {
+      if (!joinCode) {
+        showJoinNotice('warning', 'Join link required', 'Ask your company administrator for your organization\'s join link, then open it to request access.');
+        return;
+      }
+      // Someone who opened a join link came to request access, so show that tab even when the link is invalid.
+      if (!resetToken && !setupToken) switchTab('register');
+      try {
+        const response = await fetch(`${AUTH_API}/join_info?code=${encodeURIComponent(joinCode)}`);
+        const data = await response.json();
+        if (response.ok) {
+          showJoinNotice('info', `Joining ${data.organization_name}`, 'An administrator of this organization will review your request.');
+          document.getElementById('registerForm').hidden = false;
+        } else {
+          showJoinNotice('danger', 'Join link not valid', data.error);
+        }
+      } catch (err) {
+        showJoinNotice('danger', 'Connection Error', 'Could not reach the authentication server.');
+      }
+    }
+
+    loadJoinLink();
+
     // Reset Form Submission
     if(document.getElementById('resetForm')) {
       document.getElementById('resetForm').addEventListener('submit', async function(e) {
@@ -267,7 +305,7 @@
         const response = await fetch(`${AUTH_API}/request_access`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: email, role: role })
+          body: JSON.stringify({ email: email, role: role, join_code: joinCode })
         });
         
         const data = await response.json();

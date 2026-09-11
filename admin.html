@@ -64,6 +64,7 @@
       const [view, setView] = useState('dashboard');
       const [allRequests, setAllRequests] = useState([]);
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'admin@gmail.com'});
+      const [organization, setOrganization] = useState(null);
 
       const loadData = async () => {
         try {
@@ -101,6 +102,10 @@
 
       useEffect(() => {
         loadData();
+        fetch('/api/auth/organization', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (data) setOrganization(data); })
+          .catch(() => {});
       }, []);
 
       const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
@@ -136,6 +141,7 @@
                 {user.email.charAt(0).toUpperCase()}
               </div>
               <div className="sidebar-user-meta">
+                {organization && <div className="sidebar-org" title={organization.name}>{organization.name}</div>}
                 <div className="email" title={user.email}>{user.email}</div>
                 <span className={`badge ${user.role === 'SuperAdmin' ? 'badge-purple' : 'badge-accent'}`}>{user.role === 'SuperAdmin' ? 'Super Admin' : 'Admin'}</span>
               </div>
@@ -166,13 +172,6 @@
                   <span className="count secondary">{rejectedCount}</span>
                 </button>
               </li>
-              {user.role === 'SuperAdmin' && (
-                <li>
-                  <button className={view === 'mlops' ? 'active' : ''} onClick={() => setView('mlops')}>
-                    <i className="fas fa-brain"></i> ML Agent
-                  </button>
-                </li>
-              )}
               <li>
                 <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
               </li>
@@ -194,7 +193,6 @@
                 {view === 'pending' && <><i className="fas fa-clock"></i> Pending Requests</>}
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
                 {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
-                {view === 'mlops' && <><i className="fas fa-brain"></i> ML Agent Console</>}
                 {view === 'users' && <><i className="fas fa-users-cog"></i> Manage Users</>}
                 {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
               </h2>
@@ -214,8 +212,7 @@
                     refresh={loadData} 
                 />
             }
-            {user.role === 'SuperAdmin' && view === 'mlops' && <MlopsView />}
-            {view === 'users' && <UsersView userRole={user.role} />}
+            {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
             {view === 'profile' && <ProfileView user={user} />}
           </div>
         </div>
@@ -595,275 +592,7 @@
       );
     }
 
-    const TRAINING_STEPS = [
-      { key: 'collecting', label: 'Collecting training data and admin decisions' },
-      { key: 'training', label: 'Training the models' },
-      { key: 'evaluating', label: 'Checking quality against the current model' },
-      { key: 'publishing', label: 'Publishing the new model' }
-    ];
-    const RESULT_STYLES = {
-      succeeded: { callout: 'callout-success', icon: 'fa-circle-check', title: 'New model is live' },
-      rejected: { callout: 'callout-info', icon: 'fa-circle-info', title: 'Current model kept' },
-      failed: { callout: 'callout-danger', icon: 'fa-triangle-exclamation', title: 'Retraining failed' }
-    };
-    const formatPercent = (value) => value == null ? '—' : `${(value * 100).toFixed(1)}%`;
-    const formatDateTime = (value) => value
-      ? new Date(value).toLocaleString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-      : '—';
-
-    function MlopsView() {
-      const [info, setInfo] = useState(null);
-      const [versions, setVersions] = useState(null);
-      const [job, setJob] = useState(null);
-      const [loadError, setLoadError] = useState('');
-      const [starting, setStarting] = useState(false);
-
-      const fetchJson = async (url, options = {}) => {
-        const res = await fetch(url, { credentials: 'include', ...options });
-        if (isSessionExpired(res)) return null;
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || data.msg || 'The request failed.');
-        return data;
-      };
-
-      const loadModel = async () => {
-        try {
-          const [infoData, versionData, jobData] = await Promise.all([
-            fetchJson('/api/model/info'),
-            fetchJson('/api/model/versions'),
-            fetchJson('/api/model/jobs/latest')
-          ]);
-          if (infoData) setInfo(infoData);
-          if (versionData) setVersions(versionData);
-          if (jobData) setJob(jobData.job);
-          setLoadError('');
-        } catch (err) {
-          setLoadError('Could not load model details from the server.');
-        }
-      };
-
-      useEffect(() => { loadModel(); }, []);
-
-      const isRunning = !!job && job.status === 'running';
-
-      useEffect(() => {
-        if (!isRunning) return;
-        const timer = setInterval(async () => {
-          try {
-            const data = await fetchJson('/api/model/jobs/latest');
-            if (!data) return;
-            setJob(data.job);
-            if (!data.job || data.job.status !== 'running') loadModel();
-          } catch (err) {}
-        }, 2000);
-        return () => clearInterval(timer);
-      }, [isRunning]);
-
-      const triggerRetrain = async () => {
-        const result = await Swal.fire({
-          title: 'Retrain the AI model?',
-          text: 'The model will learn from its base data plus every request an admin approved or rejected by hand. The new model only goes live if it scores at least as well as the current one.',
-          icon: 'question',
-          showCancelButton: true,
-          confirmButtonText: 'Start retraining'
-        });
-        if (!result.isConfirmed) return;
-
-        setStarting(true);
-        try {
-          const started = await fetchJson('/api/model/retrain', { method: 'POST' });
-          if (started) {
-            const latest = await fetchJson('/api/model/jobs/latest');
-            if (latest) setJob(latest.job);
-          }
-        } catch (err) {
-          Swal.fire({ icon: 'error', title: 'Could Not Start Retraining', text: err.message });
-        }
-        setStarting(false);
-      };
-
-      const activateVersion = async (versionId, label) => {
-        const result = await Swal.fire({
-          title: `Switch to ${label}?`,
-          text: 'New requests will be scored by this model within about 30 seconds.',
-          icon: 'warning',
-          showCancelButton: true,
-          confirmButtonText: 'Switch model'
-        });
-        if (!result.isConfirmed) return;
-
-        try {
-          const data = await fetchJson('/api/model/activate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ version_id: versionId })
-          });
-          if (data) {
-            Swal.fire({ icon: 'success', title: 'Model Switched', timer: 1500, showConfirmButton: false });
-            loadModel();
-          }
-        } catch (err) {
-          Swal.fire({ icon: 'error', title: 'Switch Failed', text: err.message });
-        }
-      };
-
-      const metrics = (info && info.metrics) || {};
-      const activeLabel = !info ? '—' : !info.ready ? 'Unavailable' : info.version_id ? `Version ${info.version_id}` : 'Original model';
-      const currentStep = job ? TRAINING_STEPS.findIndex(step => step.key === job.step) : -1;
-      const resultStyle = job && RESULT_STYLES[job.status];
-
-      return (
-        <div>
-          <div className="dash-banner is-dark">
-            <div className="dash-banner-left">
-              <div className="dash-banner-icon"><i className="fas fa-robot"></i></div>
-              <div>
-                <h3>MLOps Control Center</h3>
-                <p>Retrain the AI approval model from your admins' decisions and switch between versions, all from here.</p>
-              </div>
-            </div>
-          </div>
-
-          <div className="stats-grid-3">
-            <div className="stat-card blue">
-              <div className="stat-icon"><i className="fas fa-microchip"></i></div>
-              <div className="stat-value is-compact">{activeLabel}</div>
-              <div className="stat-label">Active Model</div>
-            </div>
-            <div className="stat-card green">
-              <div className="stat-icon"><i className="fas fa-bullseye"></i></div>
-              <div className="stat-value" title="ROC-AUC measured on requests the model never trained on">{formatPercent(metrics.roc_auc)}</div>
-              <div className="stat-label">Quality Score</div>
-            </div>
-            <div className="stat-card purple">
-              <div className="stat-icon"><i className="fas fa-user-check"></i></div>
-              <div className="stat-value">{info && info.ready ? info.new_decisions_since_training : '—'}</div>
-              <div className="stat-label">New Admin Decisions Since Training</div>
-            </div>
-          </div>
-
-          <div className="panel">
-            <h3 className="panel-title"><i className="fas fa-bolt"></i> Retrain Model</h3>
-            <p className="panel-subtitle">
-              Retraining teaches the model from requests your admins approved or rejected by hand, including job roles, departments and destinations it has not seen before. Last trained {formatDateTime(info && info.trained_at)}.
-            </p>
-            {loadError && <p className="panel-subtitle">{loadError}</p>}
-            <button type="button" onClick={triggerRetrain} disabled={isRunning || starting || !info || !info.ready} className="btn btn-primary btn-lg">
-              {isRunning || starting
-                ? <span><i className="fas fa-spinner fa-spin"></i> Retraining in progress...</span>
-                : <span><i className="fas fa-bolt"></i> Retrain Model Now</span>}
-            </button>
-
-            {isRunning && (
-              <ol className="training-steps" aria-live="polite">
-                {TRAINING_STEPS.map((step, index) => {
-                  const state = index < currentStep ? 'done' : index === currentStep ? 'active' : 'waiting';
-                  return (
-                    <li key={step.key} className={`training-step is-${state}`}>
-                      <span className="training-step-icon">
-                        {state === 'done' ? <i className="fas fa-check"></i> : state === 'active' ? <i className="fas fa-spinner fa-spin"></i> : index + 1}
-                      </span>
-                      {step.label}
-                    </li>
-                  );
-                })}
-              </ol>
-            )}
-
-            {!isRunning && resultStyle && (
-              <div className={`callout retrain-result ${resultStyle.callout}`} role="status">
-                <i className={`fas ${resultStyle.icon}`} aria-hidden="true"></i>
-                <div>
-                  <strong>{resultStyle.title}</strong>
-                  {job.message}
-                  <div className="callout-meta">{formatDateTime(job.finished_at || job.started_at)} · started by {job.started_by}</div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {versions && (
-            <div className="panel">
-              <h3 className="panel-title"><i className="fas fa-clock-rotate-left"></i> Version History</h3>
-              <p className="panel-subtitle">Every successful retrain is saved. If a new model behaves unexpectedly, switch back to an earlier version.</p>
-              <div className="table-scroll">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Version</th>
-                      <th>Trained</th>
-                      <th>Trained By</th>
-                      <th>Quality Score</th>
-                      <th>Admin Decisions Used</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {versions.versions.map(v => (
-                      <tr key={v.id}>
-                        <td className="cell-primary">Version {v.id}</td>
-                        <td className="cell-muted">{formatDateTime(v.created_at)}</td>
-                        <td className="cell-muted">{v.created_by || '—'}</td>
-                        <td>{formatPercent(v.metrics && v.metrics.roc_auc)}</td>
-                        <td>{v.metrics ? v.metrics.feedback_rows : '—'}</td>
-                        <td className="cell-nowrap">
-                          {v.is_active
-                            ? <span className="status-badge status-approved">Active</span>
-                            : <button type="button" className="btn btn-secondary btn-sm" onClick={() => activateVersion(v.id, `Version ${v.id}`)}>Use this version</button>}
-                        </td>
-                      </tr>
-                    ))}
-                    {versions.bundled.available && (
-                      <tr>
-                        <td className="cell-primary">Original model</td>
-                        <td className="cell-muted">{formatDateTime(versions.bundled.trained_at)}</td>
-                        <td className="cell-muted">Shipped with the app</td>
-                        <td>{formatPercent(versions.bundled.metrics && versions.bundled.metrics.roc_auc)}</td>
-                        <td>{versions.bundled.metrics ? versions.bundled.metrics.feedback_rows : '—'}</td>
-                        <td className="cell-nowrap">
-                          {versions.bundled.is_active
-                            ? <span className="status-badge status-approved">Active</span>
-                            : <button type="button" className="btn btn-secondary btn-sm" onClick={() => activateVersion(null, 'the original model')}>Use this version</button>}
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {info && info.ready && (
-            <div className="panel">
-              <h3 className="panel-title"><i className="fas fa-cogs"></i> Decision Pipeline</h3>
-              <p className="panel-subtitle">
-                Requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% are auto-approved. Unknown categories, detected anomalies, and lower scores are escalated for manual review.
-              </p>
-              <div className="table-scroll">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Component</th>
-                      <th>What it does</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {info.components.map(c => (
-                      <tr key={c.name}>
-                        <td className="cell-primary">{c.name}</td>
-                        <td className="cell-muted">{c.purpose}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    function UsersView({ userRole }) {
+    function UsersView({ userRole, organization }) {
       const [allUsers, setAllUsers] = useState([]);
       const [loading, setLoading] = useState(true);
       const [activeRoleFilter, setActiveRoleFilter] = useState('All');
@@ -972,6 +701,15 @@
         });
       };
 
+      const copyJoinLink = async () => {
+        try {
+          await navigator.clipboard.writeText(organization.join_link);
+          Swal.fire({ icon: 'success', title: 'Join link copied', timer: 1200, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'info', title: 'Copy this join link', input: 'text', inputValue: organization.join_link, inputAttributes: { readonly: true } });
+        }
+      };
+
       const pendingUsers = allUsers.filter(u => u.status === 'Pending');
       const activeUsers = allUsers.filter(u => u.status !== 'Pending' && (activeRoleFilter === 'All' || u.role === activeRoleFilter));
 
@@ -979,6 +717,22 @@
         <div className="panel">
           <h3 className="panel-title"><i className="fas fa-users-cog"></i> Manage Employee Requests</h3>
           <p className="panel-subtitle">Approve pending access requests for new standard User accounts. Once approved, they will be prompted to create a password.</p>
+
+          {organization?.join_link && (
+            <div className="callout callout-info join-link">
+              <i className="fas fa-link" aria-hidden="true"></i>
+              <div className="join-link-body">
+                <strong>Invite people to {organization.name}</strong>
+                <div>Share this join link with new employees. Their access requests appear below for approval.</div>
+                <div className="join-link-row">
+                  <input type="text" readOnly value={organization.join_link} aria-label="Join link" onFocus={e => e.target.select()} />
+                  <button type="button" className="btn btn-primary btn-sm" onClick={copyJoinLink}>
+                    <i className="fas fa-copy"></i> Copy
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
           
           {loading ? (
              <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading employees...</div>
