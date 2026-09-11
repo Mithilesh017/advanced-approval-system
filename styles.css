@@ -312,6 +312,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .history-comment { margin: 6px 0 0; padding: 6px 10px; border-radius: var(--radius-sm); background: var(--fill-soft); font-size: var(--text-sm); color: var(--label-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 .history-item .shap-box { margin-top: 8px; }
 .history-empty { margin: 0; text-align: left; color: var(--label-3); }
+.history-violation { color: var(--red-text); }
 .checkbox-row { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 20px; font-size: 0.875rem; color: var(--label-2); cursor: pointer; }
 .checkbox-row input { margin-top: 3px; accent-color: var(--accent); }
 

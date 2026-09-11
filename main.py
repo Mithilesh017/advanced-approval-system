@@ -359,6 +359,19 @@ def init_db():
             END
             $$
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS PolicyRules (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                rule_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                config TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -452,6 +465,19 @@ def init_db():
                     SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted');
                 END
             ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS PolicyRules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                rule_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                config TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -465,6 +491,7 @@ REQUEST_EXTRA_COLUMNS = {
     # What the AI decided on its own and the approval mode in force, kept to measure agreement with people.
     'ai_decision': 'TEXT',
     'approval_mode': 'TEXT',
+    'policy_violations': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -680,6 +707,186 @@ def organization_auto_approve_threshold(organization):
 
 
 # ==========================================
+# POLICY RULES
+# ==========================================
+POLICY_RULE_TYPES = ('amount_limit', 'duplicate_request', 'always_review')
+POLICY_REVIEW_FIELDS = {'request_type': 'Request type', 'destination': 'Destination', 'role': 'Role', 'department': 'Department'}
+POLICY_RULES_PER_ORGANIZATION = 100
+POLICY_TEXT_MAX_LENGTH = 100
+
+def validate_policy_config(rule_type, config):
+    """Returns (clean config, None) for a valid rule configuration, or (None, error message)."""
+    if not isinstance(config, dict):
+        return None, 'config must be an object.'
+
+    if rule_type == 'amount_limit':
+        texts = {}
+        for key in ('role', 'request_type'):
+            value = config.get(key)
+            if value is not None and (not isinstance(value, str) or len(value.strip()) > POLICY_TEXT_MAX_LENGTH):
+                return None, f'{key} must be text of at most {POLICY_TEXT_MAX_LENGTH} characters, or empty for any.'
+            texts[key] = value.strip() if value and value.strip() else None
+        limit = config.get('max_amount_inr')
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or not 0 < limit <= 1_000_000_000:
+            return None, 'max_amount_inr must be a positive amount in INR.'
+        return {**texts, 'max_amount_inr': float(limit)}, None
+
+    if rule_type == 'duplicate_request':
+        days = config.get('window_days')
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 90:
+            return None, 'window_days must be a whole number from 1 to 90.'
+        return {'window_days': days}, None
+
+    field, values = config.get('field'), config.get('values')
+    if not isinstance(field, str) or field not in POLICY_REVIEW_FIELDS:
+        return None, f"field must be one of: {', '.join(POLICY_REVIEW_FIELDS)}."
+    if (not isinstance(values, list) or not 1 <= len(values) <= 50
+            or not all(isinstance(v, str) and v.strip() and len(v.strip()) <= POLICY_TEXT_MAX_LENGTH for v in values)):
+        return None, f'values must list 1 to 50 texts of at most {POLICY_TEXT_MAX_LENGTH} characters.'
+    return {'field': field, 'values': sorted({v.strip() for v in values})}, None
+
+def text_matches(expected, actual):
+    return not expected or str(actual or '').strip().lower() == expected.lower()
+
+def policy_rule_reason(conn, rule_type, config, organization_id, submitter, fields):
+    if rule_type == 'amount_limit':
+        covered = text_matches(config.get('role'), fields['role']) and text_matches(config.get('request_type'), fields['request_type'])
+        if covered and fields['amount_inr'] > config['max_amount_inr']:
+            return f"Amount ₹{fields['amount_inr']:,.0f} is above the ₹{config['max_amount_inr']:,.0f} limit."
+    elif rule_type == 'duplicate_request':
+        since = (datetime.utcnow() - timedelta(days=config['window_days'])).strftime('%Y-%m-%d %H:%M:%S')
+        earlier = conn.execute(
+            'SELECT COUNT(*) AS total FROM Requests WHERE organization_id = ? AND submitted_by = ? AND request_type = ? '
+            'AND amount = ? AND currency = ? AND created_at >= ?',
+            (organization_id, submitter, fields['request_type'], fields['amount'], fields['currency'], since)
+        ).fetchone()['total']
+        if earlier:
+            return f"The same employee submitted this request type and amount within the last {config['window_days']} days."
+    elif rule_type == 'always_review':
+        value = str(fields[config['field']] or '').strip()
+        if value.lower() in {v.lower() for v in config['values']}:
+            return f'{POLICY_REVIEW_FIELDS[config["field"]]} "{value}" always needs review.'
+    return None
+
+def policy_violations(conn, organization_id, submitter, fields):
+    rules = conn.execute(
+        'SELECT id, rule_type, name, config FROM PolicyRules WHERE organization_id = ? AND is_active = 1 ORDER BY id',
+        (organization_id,)
+    ).fetchall()
+    violations = []
+    for rule in rules:
+        reason = policy_rule_reason(conn, rule['rule_type'], json.loads(rule['config']), organization_id, submitter, fields)
+        if reason:
+            violations.append({'rule_id': rule['id'], 'name': rule['name'], 'reason': reason})
+    return violations
+
+def policy_rule_json(row):
+    rule = to_json_row(row)
+    rule['config'] = json.loads(rule['config'])
+    rule['is_active'] = bool(rule['is_active'])
+    return rule
+
+def clean_rule_name(value):
+    name = ' '.join(value.split()) if isinstance(value, str) else ''
+    return name if 2 <= len(name) <= 120 else None
+
+@app.route('/api/auth/policy_rules', methods=['GET'])
+@require_role('Admin')
+def list_policy_rules():
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT id, rule_type, name, config, is_active, created_by, created_at FROM PolicyRules '
+            'WHERE organization_id = ? ORDER BY is_active DESC, id',
+            (g.user['organization_id'],)
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({'rules': [policy_rule_json(row) for row in rows]})
+
+@app.route('/api/auth/create_policy_rule', methods=['POST'])
+@require_role('SuperAdmin')
+def create_policy_rule():
+    data = request.get_json(silent=True) or {}
+    rule_type = data.get('rule_type')
+    if not isinstance(rule_type, str) or rule_type not in POLICY_RULE_TYPES:
+        return jsonify({'error': f"rule_type must be one of: {', '.join(POLICY_RULE_TYPES)}."}), 400
+    name = clean_rule_name(data.get('name'))
+    if not name:
+        return jsonify({'error': 'Give the rule a name of 2 to 120 characters.'}), 400
+    config, error = validate_policy_config(rule_type, data.get('config'))
+    if error:
+        return jsonify({'error': error}), 400
+
+    conn = get_db_connection()
+    try:
+        active = conn.execute(
+            'SELECT COUNT(*) AS total FROM PolicyRules WHERE organization_id = ? AND is_active = 1', (g.user['organization_id'],)
+        ).fetchone()['total']
+        if active >= POLICY_RULES_PER_ORGANIZATION:
+            return jsonify({'error': f'An organization can have at most {POLICY_RULES_PER_ORGANIZATION} active rules. Turn off rules you no longer need.'}), 409
+        rule_id = conn.execute(
+            'INSERT INTO PolicyRules (organization_id, rule_type, name, config, created_by) VALUES (?, ?, ?, ?, ?) RETURNING id',
+            (g.user['organization_id'], rule_type, name, json.dumps(config), g.user['email'])
+        ).fetchall()[0][0]
+        record_event(conn, 'policy_rule.created', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'rule_id': rule_id, 'rule_type': rule_type, 'name': name, 'config': config})
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'rule_id': rule_id}), 201
+
+@app.route('/api/auth/update_policy_rule', methods=['POST'])
+@require_role('SuperAdmin')
+def update_policy_rule():
+    # Rules are never deleted, only turned off, so every request's recorded violations still point at a real rule.
+    data = request.get_json(silent=True) or {}
+    rule_id = data.get('id')
+    if isinstance(rule_id, bool) or not isinstance(rule_id, int):
+        return jsonify({'error': 'id must be a rule number.'}), 400
+
+    conn = get_db_connection()
+    try:
+        rule = conn.execute(
+            'SELECT id, rule_type, name, config, is_active FROM PolicyRules WHERE id = ? AND organization_id = ?',
+            (rule_id, g.user['organization_id'])
+        ).fetchone()
+        if not rule:
+            return jsonify({'error': 'Policy rule not found.'}), 404
+
+        before = {'name': rule['name'], 'config': json.loads(rule['config']), 'is_active': bool(rule['is_active'])}
+        after = dict(before)
+        if not any(key in data for key in after):
+            return jsonify({'error': 'Nothing to update.'}), 400
+        if 'name' in data:
+            after['name'] = clean_rule_name(data['name'])
+            if not after['name']:
+                return jsonify({'error': 'Give the rule a name of 2 to 120 characters.'}), 400
+        if 'config' in data:
+            after['config'], error = validate_policy_config(rule['rule_type'], data['config'])
+            if error:
+                return jsonify({'error': error}), 400
+        if 'is_active' in data:
+            if not isinstance(data['is_active'], bool):
+                return jsonify({'error': 'is_active must be true or false.'}), 400
+            after['is_active'] = data['is_active']
+
+        changed = [key for key in after if after[key] != before[key]]
+        if changed:
+            conn.execute(
+                'UPDATE PolicyRules SET name = ?, config = ?, is_active = ? WHERE id = ? AND organization_id = ?',
+                (after['name'], json.dumps(after['config']), int(after['is_active']), rule['id'], g.user['organization_id'])
+            )
+            record_event(conn, 'policy_rule.updated', organization_id=g.user['organization_id'], actor=g.user['email'],
+                         details={'rule_id': rule['id'], 'from': {key: before[key] for key in changed},
+                                  'to': {key: after[key] for key in changed}})
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
+
+
+# ==========================================
 # 3. STATIC FILE ROUTING (FRONTEND)
 # ==========================================
 @app.route('/<path:filename>')
@@ -813,15 +1020,25 @@ def predict():
 
         # Persist to DB
         conn = get_db_connection()
+        # Company policy rules are checked before anything is saved. A broken rule always sends the request to a
+        # person; rules never approve or reject on their own, and the AI's own decision is still recorded.
+        violations = policy_violations(conn, g.user['organization_id'], current_email, {
+            'role': role, 'department': department, 'request_type': req_type, 'destination': destination,
+            'amount': amount, 'currency': currency, 'amount_inr': normalized_inr,
+        })
+        if violations:
+            status = 'ESCALATED_RULE'
         request_id = conn.execute(
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
-                final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
+                final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode,
+                policy_violations
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
-             status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode)
+             status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode,
+             json.dumps(violations) if violations else None)
         ).fetchall()[0][0]
         record_event(
             conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
@@ -829,6 +1046,7 @@ def predict():
                 'model_version': model_version_id,
                 'approval_mode': approval_mode,
                 'ai_recommendation': ai_decision,
+                'policy_violations': violations,
                 'approval_score': round(xgb_prob, 4),
                 'unrecognized_category': is_unknown_category,
                 'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
