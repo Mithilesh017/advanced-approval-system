@@ -151,7 +151,7 @@ def test_organization_list_shows_settings_and_size_but_no_records(app_db, owner)
     acme = organizations[1]
     assert set(acme) == {
         'id', 'name', 'status', 'allow_training_data', 'is_default', 'created_by', 'created_at',
-        'active_users', 'requests', 'super_admins',
+        'approval_mode', 'auto_approve_above', 'active_users', 'requests', 'super_admins',
     }
     assert (acme['active_users'], acme['requests'], acme['is_default'], acme['allow_training_data']) == (2, 1, False, False)
     assert acme['super_admins'] == [{'email': 'boss@acme.test', 'status': 'Active'}]

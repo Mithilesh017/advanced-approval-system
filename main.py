@@ -77,7 +77,7 @@ def require_login(fn):
         try:
             user = conn.execute(
                 'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, '
-                'Organizations.status AS organization_status '
+                'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
             ).fetchone()
@@ -477,6 +477,8 @@ def check_and_add_columns():
         for table in ORGANIZATION_SCOPED_TABLES:
             cursor.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES Organizations(id)')
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
         conn.commit()
         conn.close()
         return
@@ -507,6 +509,12 @@ def check_and_add_columns():
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN organization_id INTEGER REFERENCES Organizations(id)")
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)")
 
+    cursor.execute("PRAGMA table_info(Organizations)")
+    organization_columns = {col[1] for col in cursor.fetchall()}
+    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL')):
+        if column not in organization_columns:
+            cursor.execute(f"ALTER TABLE Organizations ADD COLUMN {column} {column_type}")
+
     conn.commit()
     conn.close()
 
@@ -527,8 +535,9 @@ def ensure_default_organization():
     conn = get_db_connection()
     try:
         conn.execute(
-            'INSERT INTO Organizations (name, join_code, allow_training_data, is_default) VALUES (?, ?, 1, 1) ON CONFLICT DO NOTHING',
-            (DEFAULT_ORGANIZATION_NAME, secrets.token_urlsafe(9))
+            'INSERT INTO Organizations (name, join_code, allow_training_data, is_default, approval_mode) VALUES (?, ?, 1, 1, ?) '
+            'ON CONFLICT DO NOTHING',
+            (DEFAULT_ORGANIZATION_NAME, secrets.token_urlsafe(9), 'automatic')
         )
         organization_id = conn.execute('SELECT id FROM Organizations WHERE is_default = 1').fetchone()['id']
         # Platform Owners are the only accounts that belong to no organization.
@@ -536,6 +545,8 @@ def ensure_default_organization():
             'UPDATE Users SET organization_id = ? WHERE organization_id IS NULL AND role != ?', (organization_id, PLATFORM_OWNER_ROLE)
         )
         conn.execute('UPDATE Requests SET organization_id = ? WHERE organization_id IS NULL', (organization_id,))
+        # Organizations created before approval modes existed keep automatic approval; new ones start in shadow mode.
+        conn.execute("UPDATE Organizations SET approval_mode = 'automatic' WHERE approval_mode IS NULL")
         conn.commit()
     finally:
         conn.close()
@@ -656,6 +667,13 @@ exchange_rates = {
 
 AUTO_APPROVE_THRESHOLD = 0.8
 ESCALATE_THRESHOLD = 0.2
+# Organizations may raise their auto-approval threshold up to this value, but never below the default.
+AUTO_APPROVE_THRESHOLD_MAX = 0.99
+APPROVAL_MODES = ('shadow', 'automatic')
+
+def organization_auto_approve_threshold(organization):
+    value = organization.get('auto_approve_above')
+    return AUTO_APPROVE_THRESHOLD if value is None else max(AUTO_APPROVE_THRESHOLD, float(value))
 
 
 # ==========================================
@@ -769,12 +787,14 @@ def predict():
         shap_values = artifacts['shap_explainer'].shap_values(X_input)
         shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
         
+        auto_approve_above = organization_auto_approve_threshold(g.user)
+
         # Decision Routing Logic (Confidence Based Triage)
         if is_unknown_category:
             status = "ESCALATED_UNKNOWN"
         elif is_severe_anomaly:
             status = "ESCALATED_ANOMALY"
-        elif xgb_prob > AUTO_APPROVE_THRESHOLD:
+        elif xgb_prob > auto_approve_above:
             status = "APPROVED"
         elif xgb_prob < ESCALATE_THRESHOLD:
             status = "ESCALATED_POLICY"
@@ -800,7 +820,7 @@ def predict():
                 'approval_score': round(xgb_prob, 4),
                 'unrecognized_category': is_unknown_category,
                 'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
-                'thresholds': {'auto_approve_above': AUTO_APPROVE_THRESHOLD, 'escalate_below': ESCALATE_THRESHOLD},
+                'thresholds': {'auto_approve_above': auto_approve_above, 'escalate_below': ESCALATE_THRESHOLD},
                 'explanation': shap_impact,
             }
         )
@@ -1084,7 +1104,7 @@ def platform_organizations():
     conn = get_db_connection()
     try:
         organizations = conn.execute(
-            "SELECT id, name, status, allow_training_data, is_default, created_by, created_at, "
+            "SELECT id, name, status, allow_training_data, is_default, created_by, created_at, approval_mode, auto_approve_above, "
             "(SELECT COUNT(*) FROM Users WHERE Users.organization_id = Organizations.id AND Users.status = 'Active') AS active_users, "
             "(SELECT COUNT(*) FROM Requests WHERE Requests.organization_id = Organizations.id) AS requests "
             "FROM Organizations ORDER BY is_default DESC, name"
@@ -1102,6 +1122,7 @@ def platform_organizations():
         organization = to_json_row(row)
         organization['allow_training_data'] = bool(organization['allow_training_data'])
         organization['is_default'] = bool(organization['is_default'])
+        organization['auto_approve_above'] = organization_auto_approve_threshold(organization)
         organization['super_admins'] = contacts.get(row['id'], [])
         result.append(organization)
     return jsonify({'organizations': result})
@@ -1130,15 +1151,17 @@ def platform_create_organization():
             return jsonify({'error': 'This email already has an account. Each email can belong to only one organization.'}), 409
 
         organization_id = conn.execute(
-            'INSERT INTO Organizations (name, join_code, allow_training_data, created_by) VALUES (?, ?, ?, ?) RETURNING id',
-            (name, secrets.token_urlsafe(9), int(allow_training_data), g.user['email'])
+            # New organizations start in shadow mode: the AI only recommends until Neuzem switches them to automatic.
+            'INSERT INTO Organizations (name, join_code, allow_training_data, created_by, approval_mode) VALUES (?, ?, ?, ?, ?) RETURNING id',
+            (name, secrets.token_urlsafe(9), int(allow_training_data), g.user['email'], 'shadow')
         ).fetchall()[0][0]
         conn.execute(
             'INSERT INTO Users (email, role, status, organization_id) VALUES (?, ?, ?, ?)',
             (email, 'SuperAdmin', 'Approved_Awaiting_Password', organization_id)
         )
         record_event(conn, 'organization.created', organization_id=organization_id, actor=g.user['email'],
-                     details={'name': name, 'super_admin_email': email, 'allow_training_data': allow_training_data})
+                     details={'name': name, 'super_admin_email': email, 'allow_training_data': allow_training_data,
+                              'approval_mode': 'shadow'})
         conn.commit()
         # The setup link goes only to the Super Admin's inbox, so Neuzem never knows their password.
         setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
@@ -1167,6 +1190,10 @@ def platform_update_organization():
         if data['status'] not in ORGANIZATION_STATUSES:
             return jsonify({'error': 'status must be Active or Paused.'}), 400
         changes['status'] = data['status']
+    if 'approval_mode' in data:
+        if data['approval_mode'] not in APPROVAL_MODES:
+            return jsonify({'error': 'approval_mode must be shadow or automatic.'}), 400
+        changes['approval_mode'] = data['approval_mode']
     if 'allow_training_data' in data:
         if not isinstance(data['allow_training_data'], bool):
             return jsonify({'error': 'allow_training_data must be true or false.'}), 400
@@ -1287,10 +1314,45 @@ def current_organization():
 
     # Admins approve access requests, so only they hand out the join link.
     is_admin = g.user['role'] in ('Admin', 'SuperAdmin')
-    return jsonify({
+    body = {
         'name': organization['name'],
         'join_link': f"{public_base_url()}/join/{quote(organization['join_code'], safe='')}" if is_admin else None,
-    })
+    }
+    # Employees never see the thresholds, so nobody can tune requests to slip past them.
+    if is_admin:
+        body['approval_settings'] = {
+            'approval_mode': g.user['approval_mode'],
+            'auto_approve_above': organization_auto_approve_threshold(g.user),
+            'minimum_auto_approve_above': AUTO_APPROVE_THRESHOLD,
+            'maximum_auto_approve_above': AUTO_APPROVE_THRESHOLD_MAX,
+        }
+    return jsonify(body)
+
+@app.route('/api/auth/update_approval_settings', methods=['POST'])
+@require_role('SuperAdmin')
+def update_approval_settings():
+    data = request.get_json(silent=True) or {}
+    if 'approval_mode' in data:
+        return jsonify({'error': 'Only Neuzem can switch an organization between shadow and automatic approval.'}), 403
+
+    value = data.get('auto_approve_above')
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not AUTO_APPROVE_THRESHOLD <= value <= AUTO_APPROVE_THRESHOLD_MAX):
+        return jsonify({
+            'error': f'The auto-approval threshold must be between {AUTO_APPROVE_THRESHOLD:.0%} and {AUTO_APPROVE_THRESHOLD_MAX:.0%}.'
+        }), 400
+    value = round(float(value), 4)
+    previous = organization_auto_approve_threshold(g.user)
+
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE Organizations SET auto_approve_above = ? WHERE id = ?', (value, g.user['organization_id']))
+        record_event(conn, 'settings.updated', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'auto_approve_above': {'from': previous, 'to': value}})
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'auto_approve_above': value})
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")

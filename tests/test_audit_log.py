@@ -172,6 +172,8 @@ def test_platform_actions_are_recorded(app_db, monkeypatch):
     recorded = events(app_db)
     assert [e['action'] for e in recorded] == ['organization.created', 'organization.updated', 'model.activated', 'model.retrain_started']
     assert {e['actor_email'] for e in recorded} == {'founder@neuzem.test'}
-    assert recorded[0]['details'] == {'name': 'Acme Pvt Ltd', 'super_admin_email': 'boss@acme.test', 'allow_training_data': False}
+    assert recorded[0]['details'] == {
+        'name': 'Acme Pvt Ltd', 'super_admin_email': 'boss@acme.test', 'allow_training_data': False, 'approval_mode': 'shadow',
+    }
     assert recorded[1]['details'] == {'changes': {'status': 'Paused'}}
     assert (recorded[2]['organization_id'], recorded[2]['details']) == (None, {'version_id': None})

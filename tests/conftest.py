@@ -105,10 +105,10 @@ def execute(module, sql, params=()):
         conn.close()
 
 
-def create_organization(module, name, status='Active'):
+def create_organization(module, name, status='Active', approval_mode='automatic'):
     rows = execute(
-        module, 'INSERT INTO Organizations (name, join_code, status) VALUES (?, ?, ?) RETURNING id',
-        (name, secrets.token_urlsafe(9), status)
+        module, 'INSERT INTO Organizations (name, join_code, status, approval_mode) VALUES (?, ?, ?, ?) RETURNING id',
+        (name, secrets.token_urlsafe(9), status, approval_mode)
     )
     return rows[0][0]
 

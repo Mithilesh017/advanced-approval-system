@@ -168,12 +168,14 @@
         }
       };
 
+      const loadOrganization = () => fetch('/api/auth/organization', { credentials: 'include' })
+        .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+        .then(data => { if (data) setOrganization(data); })
+        .catch(() => {});
+
       useEffect(() => {
         loadData();
-        fetch('/api/auth/organization', { credentials: 'include' })
-          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
-          .then(data => { if (data) setOrganization(data); })
-          .catch(() => {});
+        loadOrganization();
       }, []);
 
       const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
@@ -243,6 +245,11 @@
               <li>
                 <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
               </li>
+              {user.role === 'SuperAdmin' && (
+                <li>
+                  <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}><i className="fas fa-sliders"></i> Approval Settings</button>
+                </li>
+              )}
               <li>
                 <button onClick={() => Swal.fire('About', 'Approval Management System Version 2.0', 'info')}><i className="fas fa-info-circle"></i> About App</button>
               </li>
@@ -262,6 +269,7 @@
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
                 {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
                 {view === 'users' && <><i className="fas fa-users-cog"></i> Manage Users</>}
+                {view === 'settings' && <><i className="fas fa-sliders"></i> Approval Settings</>}
                 {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
               </h2>
               <div className="user-welcome">Welcome, {user.email}</div>
@@ -282,6 +290,7 @@
             }
             {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
             {view === 'profile' && <ProfileView user={user} />}
+            {user.role === 'SuperAdmin' && view === 'settings' && <SettingsView organization={organization} onSaved={loadOrganization} />}
           </div>
         </div>
       );
@@ -901,6 +910,83 @@
               )}
             </>
           )}
+        </div>
+      );
+    }
+
+    function SettingsView({ organization, onSaved }) {
+      const settings = organization && organization.approval_settings;
+      const [percent, setPercent] = useState('');
+      const [saving, setSaving] = useState(false);
+
+      useEffect(() => {
+        if (settings) setPercent(String(Math.round(settings.auto_approve_above * 100)));
+      }, [settings && settings.auto_approve_above]);
+
+      if (!settings) {
+        return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading approval settings...</div></div>;
+      }
+
+      const minimum = Math.round(settings.minimum_auto_approve_above * 100);
+      const maximum = Math.round(settings.maximum_auto_approve_above * 100);
+      const shadow = settings.approval_mode === 'shadow';
+
+      const handleSave = async (e) => {
+        e.preventDefault();
+        const value = Number(percent);
+        if (!Number.isInteger(value) || value < minimum || value > maximum) {
+          Swal.fire({ icon: 'error', title: 'Invalid Threshold', text: `Enter a whole number from ${minimum} to ${maximum}.` });
+          return;
+        }
+        setSaving(true);
+        try {
+          const res = await fetch('/api/auth/update_approval_settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ auto_approve_above: value / 100 }),
+            credentials: 'include'
+          });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The settings could not be saved.');
+          await onSaved();
+          Swal.fire({ icon: 'success', title: 'Settings Saved', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Save Failed', text: err.message });
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      return (
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-sliders"></i> Approval Settings</h3>
+          <p className="panel-subtitle">Every change here is saved in the audit log.</p>
+
+          <div className={`callout ${shadow ? 'callout-warning' : 'callout-info'}`}>
+            <i className={`fas ${shadow ? 'fa-eye' : 'fa-bolt'}`} aria-hidden="true"></i>
+            <div>
+              <strong>{shadow ? 'Shadow mode' : 'Automatic approval'}</strong>
+              {shadow
+                ? 'The AI only recommends. A person decides every request.'
+                : 'Requests the AI is confident about are approved without waiting for a person.'}
+              <div className="callout-meta">Neuzem sets the approval mode for your organization.</div>
+            </div>
+          </div>
+
+          <form onSubmit={handleSave} className="profile-form">
+            <div className="form-group">
+              <label htmlFor="auto-approve-above">Auto-approve when the AI approval score is above (%)</label>
+              <input id="auto-approve-above" type="number" min={minimum} max={maximum} step="1" value={percent} onChange={e => setPercent(e.target.value)} required />
+              <small className="field-hint">
+                You can raise this up to {maximum}% so fewer requests are approved automatically. It cannot go below {minimum}%.
+                {shadow ? ' It takes effect once your organization uses automatic approval.' : ''}
+              </small>
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={saving}>
+              {saving ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Settings</span>}
+            </button>
+          </form>
         </div>
       );
     }
