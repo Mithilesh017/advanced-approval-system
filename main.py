@@ -77,7 +77,7 @@ def require_login(fn):
         try:
             user = conn.execute(
                 'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, '
-                'Organizations.status AS organization_status '
+                'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
             ).fetchone()
@@ -177,6 +177,17 @@ def to_json_row(row):
         result[key] = value
     return result
 
+def record_event(conn, action, *, organization_id=None, request_id=None, actor=None,
+                 from_status=None, to_status=None, comment=None, details=None):
+    # The audit log is append-only: the database itself refuses to change or delete these rows.
+    # Callers write the event in the same transaction as the change it describes.
+    conn.execute(
+        'INSERT INTO AuditEvents (organization_id, request_id, actor_email, action, from_status, to_status, comment, details) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (organization_id, request_id, actor, action, from_status, to_status, comment,
+         json.dumps(details) if details is not None else None)
+    )
+
 # ==========================================
 # 1. AUTHENTICATION & DATABASE CONFIGURATION
 # ==========================================
@@ -235,6 +246,11 @@ class PostgresWrapper:
 # At most one organization can be the default, even when several workers start at once.
 ORGANIZATIONS_SINGLE_DEFAULT_INDEX = (
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_single_default ON Organizations (is_default) WHERE is_default = 1'
+)
+
+AUDIT_EVENT_INDEXES = (
+    'CREATE INDEX IF NOT EXISTS idx_audit_events_request ON AuditEvents (request_id)',
+    'CREATE INDEX IF NOT EXISTS idx_audit_events_organization ON AuditEvents (organization_id)',
 )
 
 def init_db():
@@ -312,6 +328,52 @@ def init_db():
             )
         ''')
         cursor.execute(ORGANIZATIONS_SINGLE_DEFAULT_INDEX)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS AuditEvents (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER REFERENCES Organizations(id),
+                request_id INTEGER REFERENCES Requests(id),
+                actor_email TEXT,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                comment TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'reject_audit_event_changes') THEN
+                    CREATE FUNCTION reject_audit_event_changes() RETURNS trigger AS $body$
+                    BEGIN
+                        RAISE EXCEPTION 'Audit events cannot be changed or deleted';
+                    END;
+                    $body$ LANGUAGE plpgsql;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'audit_events_append_only') THEN
+                    CREATE TRIGGER audit_events_append_only BEFORE UPDATE OR DELETE ON AuditEvents
+                        FOR EACH ROW EXECUTE FUNCTION reject_audit_event_changes();
+                END IF;
+            END
+            $$
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS PolicyRules (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                rule_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                config TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
+        for statement in AUDIT_EVENT_INDEXES:
+            cursor.execute(statement)
         conn.commit()
         conn.close()
     else:
@@ -382,6 +444,42 @@ def init_db():
             )
         ''')
         cursor.execute(ORGANIZATIONS_SINGLE_DEFAULT_INDEX)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS AuditEvents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER REFERENCES Organizations(id),
+                request_id INTEGER REFERENCES Requests(id),
+                actor_email TEXT,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                comment TEXT,
+                details TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        for operation in ('UPDATE', 'DELETE'):
+            cursor.execute(f'''
+                CREATE TRIGGER IF NOT EXISTS audit_events_no_{operation.lower()} BEFORE {operation} ON AuditEvents
+                BEGIN
+                    SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted');
+                END
+            ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS PolicyRules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                rule_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                config TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_policy_rules_organization ON PolicyRules (organization_id)')
+        for statement in AUDIT_EVENT_INDEXES:
+            cursor.execute(statement)
         conn.commit()
         conn.close()
 
@@ -390,6 +488,10 @@ REQUEST_EXTRA_COLUMNS = {
     'employee_id': 'TEXT',
     'reviewed_by': 'TEXT',
     'reviewed_at': 'TIMESTAMP',
+    # What the AI decided on its own and the approval mode in force, kept to measure agreement with people.
+    'ai_decision': 'TEXT',
+    'approval_mode': 'TEXT',
+    'policy_violations': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -405,6 +507,8 @@ def check_and_add_columns():
         for table in ORGANIZATION_SCOPED_TABLES:
             cursor.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES Organizations(id)')
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
         conn.commit()
         conn.close()
         return
@@ -435,6 +539,12 @@ def check_and_add_columns():
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN organization_id INTEGER REFERENCES Organizations(id)")
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)")
 
+    cursor.execute("PRAGMA table_info(Organizations)")
+    organization_columns = {col[1] for col in cursor.fetchall()}
+    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL')):
+        if column not in organization_columns:
+            cursor.execute(f"ALTER TABLE Organizations ADD COLUMN {column} {column_type}")
+
     conn.commit()
     conn.close()
 
@@ -455,8 +565,9 @@ def ensure_default_organization():
     conn = get_db_connection()
     try:
         conn.execute(
-            'INSERT INTO Organizations (name, join_code, allow_training_data, is_default) VALUES (?, ?, 1, 1) ON CONFLICT DO NOTHING',
-            (DEFAULT_ORGANIZATION_NAME, secrets.token_urlsafe(9))
+            'INSERT INTO Organizations (name, join_code, allow_training_data, is_default, approval_mode) VALUES (?, ?, 1, 1, ?) '
+            'ON CONFLICT DO NOTHING',
+            (DEFAULT_ORGANIZATION_NAME, secrets.token_urlsafe(9), 'automatic')
         )
         organization_id = conn.execute('SELECT id FROM Organizations WHERE is_default = 1').fetchone()['id']
         # Platform Owners are the only accounts that belong to no organization.
@@ -464,6 +575,8 @@ def ensure_default_organization():
             'UPDATE Users SET organization_id = ? WHERE organization_id IS NULL AND role != ?', (organization_id, PLATFORM_OWNER_ROLE)
         )
         conn.execute('UPDATE Requests SET organization_id = ? WHERE organization_id IS NULL', (organization_id,))
+        # Organizations created before approval modes existed keep automatic approval; new ones start in shadow mode.
+        conn.execute("UPDATE Organizations SET approval_mode = 'automatic' WHERE approval_mode IS NULL")
         conn.commit()
     finally:
         conn.close()
@@ -511,7 +624,7 @@ MODEL_VERSIONS_KEPT = 5
 TRAINING_JOB_STALE_AFTER = timedelta(minutes=30)
 
 _model_lock = threading.Lock()
-_model_state = {'artifacts': None, 'version_id': None, 'checked_at': None}
+_model_state = {'artifacts': None, 'version_id': None, 'checked_at': None, 'unloadable_version_id': None}
 _bundled_artifacts = None
 
 def load_bundled_artifacts():
@@ -536,13 +649,24 @@ def get_active_model(force=False):
             try:
                 row = conn.execute('SELECT id FROM ModelVersions WHERE is_active = 1 ORDER BY id DESC LIMIT 1').fetchone()
                 version_id = row['id'] if row else None
+                if version_id != _model_state['unloadable_version_id']:
+                    _model_state['unloadable_version_id'] = None
+
                 if version_id is None:
                     artifacts = load_bundled_artifacts()
                 elif version_id == _model_state['version_id'] and _model_state['artifacts'] is not None:
                     artifacts = _model_state['artifacts']
+                elif version_id == _model_state['unloadable_version_id'] and not force:
+                    # This version already failed to load, so keep using the original model without retrying on every refresh.
+                    artifacts, version_id = load_bundled_artifacts(), None
                 else:
                     blob = conn.execute('SELECT artifact FROM ModelVersions WHERE id = ?', (version_id,)).fetchone()['artifact']
-                    artifacts = joblib.load(io.BytesIO(bytes(blob)))
+                    try:
+                        artifacts = joblib.load(io.BytesIO(bytes(blob)))
+                    except Exception:
+                        app.logger.exception('Model version %s could not be loaded; the original model is scoring requests instead', version_id)
+                        _model_state['unloadable_version_id'] = version_id
+                        artifacts, version_id = load_bundled_artifacts(), None
             finally:
                 conn.close()
             _model_state.update(artifacts=artifacts, version_id=version_id)
@@ -573,6 +697,193 @@ exchange_rates = {
 
 AUTO_APPROVE_THRESHOLD = 0.8
 ESCALATE_THRESHOLD = 0.2
+# Organizations may raise their auto-approval threshold up to this value, but never below the default.
+AUTO_APPROVE_THRESHOLD_MAX = 0.99
+APPROVAL_MODES = ('shadow', 'automatic')
+
+def organization_auto_approve_threshold(organization):
+    value = organization.get('auto_approve_above')
+    return AUTO_APPROVE_THRESHOLD if value is None else max(AUTO_APPROVE_THRESHOLD, float(value))
+
+
+# ==========================================
+# POLICY RULES
+# ==========================================
+POLICY_RULE_TYPES = ('amount_limit', 'duplicate_request', 'always_review')
+POLICY_REVIEW_FIELDS = {'request_type': 'Request type', 'destination': 'Destination', 'role': 'Role', 'department': 'Department'}
+POLICY_RULES_PER_ORGANIZATION = 100
+POLICY_TEXT_MAX_LENGTH = 100
+
+def validate_policy_config(rule_type, config):
+    """Returns (clean config, None) for a valid rule configuration, or (None, error message)."""
+    if not isinstance(config, dict):
+        return None, 'config must be an object.'
+
+    if rule_type == 'amount_limit':
+        texts = {}
+        for key in ('role', 'request_type'):
+            value = config.get(key)
+            if value is not None and (not isinstance(value, str) or len(value.strip()) > POLICY_TEXT_MAX_LENGTH):
+                return None, f'{key} must be text of at most {POLICY_TEXT_MAX_LENGTH} characters, or empty for any.'
+            texts[key] = value.strip() if value and value.strip() else None
+        limit = config.get('max_amount_inr')
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or not 0 < limit <= 1_000_000_000:
+            return None, 'max_amount_inr must be a positive amount in INR.'
+        return {**texts, 'max_amount_inr': float(limit)}, None
+
+    if rule_type == 'duplicate_request':
+        days = config.get('window_days')
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 90:
+            return None, 'window_days must be a whole number from 1 to 90.'
+        return {'window_days': days}, None
+
+    field, values = config.get('field'), config.get('values')
+    if not isinstance(field, str) or field not in POLICY_REVIEW_FIELDS:
+        return None, f"field must be one of: {', '.join(POLICY_REVIEW_FIELDS)}."
+    if (not isinstance(values, list) or not 1 <= len(values) <= 50
+            or not all(isinstance(v, str) and v.strip() and len(v.strip()) <= POLICY_TEXT_MAX_LENGTH for v in values)):
+        return None, f'values must list 1 to 50 texts of at most {POLICY_TEXT_MAX_LENGTH} characters.'
+    return {'field': field, 'values': sorted({v.strip() for v in values})}, None
+
+def text_matches(expected, actual):
+    return not expected or str(actual or '').strip().lower() == expected.lower()
+
+def policy_rule_reason(conn, rule_type, config, organization_id, submitter, fields):
+    if rule_type == 'amount_limit':
+        covered = text_matches(config.get('role'), fields['role']) and text_matches(config.get('request_type'), fields['request_type'])
+        if covered and fields['amount_inr'] > config['max_amount_inr']:
+            return f"Amount ₹{fields['amount_inr']:,.0f} is above the ₹{config['max_amount_inr']:,.0f} limit."
+    elif rule_type == 'duplicate_request':
+        since = (datetime.utcnow() - timedelta(days=config['window_days'])).strftime('%Y-%m-%d %H:%M:%S')
+        earlier = conn.execute(
+            'SELECT COUNT(*) AS total FROM Requests WHERE organization_id = ? AND submitted_by = ? AND request_type = ? '
+            'AND amount = ? AND currency = ? AND created_at >= ?',
+            (organization_id, submitter, fields['request_type'], fields['amount'], fields['currency'], since)
+        ).fetchone()['total']
+        if earlier:
+            return f"The same employee submitted this request type and amount within the last {config['window_days']} days."
+    elif rule_type == 'always_review':
+        value = str(fields[config['field']] or '').strip()
+        if value.lower() in {v.lower() for v in config['values']}:
+            return f'{POLICY_REVIEW_FIELDS[config["field"]]} "{value}" always needs review.'
+    return None
+
+def policy_violations(conn, organization_id, submitter, fields):
+    rules = conn.execute(
+        'SELECT id, rule_type, name, config FROM PolicyRules WHERE organization_id = ? AND is_active = 1 ORDER BY id',
+        (organization_id,)
+    ).fetchall()
+    violations = []
+    for rule in rules:
+        reason = policy_rule_reason(conn, rule['rule_type'], json.loads(rule['config']), organization_id, submitter, fields)
+        if reason:
+            violations.append({'rule_id': rule['id'], 'name': rule['name'], 'reason': reason})
+    return violations
+
+def policy_rule_json(row):
+    rule = to_json_row(row)
+    rule['config'] = json.loads(rule['config'])
+    rule['is_active'] = bool(rule['is_active'])
+    return rule
+
+def clean_rule_name(value):
+    name = ' '.join(value.split()) if isinstance(value, str) else ''
+    return name if 2 <= len(name) <= 120 else None
+
+@app.route('/api/auth/policy_rules', methods=['GET'])
+@require_role('Admin')
+def list_policy_rules():
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT id, rule_type, name, config, is_active, created_by, created_at FROM PolicyRules '
+            'WHERE organization_id = ? ORDER BY is_active DESC, id',
+            (g.user['organization_id'],)
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({'rules': [policy_rule_json(row) for row in rows]})
+
+@app.route('/api/auth/create_policy_rule', methods=['POST'])
+@require_role('SuperAdmin')
+def create_policy_rule():
+    data = request.get_json(silent=True) or {}
+    rule_type = data.get('rule_type')
+    if not isinstance(rule_type, str) or rule_type not in POLICY_RULE_TYPES:
+        return jsonify({'error': f"rule_type must be one of: {', '.join(POLICY_RULE_TYPES)}."}), 400
+    name = clean_rule_name(data.get('name'))
+    if not name:
+        return jsonify({'error': 'Give the rule a name of 2 to 120 characters.'}), 400
+    config, error = validate_policy_config(rule_type, data.get('config'))
+    if error:
+        return jsonify({'error': error}), 400
+
+    conn = get_db_connection()
+    try:
+        active = conn.execute(
+            'SELECT COUNT(*) AS total FROM PolicyRules WHERE organization_id = ? AND is_active = 1', (g.user['organization_id'],)
+        ).fetchone()['total']
+        if active >= POLICY_RULES_PER_ORGANIZATION:
+            return jsonify({'error': f'An organization can have at most {POLICY_RULES_PER_ORGANIZATION} active rules. Turn off rules you no longer need.'}), 409
+        rule_id = conn.execute(
+            'INSERT INTO PolicyRules (organization_id, rule_type, name, config, created_by) VALUES (?, ?, ?, ?, ?) RETURNING id',
+            (g.user['organization_id'], rule_type, name, json.dumps(config), g.user['email'])
+        ).fetchall()[0][0]
+        record_event(conn, 'policy_rule.created', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'rule_id': rule_id, 'rule_type': rule_type, 'name': name, 'config': config})
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'rule_id': rule_id}), 201
+
+@app.route('/api/auth/update_policy_rule', methods=['POST'])
+@require_role('SuperAdmin')
+def update_policy_rule():
+    # Rules are never deleted, only turned off, so every request's recorded violations still point at a real rule.
+    data = request.get_json(silent=True) or {}
+    rule_id = data.get('id')
+    if isinstance(rule_id, bool) or not isinstance(rule_id, int):
+        return jsonify({'error': 'id must be a rule number.'}), 400
+
+    conn = get_db_connection()
+    try:
+        rule = conn.execute(
+            'SELECT id, rule_type, name, config, is_active FROM PolicyRules WHERE id = ? AND organization_id = ?',
+            (rule_id, g.user['organization_id'])
+        ).fetchone()
+        if not rule:
+            return jsonify({'error': 'Policy rule not found.'}), 404
+
+        before = {'name': rule['name'], 'config': json.loads(rule['config']), 'is_active': bool(rule['is_active'])}
+        after = dict(before)
+        if not any(key in data for key in after):
+            return jsonify({'error': 'Nothing to update.'}), 400
+        if 'name' in data:
+            after['name'] = clean_rule_name(data['name'])
+            if not after['name']:
+                return jsonify({'error': 'Give the rule a name of 2 to 120 characters.'}), 400
+        if 'config' in data:
+            after['config'], error = validate_policy_config(rule['rule_type'], data['config'])
+            if error:
+                return jsonify({'error': error}), 400
+        if 'is_active' in data:
+            if not isinstance(data['is_active'], bool):
+                return jsonify({'error': 'is_active must be true or false.'}), 400
+            after['is_active'] = data['is_active']
+
+        changed = [key for key in after if after[key] != before[key]]
+        if changed:
+            conn.execute(
+                'UPDATE PolicyRules SET name = ?, config = ?, is_active = ? WHERE id = ? AND organization_id = ?',
+                (after['name'], json.dumps(after['config']), int(after['is_active']), rule['id'], g.user['organization_id'])
+            )
+            record_event(conn, 'policy_rule.updated', organization_id=g.user['organization_id'], actor=g.user['email'],
+                         details={'rule_id': rule['id'], 'from': {key: before[key] for key in changed},
+                                  'to': {key: after[key] for key in changed}})
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
 
 
 # ==========================================
@@ -604,7 +915,7 @@ def join_page(code):
 @limiter.limit("20 per minute")
 @require_login
 def predict():
-    artifacts, _ = get_active_model()
+    artifacts, model_version_id = get_active_model()
     if artifacts is None:
         return jsonify({
             'error': 'The AI model is currently unavailable. Please try again later.',
@@ -681,30 +992,67 @@ def predict():
         iso_pred = int(iso_forest.predict(X_input)[0])
         svm_pred = int(oc_svm.predict(X_input)[0])
         is_severe_anomaly = (iso_pred == -1) or (svm_pred == -1)
+
+        # SHAP values show administrators which fields pushed the score up or down.
+        shap_values = artifacts['shap_explainer'].shap_values(X_input)
+        shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
         
+        auto_approve_above = organization_auto_approve_threshold(g.user)
+
         # Decision Routing Logic (Confidence Based Triage)
         if is_unknown_category:
             status = "ESCALATED_UNKNOWN"
         elif is_severe_anomaly:
             status = "ESCALATED_ANOMALY"
-        elif xgb_prob > AUTO_APPROVE_THRESHOLD:
+        elif xgb_prob > auto_approve_above:
             status = "APPROVED"
         elif xgb_prob < ESCALATE_THRESHOLD:
             status = "ESCALATED_POLICY"
         else:
             status = "ESCALATED_MANUAL_REVIEW"
 
+        # In shadow mode the AI only recommends, so a request it would approve still waits for a person.
+        # Any mode other than an explicit "automatic" is treated as shadow, so a bad value never auto-approves.
+        ai_decision = status
+        approval_mode = 'automatic' if g.user['approval_mode'] == 'automatic' else 'shadow'
+        if approval_mode == 'shadow' and ai_decision == 'APPROVED':
+            status = 'ESCALATED_SHADOW'
+
         # Persist to DB
         conn = get_db_connection()
-        conn.execute(
+        # Company policy rules are checked before anything is saved. A broken rule always sends the request to a
+        # person; rules never approve or reject on their own, and the AI's own decision is still recorded.
+        violations = policy_violations(conn, g.user['organization_id'], current_email, {
+            'role': role, 'department': department, 'request_type': req_type, 'destination': destination,
+            'amount': amount, 'currency': currency, 'amount_inr': normalized_inr,
+        })
+        if violations:
+            status = 'ESCALATED_RULE'
+        request_id = conn.execute(
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
-                final_decision, submitted_by, employee_name, employee_id, organization_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode,
+                policy_violations
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
-             status, current_email, employee_name, employee_id, g.user['organization_id'])
+             status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode,
+             json.dumps(violations) if violations else None)
+        ).fetchall()[0][0]
+        record_event(
+            conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
+            actor=current_email, to_status=status, details={
+                'model_version': model_version_id,
+                'approval_mode': approval_mode,
+                'ai_recommendation': ai_decision,
+                'policy_violations': violations,
+                'approval_score': round(xgb_prob, 4),
+                'unrecognized_category': is_unknown_category,
+                'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
+                'thresholds': {'auto_approve_above': auto_approve_above, 'escalate_below': ESCALATE_THRESHOLD},
+                'explanation': shap_impact,
+            }
         )
         conn.commit()
         conn.close()
@@ -744,6 +1092,10 @@ def model_info():
     return jsonify({
         'ready': True,
         'version_id': version_id,
+        'load_problem': (
+            f"Version {_model_state['unloadable_version_id']} is marked active but could not be loaded, so the original model "
+            'is scoring requests. Switch to a working version or retrain the model.'
+        ) if _model_state['unloadable_version_id'] is not None else None,
         'components': [
             {'name': 'XGBoost classifier', 'purpose': 'Scores how likely a request is to be approved'},
             {'name': 'Isolation Forest', 'purpose': 'Flags requests with unusual patterns'},
@@ -901,6 +1253,7 @@ def retrain_model():
         "INSERT INTO TrainingJobs (status, step, started_by) VALUES ('running', 'queued', ?) RETURNING id",
         (started_by,)
     ).fetchall()[0][0]
+    record_event(conn, 'model.retrain_started', actor=started_by, details={'job_id': job_id})
     conn.commit()
     conn.close()
 
@@ -961,6 +1314,7 @@ def activate_model_version():
             conn.close()
             return jsonify({'error': 'Model version not found.'}), 404
         conn.execute('UPDATE ModelVersions SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END', (version_id,))
+    record_event(conn, 'model.activated', actor=g.user['email'], details={'version_id': version_id})
     conn.commit()
     conn.close()
 
@@ -980,7 +1334,7 @@ def platform_organizations():
     conn = get_db_connection()
     try:
         organizations = conn.execute(
-            "SELECT id, name, status, allow_training_data, is_default, created_by, created_at, "
+            "SELECT id, name, status, allow_training_data, is_default, created_by, created_at, approval_mode, auto_approve_above, "
             "(SELECT COUNT(*) FROM Users WHERE Users.organization_id = Organizations.id AND Users.status = 'Active') AS active_users, "
             "(SELECT COUNT(*) FROM Requests WHERE Requests.organization_id = Organizations.id) AS requests "
             "FROM Organizations ORDER BY is_default DESC, name"
@@ -998,6 +1352,7 @@ def platform_organizations():
         organization = to_json_row(row)
         organization['allow_training_data'] = bool(organization['allow_training_data'])
         organization['is_default'] = bool(organization['is_default'])
+        organization['auto_approve_above'] = organization_auto_approve_threshold(organization)
         organization['super_admins'] = contacts.get(row['id'], [])
         result.append(organization)
     return jsonify({'organizations': result})
@@ -1026,13 +1381,17 @@ def platform_create_organization():
             return jsonify({'error': 'This email already has an account. Each email can belong to only one organization.'}), 409
 
         organization_id = conn.execute(
-            'INSERT INTO Organizations (name, join_code, allow_training_data, created_by) VALUES (?, ?, ?, ?) RETURNING id',
-            (name, secrets.token_urlsafe(9), int(allow_training_data), g.user['email'])
+            # New organizations start in shadow mode: the AI only recommends until Neuzem switches them to automatic.
+            'INSERT INTO Organizations (name, join_code, allow_training_data, created_by, approval_mode) VALUES (?, ?, ?, ?, ?) RETURNING id',
+            (name, secrets.token_urlsafe(9), int(allow_training_data), g.user['email'], 'shadow')
         ).fetchall()[0][0]
         conn.execute(
             'INSERT INTO Users (email, role, status, organization_id) VALUES (?, ?, ?, ?)',
             (email, 'SuperAdmin', 'Approved_Awaiting_Password', organization_id)
         )
+        record_event(conn, 'organization.created', organization_id=organization_id, actor=g.user['email'],
+                     details={'name': name, 'super_admin_email': email, 'allow_training_data': allow_training_data,
+                              'approval_mode': 'shadow'})
         conn.commit()
         # The setup link goes only to the Super Admin's inbox, so Neuzem never knows their password.
         setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
@@ -1061,6 +1420,10 @@ def platform_update_organization():
         if data['status'] not in ORGANIZATION_STATUSES:
             return jsonify({'error': 'status must be Active or Paused.'}), 400
         changes['status'] = data['status']
+    if 'approval_mode' in data:
+        if data['approval_mode'] not in APPROVAL_MODES:
+            return jsonify({'error': 'approval_mode must be shadow or automatic.'}), 400
+        changes['approval_mode'] = data['approval_mode']
     if 'allow_training_data' in data:
         if not isinstance(data['allow_training_data'], bool):
             return jsonify({'error': 'allow_training_data must be true or false.'}), 400
@@ -1078,6 +1441,8 @@ def platform_update_organization():
         # Column names come from the fixed keys above, never from the request.
         assignments = ', '.join(f'{column} = ?' for column in changes)
         conn.execute(f'UPDATE Organizations SET {assignments} WHERE id = ?', (*changes.values(), organization_id))
+        record_event(conn, 'organization.updated', organization_id=organization_id, actor=g.user['email'],
+                     details={'changes': {column: data[column] for column in changes}})
         conn.commit()
     finally:
         conn.close()
@@ -1179,10 +1544,45 @@ def current_organization():
 
     # Admins approve access requests, so only they hand out the join link.
     is_admin = g.user['role'] in ('Admin', 'SuperAdmin')
-    return jsonify({
+    body = {
         'name': organization['name'],
         'join_link': f"{public_base_url()}/join/{quote(organization['join_code'], safe='')}" if is_admin else None,
-    })
+    }
+    # Employees never see the thresholds, so nobody can tune requests to slip past them.
+    if is_admin:
+        body['approval_settings'] = {
+            'approval_mode': g.user['approval_mode'],
+            'auto_approve_above': organization_auto_approve_threshold(g.user),
+            'minimum_auto_approve_above': AUTO_APPROVE_THRESHOLD,
+            'maximum_auto_approve_above': AUTO_APPROVE_THRESHOLD_MAX,
+        }
+    return jsonify(body)
+
+@app.route('/api/auth/update_approval_settings', methods=['POST'])
+@require_role('SuperAdmin')
+def update_approval_settings():
+    data = request.get_json(silent=True) or {}
+    if 'approval_mode' in data:
+        return jsonify({'error': 'Only Neuzem can switch an organization between shadow and automatic approval.'}), 403
+
+    value = data.get('auto_approve_above')
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not AUTO_APPROVE_THRESHOLD <= value <= AUTO_APPROVE_THRESHOLD_MAX):
+        return jsonify({
+            'error': f'The auto-approval threshold must be between {AUTO_APPROVE_THRESHOLD:.0%} and {AUTO_APPROVE_THRESHOLD_MAX:.0%}.'
+        }), 400
+    value = round(float(value), 4)
+    previous = organization_auto_approve_threshold(g.user)
+
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE Organizations SET auto_approve_above = ? WHERE id = ?', (value, g.user['organization_id']))
+        record_event(conn, 'settings.updated', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'auto_approve_above': {'from': previous, 'to': value}})
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'auto_approve_above': value})
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
@@ -1335,6 +1735,9 @@ def delete_user():
         return jsonify({'status': 'ERROR', 'message': 'Admins can only remove employee accounts.'}), 403
 
     cursor = conn.execute('DELETE FROM Users WHERE email = ? AND organization_id = ?', (email, g.user['organization_id']))
+    if cursor.rowcount:
+        record_event(conn, 'user.deleted', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'email': email, 'role': target['role'] if target else None})
     conn.commit()
     conn.close()
     
@@ -1368,6 +1771,9 @@ def approve_user():
         'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending" AND organization_id = ?',
         ('Approved_Awaiting_Password', email, g.user['organization_id'])
     )
+    if cursor.rowcount:
+        record_event(conn, 'user.approved', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'email': email, 'role': target['role']})
     conn.commit()
     
     if cursor.rowcount > 0:
@@ -1409,6 +1815,9 @@ def reject_user():
         'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending" AND organization_id = ?',
         ('Rejected', email, g.user['organization_id'])
     )
+    if cursor.rowcount:
+        record_event(conn, 'user.rejected', organization_id=g.user['organization_id'], actor=g.user['email'],
+                     details={'email': email, 'role': target['role']})
     conn.commit()
     
     if cursor.rowcount > 0:
@@ -1504,16 +1913,22 @@ def is_awaiting_review(decision):
 def is_decided(decision):
     return decision in ('APPROVED', 'REJECTED')
 
-def change_request_decision(new_decision, allowed_from, conflict_message):
+COMMENT_MAX_LENGTH = 1000
+
+def change_request_decision(new_decision, allowed_from, conflict_message, action, reason_required=False):
     data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
         return jsonify({'error': 'Request ID is required'}), 400
+    comment = data.get('comment')
+    if comment is not None and not isinstance(comment, str):
+        return jsonify({'error': 'The comment must be text.'}), 400
+    comment = (comment or '').strip()[:COMMENT_MAX_LENGTH] or None
 
     conn = get_db_connection()
     try:
         target = conn.execute(
-            'SELECT submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            'SELECT id, submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
             (req_id, g.user['organization_id'])
         ).fetchone()
         if not target:
@@ -1522,17 +1937,24 @@ def change_request_decision(new_decision, allowed_from, conflict_message):
             return jsonify({'error': 'You cannot review your own request.'}), 403
         if not allowed_from(target['final_decision']):
             return jsonify({'error': conflict_message}), 409
+        if reason_required and not comment:
+            return jsonify({'error': 'Please give a reason. It is saved in the request history.'}), 400
 
         reviewer = g.user['email'] if is_decided(new_decision) else None
         # Matching the status that was checked stops two admins acting at once from overwriting each other.
         cursor = conn.execute(
             f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'} "
             'WHERE id = ? AND organization_id = ? AND final_decision = ?',
-            (new_decision, reviewer, req_id, g.user['organization_id'], target['final_decision'])
+            (new_decision, reviewer, target['id'], g.user['organization_id'], target['final_decision'])
         )
-        conn.commit()
         if not cursor.rowcount:
             return jsonify({'error': conflict_message}), 409
+        # The decision and its history entry are saved together, or neither is.
+        record_event(
+            conn, action, organization_id=g.user['organization_id'], request_id=target['id'], actor=g.user['email'],
+            from_status=target['final_decision'], to_status=new_decision, comment=comment
+        )
+        conn.commit()
     finally:
         conn.close()
     return jsonify({'status': 'SUCCESS'})
@@ -1540,19 +1962,50 @@ def change_request_decision(new_decision, allowed_from, conflict_message):
 @app.route('/api/auth/approve_request', methods=['POST'])
 @require_role('Admin')
 def approve_request():
-    return change_request_decision('APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.')
+    return change_request_decision(
+        'APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.', 'request.approved'
+    )
 
 @app.route('/api/auth/reject_request', methods=['POST'])
 @require_role('Admin')
 def reject_request():
-    return change_request_decision('REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.')
+    return change_request_decision(
+        'REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.', 'request.rejected', reason_required=True
+    )
 
 @app.route('/api/auth/reopen_request', methods=['POST'])
 @require_role('Admin')
 def reopen_request():
     return change_request_decision(
-        'ESCALATED_MANUAL_REVIEW', is_decided, 'Only approved or rejected requests can be moved back to pending.'
+        'ESCALATED_MANUAL_REVIEW', is_decided, 'Only approved or rejected requests can be moved back to pending.',
+        'request.reopened', reason_required=True
     )
+
+@app.route('/api/auth/request_history', methods=['GET'])
+@require_role('Admin')
+def request_history():
+    request_id = request.args.get('id', type=int)
+    if request_id is None:
+        return jsonify({'error': 'Request ID is required'}), 400
+
+    conn = get_db_connection()
+    try:
+        if not conn.execute('SELECT id FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])).fetchone():
+            return jsonify({'error': 'Request not found.'}), 404
+        rows = conn.execute(
+            'SELECT action, actor_email, from_status, to_status, comment, details, created_at FROM AuditEvents '
+            'WHERE request_id = ? AND organization_id = ? ORDER BY id',
+            (request_id, g.user['organization_id'])
+        ).fetchall()
+    finally:
+        conn.close()
+
+    events = []
+    for row in rows:
+        event = to_json_row(row)
+        event['details'] = json.loads(event['details']) if event['details'] else None
+        events.append(event)
+    return jsonify({'events': events})
 
 @app.route('/api/auth/request_password_reset', methods=['POST'])
 @limiter.limit("3 per hour")

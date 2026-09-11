@@ -69,6 +69,7 @@
                 <th>Active users</th>
                 <th>Requests</th>
                 <th>AI training data</th>
+                <th>Approval</th>
                 <th>Status</th>
                 <th>Action</th>
               </tr>
@@ -167,6 +168,16 @@
           () => updateOrganization(org, { allow_training_data: !sharing }))
       ]);
 
+      const automatic = org.approval_mode === 'automatic';
+      const approval = el('div', '', [
+        el('div', 'cell-actions', [
+          el('span', `badge ${automatic ? 'badge-accent' : 'badge-orange'}`, [automatic ? 'Automatic' : 'Shadow']),
+          button(automatic ? 'Use shadow' : 'Go automatic', automatic ? 'fa-eye' : 'fa-bolt', 'btn-secondary',
+            () => updateOrganization(org, { approval_mode: automatic ? 'shadow' : 'automatic' }))
+        ]),
+        el('div', 'cell-secondary', [automatic ? `Auto-approves above ${Math.round(org.auto_approve_above * 100)}%` : 'AI only recommends'])
+      ]);
+
       const active = org.status === 'Active';
       const action = org.is_default
         ? el('span', 'cell-muted', ['Always active'])
@@ -180,6 +191,7 @@
         el('td', '', [String(org.active_users)]),
         el('td', '', [String(org.requests)]),
         el('td', '', [training]),
+        el('td', '', [approval]),
         el('td', '', [el('span', `status-badge ${active ? 'status-approved' : 'status-rejected'}`, [org.status])]),
         el('td', '', [action])
       ]);
@@ -201,6 +213,16 @@
     }
 
     function confirmationFor(org, changes) {
+      if (changes.approval_mode === 'automatic') {
+        return {
+          titleText: `Turn on automatic approval for ${org.name}?`,
+          text: 'Requests the AI is confident about will be approved without a person. Only do this once the organization has agreed and its shadow-mode results look good.',
+          confirmButtonText: 'Go automatic'
+        };
+      }
+      if (changes.approval_mode === 'shadow') {
+        return { titleText: `Switch ${org.name} to shadow mode?`, text: 'The AI will only recommend. A person decides every request.', confirmButtonText: 'Use shadow mode' };
+      }
       if (changes.status === 'Paused') {
         return {
           titleText: `Pause ${org.name}?`,
@@ -425,6 +447,16 @@
             </div>
           </div>
 
+          {info && info.load_problem && (
+            <div className="callout callout-danger" role="alert">
+              <i className="fas fa-triangle-exclamation" aria-hidden="true"></i>
+              <div>
+                <strong>Active version could not be loaded</strong>
+                {info.load_problem}
+              </div>
+            </div>
+          )}
+
           <div className="panel">
             <h3 className="panel-title"><i className="fas fa-bolt"></i> Retrain Model</h3>
             <p className="panel-subtitle">
@@ -520,7 +552,7 @@
             <div className="panel">
               <h3 className="panel-title"><i className="fas fa-cogs"></i> Decision Pipeline</h3>
               <p className="panel-subtitle">
-                Requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% are auto-approved. Unknown categories, detected anomalies, and lower scores are escalated for manual review.
+                In organizations using automatic approval, requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% (or the organization's stricter threshold) are auto-approved. In shadow mode a person decides every request and the AI's recommendation is saved. Unknown categories, detected anomalies, and lower scores are always escalated for manual review.
               </p>
               <div className="table-scroll">
                 <table className="data-table">

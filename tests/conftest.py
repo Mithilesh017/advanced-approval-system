@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+import numpy as np
 import pytest
 from werkzeug.security import generate_password_hash
 
@@ -105,10 +106,10 @@ def execute(module, sql, params=()):
         conn.close()
 
 
-def create_organization(module, name, status='Active'):
+def create_organization(module, name, status='Active', approval_mode='automatic'):
     rows = execute(
-        module, 'INSERT INTO Organizations (name, join_code, status) VALUES (?, ?, ?) RETURNING id',
-        (name, secrets.token_urlsafe(9), status)
+        module, 'INSERT INTO Organizations (name, join_code, status, approval_mode) VALUES (?, ?, ?, ?) RETURNING id',
+        (name, secrets.token_urlsafe(9), status, approval_mode)
     )
     return rows[0][0]
 
@@ -142,6 +143,29 @@ def add_request(module, organization_id, submitted_by, final_decision='ESCALATED
         (department, final_decision, submitted_by, organization_id)
     )
     return rows[0][0]
+
+
+class FixedScore:
+    """Stands in for the classifier so a test controls the AI approval score."""
+
+    def __init__(self, score):
+        self.score = score
+
+    def predict_proba(self, features):
+        return np.array([[1 - self.score, self.score]])
+
+
+class NoAnomaly:
+    def predict(self, features):
+        return np.array([1])
+
+
+def use_model_score(module, monkeypatch, score):
+    artifacts = {
+        **module.load_bundled_artifacts(),
+        'xgboost_model': FixedScore(score), 'isolation_forest': NoAnomaly(), 'one_class_svm': NoAnomaly(),
+    }
+    monkeypatch.setattr(module, 'get_active_model', lambda force=False: (artifacts, None))
 
 
 def login(client, email, password=PASSWORD):

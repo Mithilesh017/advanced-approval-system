@@ -57,7 +57,89 @@
       ESCALATED_UNKNOWN: 'Unrecognized category',
       ESCALATED_ANOMALY: 'Anomaly detected',
       ESCALATED_POLICY: 'Low AI confidence',
-      ESCALATED_MANUAL_REVIEW: 'Needs manual review'
+      ESCALATED_MANUAL_REVIEW: 'Needs manual review',
+      ESCALATED_SHADOW: 'AI recommends approval',
+      ESCALATED_RULE: 'Breaks a policy rule'
+    };
+
+    const parseViolations = (value) => {
+      try {
+        return value ? JSON.parse(value) : [];
+      } catch (err) {
+        return [];
+      }
+    };
+
+    const DECISION_PROMPTS = {
+      Approved: { title: 'Approve this request?', inputLabel: 'Note (optional)', confirmButtonText: 'Approve', reasonRequired: false },
+      Rejected: { title: 'Reject this request?', inputLabel: 'Reason for rejecting (required)', confirmButtonText: 'Reject', reasonRequired: true },
+      Pending: { title: 'Move this request back to pending?', inputLabel: 'Reason for reopening (required)', confirmButtonText: 'Move to pending', reasonRequired: true }
+    };
+
+    const HISTORY_ACTIONS = {
+      'request.submitted': 'Submitted',
+      'request.approved': 'Approved',
+      'request.rejected': 'Rejected',
+      'request.reopened': 'Moved back to pending'
+    };
+    const FEATURE_LABELS = { Role: 'Role', Department: 'Department', Request_Type: 'Request type', Destination: 'Destination', Amount_INR: 'Amount' };
+
+    // The history is built from DOM nodes with text content, so nothing typed by users is rendered as HTML.
+    const historyNode = (tag, className, children = []) => {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      element.append(...children);
+      return element;
+    };
+
+    const formatHistoryTime = (value) => new Date(value).toLocaleString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+    const submissionDetails = (event) => {
+      const details = event.details || {};
+      const outcome = event.to_status === 'APPROVED' ? 'Approved automatically' : (DECISION_LABELS[event.to_status] || event.to_status);
+      const model = details.model_version ? `model version ${details.model_version}` : 'original model';
+      const mode = details.approval_mode === 'shadow' ? ' · shadow mode' : '';
+      const parts = [historyNode('div', 'history-meta', [`Outcome: ${outcome} · AI approval score ${(details.approval_score * 100).toFixed(1)}% · ${model}${mode}`])];
+      (details.policy_violations || []).forEach(violation => {
+        parts.push(historyNode('div', 'history-meta history-violation', [`Policy rule broken: ${violation.name} (${violation.reason})`]));
+      });
+      if (details.explanation) {
+        const rows = Object.entries(details.explanation)
+          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+          .map(([feature, impact]) => historyNode('div', 'shap-row', [
+            historyNode('span', '', [`${FEATURE_LABELS[feature] || feature}:`]),
+            historyNode('strong', impact > 0 ? 'is-positive' : 'is-negative', [`${impact > 0 ? '+' : ''}${impact.toFixed(3)}`])
+          ]));
+        parts.push(historyNode('div', 'shap-box', [historyNode('div', 'shap-title', ['What influenced the AI score']), ...rows]));
+      }
+      return parts;
+    };
+
+    const buildHistory = (events) => {
+      if (!events.length) {
+        return historyNode('p', 'history-empty', ['No history was recorded for this request. Requests handled before the audit log was added have no history.']);
+      }
+      return historyNode('ol', 'history-list', events.map(event => historyNode('li', 'history-item', [
+        historyNode('div', 'history-head', [
+          historyNode('strong', '', [HISTORY_ACTIONS[event.action] || event.action]),
+          historyNode('span', 'history-time', [formatHistoryTime(event.created_at)])
+        ]),
+        historyNode('div', 'history-meta', [event.actor_email ? `by ${event.actor_email}` : 'by the system']),
+        ...(event.comment ? [historyNode('blockquote', 'history-comment', [event.comment])] : []),
+        ...(event.action === 'request.submitted' ? submissionDetails(event) : [])
+      ])));
+    };
+
+    const showRequestHistory = async (req) => {
+      try {
+        const res = await fetch(`/api/auth/request_history?id=${encodeURIComponent(req.id)}`, { credentials: 'include' });
+        if (isSessionExpired(res)) return;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'The history could not be loaded.');
+        Swal.fire({ title: `${req.reqId} History`, html: buildHistory(data.events), width: 640, confirmButtonText: 'Close' });
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'History Unavailable', text: err.message });
+      }
     };
 
     function AdminPortal() {
@@ -91,7 +173,9 @@
               raw_status: r.final_decision,
               aiScore: (r.xgb_score * 100).toFixed(1) + '%',
               confidence: r.xgb_score == null ? undefined : Math.round(r.xgb_score * 1000) / 10,
-              reason: DECISION_LABELS[r.final_decision]
+              reason: DECISION_LABELS[r.final_decision],
+              shadowRecommendation: r.approval_mode === 'shadow' ? r.ai_decision : null,
+              violations: parseViolations(r.policy_violations)
             }));
             setAllRequests(myRequests);
           }
@@ -100,12 +184,14 @@
         }
       };
 
+      const loadOrganization = () => fetch('/api/auth/organization', { credentials: 'include' })
+        .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+        .then(data => { if (data) setOrganization(data); })
+        .catch(() => {});
+
       useEffect(() => {
         loadData();
-        fetch('/api/auth/organization', { credentials: 'include' })
-          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
-          .then(data => { if (data) setOrganization(data); })
-          .catch(() => {});
+        loadOrganization();
       }, []);
 
       const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
@@ -175,6 +261,11 @@
               <li>
                 <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
               </li>
+              {user.role === 'SuperAdmin' && (
+                <li>
+                  <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}><i className="fas fa-sliders"></i> Approval Settings</button>
+                </li>
+              )}
               <li>
                 <button onClick={() => Swal.fire('About', 'Approval Management System Version 2.0', 'info')}><i className="fas fa-info-circle"></i> About App</button>
               </li>
@@ -194,6 +285,7 @@
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
                 {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
                 {view === 'users' && <><i className="fas fa-users-cog"></i> Manage Users</>}
+                {view === 'settings' && <><i className="fas fa-sliders"></i> Approval Settings</>}
                 {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
               </h2>
               <div className="user-welcome">Welcome, {user.email}</div>
@@ -214,6 +306,7 @@
             }
             {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
             {view === 'profile' && <ProfileView user={user} />}
+            {user.role === 'SuperAdmin' && view === 'settings' && <SettingsView organization={organization} onSaved={loadOrganization} />}
           </div>
         </div>
       );
@@ -436,6 +529,18 @@
       }, [tableKey]); // Re-run only when the tableKey changes (full remount)
 
       const handleAction = async (id, newStatus) => {
+        const decisionPrompt = DECISION_PROMPTS[newStatus];
+        const answer = await Swal.fire({
+          title: decisionPrompt.title,
+          input: 'textarea',
+          inputLabel: decisionPrompt.inputLabel,
+          inputAttributes: { maxlength: '1000' },
+          showCancelButton: true,
+          confirmButtonText: decisionPrompt.confirmButtonText,
+          inputValidator: (value) => (decisionPrompt.reasonRequired && !value.trim() ? 'Please give a reason. It is saved in the request history.' : undefined)
+        });
+        if (!answer.isConfirmed) return;
+
         const endpoints = {
           Approved: '/api/auth/approve_request',
           Rejected: '/api/auth/reject_request',
@@ -446,7 +551,7 @@
           const res = await fetch(endpoints[newStatus], {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: id }),
+            body: JSON.stringify({ id: id, comment: answer.value.trim() }),
             credentials: 'include'
           });
           if (isSessionExpired(res)) return;
@@ -554,22 +659,16 @@
                           </span>
                         )}
                         {req.reason && <span className="badge badge-block badge-accent">{req.reason}</span>}
-                        {req.shap && (
-                          <div className="shap-box">
-                            <div className="shap-title">SHAP Impact</div>
-                            {Object.entries(req.shap).map(([feature, impact]) => {
-                              const isPositive = impact > 0;
-                              return (
-                                <div key={feature} className="shap-row">
-                                  <span>{feature.replace('_', ' ')}:</span>
-                                  <strong className={isPositive ? 'is-positive' : 'is-negative'}>
-                                    {isPositive ? '+' : ''}{impact.toFixed(3)}
-                                  </strong>
-                                </div>
-                              );
-                            })}
-                          </div>
+                        {req.shadowRecommendation && req.status !== 'Pending' && (
+                          <span className={`badge badge-block ${req.shadowRecommendation === 'APPROVED' ? 'badge-green' : 'badge-orange'}`}>
+                            <i className="fas fa-eye"></i> AI {req.shadowRecommendation === 'APPROVED' ? 'recommended approval' : 'flagged for review'}
+                          </span>
                         )}
+                        {req.violations.map(violation => (
+                          <span key={violation.rule_id} className="badge badge-block badge-red" title={violation.reason}>
+                            <i className="fas fa-scale-balanced"></i> {violation.name}
+                          </span>
+                        ))}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
                       <td className="cell-nowrap">
@@ -581,6 +680,7 @@
                         ) : (
                           <button type="button" className="action-btn info" onClick={() => handleAction(req.id, 'Pending')} title="Move to Pending" aria-label="Move to Pending"><i className="fas fa-undo"></i></button>
                         )}
+                        <button type="button" className="action-btn info" onClick={() => showRequestHistory(req)} title="History" aria-label="History"><i className="fas fa-clock-rotate-left"></i></button>
                       </td>
                     </tr>
                   ))}
@@ -837,6 +937,299 @@
             </>
           )}
         </div>
+      );
+    }
+
+    const RULE_TYPE_LABELS = {
+      amount_limit: 'Amount limit',
+      duplicate_request: 'Duplicate request',
+      always_review: 'Always review'
+    };
+    const REVIEW_FIELD_OPTIONS = [
+      { value: 'request_type', label: 'Request type', optionKey: 'Request_Type' },
+      { value: 'destination', label: 'Destination', optionKey: 'Destination' },
+      { value: 'role', label: 'Role', optionKey: 'Role' },
+      { value: 'department', label: 'Department', optionKey: 'Department' }
+    ];
+    const EMPTY_RULE = { rule_type: 'amount_limit', role: '', request_type: '', max_amount_inr: '', window_days: '7', field: 'request_type', value: '' };
+
+    const describeRule = (form) => {
+      if (form.rule_type === 'amount_limit') {
+        return `${form.role.trim() || 'Any role'} · ${form.request_type.trim() || 'any request type'} over ₹${Number(form.max_amount_inr).toLocaleString('en-IN')}`;
+      }
+      if (form.rule_type === 'duplicate_request') {
+        return `Same employee, request type and amount within ${form.window_days} days`;
+      }
+      const field = REVIEW_FIELD_OPTIONS.find(option => option.value === form.field);
+      return `Always review ${field.label.toLowerCase()} "${form.value.trim()}"`;
+    };
+
+    const ruleConfig = (form) => {
+      if (form.rule_type === 'amount_limit') {
+        return { role: form.role.trim() || null, request_type: form.request_type.trim() || null, max_amount_inr: Number(form.max_amount_inr) };
+      }
+      if (form.rule_type === 'duplicate_request') return { window_days: Number(form.window_days) };
+      return { field: form.field, values: [form.value.trim()] };
+    };
+
+    function PolicyRulesPanel() {
+      const [rules, setRules] = useState(null);
+      const [options, setOptions] = useState({});
+      const [form, setForm] = useState(EMPTY_RULE);
+      const [saving, setSaving] = useState(false);
+
+      const loadRules = async () => {
+        try {
+          const res = await fetch('/api/auth/policy_rules', { credentials: 'include' });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The policy rules could not be loaded.');
+          setRules(data.rules);
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Rules Unavailable', text: err.message });
+        }
+      };
+
+      useEffect(() => {
+        loadRules();
+        fetch('/api/model/form_options', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (data && data.options) setOptions(data.options); })
+          .catch(() => {});
+      }, []);
+
+      const setField = (name, value) => setForm(prev => ({ ...prev, [name]: value }));
+
+      const postRule = async (url, body) => {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          credentials: 'include'
+        });
+        if (isSessionExpired(res)) return null;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'The rule could not be saved.');
+        return data;
+      };
+
+      const handleCreate = async (e) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+          const data = await postRule('/api/auth/create_policy_rule', { rule_type: form.rule_type, name: describeRule(form), config: ruleConfig(form) });
+          if (data) {
+            setForm(EMPTY_RULE);
+            await loadRules();
+            Swal.fire({ icon: 'success', title: 'Rule Added', timer: 1500, showConfirmButton: false });
+          }
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Could Not Add Rule', text: err.message });
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      const toggleRule = async (rule) => {
+        const result = await Swal.fire({
+          icon: 'question',
+          titleText: rule.is_active ? 'Turn off this rule?' : 'Turn this rule back on?',
+          text: rule.name,
+          showCancelButton: true,
+          confirmButtonText: rule.is_active ? 'Turn off' : 'Turn on'
+        });
+        if (!result.isConfirmed) return;
+        try {
+          if (await postRule('/api/auth/update_policy_rule', { id: rule.id, is_active: !rule.is_active })) await loadRules();
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Update Failed', text: err.message });
+        }
+      };
+
+      const reviewField = REVIEW_FIELD_OPTIONS.find(option => option.value === form.field);
+      const listId = (key) => `policy-options-${key}`;
+
+      return (
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-scale-balanced"></i> Policy Rules</h3>
+          <p className="panel-subtitle">Rules are checked before the AI. A request that breaks a rule always goes to a person with the rule shown. Rules never reject a request on their own.</p>
+
+          <form onSubmit={handleCreate}>
+            <div className="form-grid">
+              <div className="form-group">
+                <label htmlFor="rule-type">Rule type</label>
+                <select id="rule-type" value={form.rule_type} onChange={e => setField('rule_type', e.target.value)}>
+                  <option value="amount_limit">Amount limit</option>
+                  <option value="duplicate_request">Duplicate request</option>
+                  <option value="always_review">Always review</option>
+                </select>
+              </div>
+
+              {form.rule_type === 'amount_limit' && (<>
+                <div className="form-group">
+                  <label htmlFor="rule-limit">Maximum amount (INR)</label>
+                  <input id="rule-limit" type="number" min="1" step="1" value={form.max_amount_inr} onChange={e => setField('max_amount_inr', e.target.value)} required />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="rule-role">Role (leave empty for any)</label>
+                  <input id="rule-role" type="text" list={listId('Role')} value={form.role} onChange={e => setField('role', e.target.value)} />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="rule-request-type">Request type (leave empty for any)</label>
+                  <input id="rule-request-type" type="text" list={listId('Request_Type')} value={form.request_type} onChange={e => setField('request_type', e.target.value)} />
+                </div>
+              </>)}
+
+              {form.rule_type === 'duplicate_request' && (
+                <div className="form-group">
+                  <label htmlFor="rule-window">Look back (days)</label>
+                  <input id="rule-window" type="number" min="1" max="90" step="1" value={form.window_days} onChange={e => setField('window_days', e.target.value)} required />
+                </div>
+              )}
+
+              {form.rule_type === 'always_review' && (<>
+                <div className="form-group">
+                  <label htmlFor="rule-field">Field</label>
+                  <select id="rule-field" value={form.field} onChange={e => setField('field', e.target.value)}>
+                    {REVIEW_FIELD_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label htmlFor="rule-value">{reviewField.label} to always review</label>
+                  <input id="rule-value" type="text" list={listId(reviewField.optionKey)} value={form.value} onChange={e => setField('value', e.target.value)} required />
+                </div>
+              </>)}
+            </div>
+
+            {REVIEW_FIELD_OPTIONS.map(option => (
+              <datalist key={option.optionKey} id={listId(option.optionKey)}>
+                {(options[option.optionKey] || []).map(value => <option key={value} value={value} />)}
+              </datalist>
+            ))}
+
+            <button type="submit" className="btn btn-primary" disabled={saving}>
+              {saving ? <span><i className="fas fa-spinner fa-spin"></i> Adding...</span> : <span><i className="fas fa-plus"></i> Add Rule</span>}
+            </button>
+          </form>
+
+          <hr className="divider" />
+
+          {rules === null ? (
+            <div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading rules...</div>
+          ) : rules.length === 0 ? (
+            <div className="empty-state is-neutral"><i className="fas fa-scale-balanced"></i>No policy rules yet.</div>
+          ) : (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Rule</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rules.map(rule => (
+                    <tr key={rule.id}>
+                      <td>
+                        <div className="cell-primary">{rule.name}</div>
+                        <div className="cell-secondary">Added {formatHistoryTime(rule.created_at)}{rule.created_by ? ` by ${rule.created_by}` : ''}</div>
+                      </td>
+                      <td>{RULE_TYPE_LABELS[rule.rule_type] || rule.rule_type}</td>
+                      <td><span className={`status-badge ${rule.is_active ? 'status-approved' : 'status-rejected'}`}>{rule.is_active ? 'On' : 'Off'}</span></td>
+                      <td>
+                        <button type="button" className={`btn btn-sm ${rule.is_active ? 'btn-tinted-danger' : 'btn-secondary'}`} onClick={() => toggleRule(rule)}>
+                          {rule.is_active ? 'Turn off' : 'Turn on'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function SettingsView({ organization, onSaved }) {
+      const settings = organization && organization.approval_settings;
+      const [percent, setPercent] = useState('');
+      const [saving, setSaving] = useState(false);
+
+      useEffect(() => {
+        if (settings) setPercent(String(Math.round(settings.auto_approve_above * 100)));
+      }, [settings && settings.auto_approve_above]);
+
+      if (!settings) {
+        return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading approval settings...</div></div>;
+      }
+
+      const minimum = Math.round(settings.minimum_auto_approve_above * 100);
+      const maximum = Math.round(settings.maximum_auto_approve_above * 100);
+      const shadow = settings.approval_mode === 'shadow';
+
+      const handleSave = async (e) => {
+        e.preventDefault();
+        const value = Number(percent);
+        if (!Number.isInteger(value) || value < minimum || value > maximum) {
+          Swal.fire({ icon: 'error', title: 'Invalid Threshold', text: `Enter a whole number from ${minimum} to ${maximum}.` });
+          return;
+        }
+        setSaving(true);
+        try {
+          const res = await fetch('/api/auth/update_approval_settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ auto_approve_above: value / 100 }),
+            credentials: 'include'
+          });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The settings could not be saved.');
+          await onSaved();
+          Swal.fire({ icon: 'success', title: 'Settings Saved', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Save Failed', text: err.message });
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      return (
+        <>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-sliders"></i> Approval Settings</h3>
+          <p className="panel-subtitle">Every change here is saved in the audit log.</p>
+
+          <div className={`callout ${shadow ? 'callout-warning' : 'callout-info'}`}>
+            <i className={`fas ${shadow ? 'fa-eye' : 'fa-bolt'}`} aria-hidden="true"></i>
+            <div>
+              <strong>{shadow ? 'Shadow mode' : 'Automatic approval'}</strong>
+              {shadow
+                ? 'The AI only recommends. A person decides every request.'
+                : 'Requests the AI is confident about are approved without waiting for a person.'}
+              <div className="callout-meta">Neuzem sets the approval mode for your organization.</div>
+            </div>
+          </div>
+
+          <form onSubmit={handleSave} className="profile-form">
+            <div className="form-group">
+              <label htmlFor="auto-approve-above">Auto-approve when the AI approval score is above (%)</label>
+              <input id="auto-approve-above" type="number" min={minimum} max={maximum} step="1" value={percent} onChange={e => setPercent(e.target.value)} required />
+              <small className="field-hint">
+                You can raise this up to {maximum}% so fewer requests are approved automatically. It cannot go below {minimum}%.
+                {shadow ? ' It takes effect once your organization uses automatic approval.' : ''}
+              </small>
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={saving}>
+              {saving ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Settings</span>}
+            </button>
+          </form>
+        </div>
+        <PolicyRulesPanel />
+        </>
       );
     }
 
