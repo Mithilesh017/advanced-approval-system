@@ -121,7 +121,9 @@ def to_json_row(row):
 # ==========================================
 # 1. AUTHENTICATION & DATABASE CONFIGURATION
 # ==========================================
-DB_FILE = 'auth.db'
+DB_FILE = os.getenv('SQLITE_PATH', 'auth.db')
+DEFAULT_ORGANIZATION_NAME = 'Default Organization'
+DEFAULT_ORGANIZATION_ID = None  # Set by setup_database()
 
 try:
     import psycopg2
@@ -131,19 +133,18 @@ except ImportError:
 
 # Initialize Super Admin via environment variables if provided
 def bootstrap_super_admin():
-    sa_email = os.getenv('INITIAL_SUPER_ADMIN_EMAIL', 'superadmin.main.01@gmail.com')
+    sa_email = os.getenv('INITIAL_SUPER_ADMIN_EMAIL')
     sa_password = os.getenv('INITIAL_SUPER_ADMIN_PASSWORD', os.getenv('SUPER_ADMIN_PASSWORD'))
-    
+
     if not sa_email or not sa_password:
         return
-        
+
     conn = get_db_connection()
     user = conn.execute('SELECT * FROM Users WHERE email = ?', (sa_email,)).fetchone()
     if not user:
-        from werkzeug.security import generate_password_hash
         conn.execute(
-            'INSERT INTO Users (email, password_hash, role, status) VALUES (?, ?, ?, ?)',
-            (sa_email, generate_password_hash(sa_password), 'SuperAdmin', 'Active')
+            'INSERT INTO Users (email, password_hash, role, status, organization_id) VALUES (?, ?, ?, ?, ?)',
+            (sa_email, generate_password_hash(sa_password), 'SuperAdmin', 'Active', DEFAULT_ORGANIZATION_ID)
         )
         conn.commit()
     conn.close()
@@ -171,6 +172,11 @@ class PostgresWrapper:
         
     def close(self):
         self.conn.close()
+
+# At most one organization can be the default, even when several workers start at once.
+ORGANIZATIONS_SINGLE_DEFAULT_INDEX = (
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_single_default ON Organizations (is_default) WHERE is_default = 1'
+)
 
 def init_db():
     DATABASE_URL = os.getenv('DATABASE_URL')
@@ -234,6 +240,19 @@ def init_db():
                 finished_at TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Organizations (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                join_code TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Active',
+                allow_training_data INTEGER NOT NULL DEFAULT 0,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute(ORGANIZATIONS_SINGLE_DEFAULT_INDEX)
         conn.commit()
         conn.close()
     else:
@@ -291,12 +310,21 @@ def init_db():
                 finished_at DATETIME
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Organizations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                join_code TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Active',
+                allow_training_data INTEGER NOT NULL DEFAULT 0,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute(ORGANIZATIONS_SINGLE_DEFAULT_INDEX)
         conn.commit()
         conn.close()
-
-# Initialize DB on startup
-print("Initializing Auth Database...")
-init_db()
 
 REQUEST_EXTRA_COLUMNS = {
     'employee_name': 'TEXT',
@@ -304,6 +332,8 @@ REQUEST_EXTRA_COLUMNS = {
     'reviewed_by': 'TEXT',
     'reviewed_at': 'TIMESTAMP',
 }
+
+ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
 
 def check_and_add_columns():
     DATABASE_URL = os.getenv('DATABASE_URL')
@@ -313,6 +343,9 @@ def check_and_add_columns():
         cursor = conn.cursor()
         for column, column_type in REQUEST_EXTRA_COLUMNS.items():
             cursor.execute(f'ALTER TABLE Requests ADD COLUMN IF NOT EXISTS {column} {column_type}')
+        for table in ORGANIZATION_SCOPED_TABLES:
+            cursor.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES Organizations(id)')
+            cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)')
         conn.commit()
         conn.close()
         return
@@ -336,11 +369,15 @@ def check_and_add_columns():
     for column, column_type in REQUEST_EXTRA_COLUMNS.items():
         if column not in request_columns:
             cursor.execute(f"ALTER TABLE Requests ADD COLUMN {column} {column_type.replace('TIMESTAMP', 'DATETIME')}")
-        
+
+    for table in ORGANIZATION_SCOPED_TABLES:
+        cursor.execute(f"PRAGMA table_info({table})")
+        if 'organization_id' not in {col[1] for col in cursor.fetchall()}:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN organization_id INTEGER REFERENCES Organizations(id)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)")
+
     conn.commit()
     conn.close()
-
-check_and_add_columns()
 
 def get_db_connection():
     DATABASE_URL = os.getenv('DATABASE_URL')
@@ -353,7 +390,32 @@ def get_db_connection():
         conn.row_factory = sqlite3.Row
         return conn
 
-bootstrap_super_admin()
+def ensure_default_organization():
+    # Everything created before organizations existed belongs to one default organization.
+    # It keeps contributing to model training, as all data did before.
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'INSERT INTO Organizations (name, join_code, allow_training_data, is_default) VALUES (?, ?, 1, 1) ON CONFLICT DO NOTHING',
+            (DEFAULT_ORGANIZATION_NAME, secrets.token_urlsafe(9))
+        )
+        organization_id = conn.execute('SELECT id FROM Organizations WHERE is_default = 1').fetchone()['id']
+        for table in ORGANIZATION_SCOPED_TABLES:
+            conn.execute(f'UPDATE {table} SET organization_id = ? WHERE organization_id IS NULL', (organization_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return organization_id
+
+def setup_database():
+    global DEFAULT_ORGANIZATION_ID
+    init_db()
+    check_and_add_columns()
+    DEFAULT_ORGANIZATION_ID = ensure_default_organization()
+    bootstrap_super_admin()
+
+print("Initializing Auth Database...")
+setup_database()
 
 
 # ==========================================
@@ -562,11 +624,11 @@ def predict():
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
-                final_decision, submitted_by, employee_name, employee_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (role, department, req_type, destination, amount, currency, 
-             normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100, 
-             status, current_email, employee_name, employee_id)
+                final_decision, submitted_by, employee_name, employee_id, organization_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT organization_id FROM Users WHERE email = ?))''',
+            (role, department, req_type, destination, amount, currency,
+             normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
+             status, current_email, employee_name, employee_id, current_email)
         )
         conn.commit()
         conn.close()
@@ -876,9 +938,10 @@ def request_access():
         conn.close()
         return jsonify({'error': 'Email already exists or is pending.'}), 409
     try:
+        # Until join links exist, every access request joins the default organization.
         conn.execute(
-            'INSERT INTO Users (email, role, status) VALUES (?, ?, ?)',
-            (email, role, 'Pending')
+            'INSERT INTO Users (email, role, status, organization_id) VALUES (?, ?, ?, ?)',
+            (email, role, 'Pending', DEFAULT_ORGANIZATION_ID)
         )
         conn.commit()
     except DB_INTEGRITY_ERRORS:
