@@ -511,7 +511,7 @@ MODEL_VERSIONS_KEPT = 5
 TRAINING_JOB_STALE_AFTER = timedelta(minutes=30)
 
 _model_lock = threading.Lock()
-_model_state = {'artifacts': None, 'version_id': None, 'checked_at': None}
+_model_state = {'artifacts': None, 'version_id': None, 'checked_at': None, 'unloadable_version_id': None}
 _bundled_artifacts = None
 
 def load_bundled_artifacts():
@@ -536,13 +536,24 @@ def get_active_model(force=False):
             try:
                 row = conn.execute('SELECT id FROM ModelVersions WHERE is_active = 1 ORDER BY id DESC LIMIT 1').fetchone()
                 version_id = row['id'] if row else None
+                if version_id != _model_state['unloadable_version_id']:
+                    _model_state['unloadable_version_id'] = None
+
                 if version_id is None:
                     artifacts = load_bundled_artifacts()
                 elif version_id == _model_state['version_id'] and _model_state['artifacts'] is not None:
                     artifacts = _model_state['artifacts']
+                elif version_id == _model_state['unloadable_version_id'] and not force:
+                    # This version already failed to load, so keep using the original model without retrying on every refresh.
+                    artifacts, version_id = load_bundled_artifacts(), None
                 else:
                     blob = conn.execute('SELECT artifact FROM ModelVersions WHERE id = ?', (version_id,)).fetchone()['artifact']
-                    artifacts = joblib.load(io.BytesIO(bytes(blob)))
+                    try:
+                        artifacts = joblib.load(io.BytesIO(bytes(blob)))
+                    except Exception:
+                        app.logger.exception('Model version %s could not be loaded; the original model is scoring requests instead', version_id)
+                        _model_state['unloadable_version_id'] = version_id
+                        artifacts, version_id = load_bundled_artifacts(), None
             finally:
                 conn.close()
             _model_state.update(artifacts=artifacts, version_id=version_id)
@@ -744,6 +755,10 @@ def model_info():
     return jsonify({
         'ready': True,
         'version_id': version_id,
+        'load_problem': (
+            f"Version {_model_state['unloadable_version_id']} is marked active but could not be loaded, so the original model "
+            'is scoring requests. Switch to a working version or retrain the model.'
+        ) if _model_state['unloadable_version_id'] is not None else None,
         'components': [
             {'name': 'XGBoost classifier', 'purpose': 'Scores how likely a request is to be approved'},
             {'name': 'Isolation Forest', 'purpose': 'Flags requests with unusual patterns'},

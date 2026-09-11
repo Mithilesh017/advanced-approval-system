@@ -425,6 +425,16 @@
             </div>
           </div>
 
+          {info && info.load_problem && (
+            <div className="callout callout-danger" role="alert">
+              <i className="fas fa-triangle-exclamation" aria-hidden="true"></i>
+              <div>
+                <strong>Active version could not be loaded</strong>
+                {info.load_problem}
+              </div>
+            </div>
+          )}
+
           <div className="panel">
             <h3 className="panel-title"><i className="fas fa-bolt"></i> Retrain Model</h3>
             <p className="panel-subtitle">
