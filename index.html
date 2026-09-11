@@ -42,7 +42,7 @@
               <input type="password" id="loginPassword" placeholder="Enter your password" autocomplete="current-password">
               <button type="button" class="input-action" aria-label="Show or hide password" onclick="togglePasswordVisibility('loginPassword', this.firstElementChild)"><i class="fas fa-eye toggle-password"></i></button>
             </div>
-            <small class="field-hint">Logging in for the first time after your access was approved? Leave the password blank to set one up.</small>
+            <small class="field-hint">Approved but haven't set a password yet? Use the setup link from your approval email.</small>
           </div>
           <button type="submit" class="btn btn-primary btn-block btn-lg">
             Secure Login <i class="fas fa-arrow-right"></i>
@@ -87,7 +87,7 @@
             <label for="setupPassword">New Password</label>
             <div class="input-wrap has-action">
               <i class="fas fa-key input-icon" aria-hidden="true"></i>
-              <input type="password" id="setupPassword" placeholder="Create a password" autocomplete="new-password" required>
+              <input type="password" id="setupPassword" placeholder="At least 8 characters" autocomplete="new-password" minlength="8" required>
               <button type="button" class="input-action" aria-label="Show or hide password" onclick="togglePasswordVisibility('setupPassword', this.firstElementChild)"><i class="fas fa-eye toggle-password"></i></button>
             </div>
           </div>
@@ -111,7 +111,7 @@
             <label for="resetPasswordInput">New Password</label>
             <div class="input-wrap has-action">
               <i class="fas fa-key input-icon" aria-hidden="true"></i>
-              <input type="password" id="resetPasswordInput" placeholder="Enter new password" autocomplete="new-password" required>
+              <input type="password" id="resetPasswordInput" placeholder="At least 8 characters" autocomplete="new-password" minlength="8" required>
               <button type="button" class="input-action" aria-label="Show or hide password" onclick="togglePasswordVisibility('resetPasswordInput', this.firstElementChild)"><i class="fas fa-eye toggle-password"></i></button>
             </div>
           </div>
@@ -126,7 +126,6 @@
   <script>
     // Dynamic API URL for production vs local
     const AUTH_API = '/api/auth';
-    let currentSetupEmail = '';
 
     function togglePasswordVisibility(inputId, iconElement) {
       const input = document.getElementById(inputId);
@@ -158,11 +157,18 @@
     // Check for reset token in URL
     const urlParams = new URLSearchParams(window.location.search);
     const resetToken = urlParams.get('reset_token');
+    const setupToken = urlParams.get('setup_token');
     
     if (resetToken) {
       document.querySelectorAll('.auth-section').forEach(s => s.classList.remove('active'));
       document.getElementById('authTabs').style.display = 'none';
       document.getElementById('resetSection').classList.add('active');
+    }
+
+    if (setupToken) {
+      document.querySelectorAll('.auth-section').forEach(s => s.classList.remove('active'));
+      document.getElementById('authTabs').style.display = 'none';
+      document.getElementById('setupSection').classList.add('active');
     }
 
     // Reset Form Submission
@@ -208,12 +214,26 @@
 
         if (response.ok) {
           if (data.status === 'SETUP_REQUIRED') {
-            // Switch to setup password UI
-            currentSetupEmail = email;
-            document.querySelectorAll('.auth-section').forEach(s => s.classList.remove('active'));
-            document.getElementById('authTabs').style.display = 'none';
-            document.getElementById('setupSection').classList.add('active');
-            Swal.fire({ icon: 'info', title: 'Action Required', text: data.message });
+            Swal.fire({
+              icon: 'info',
+              title: 'Action Required',
+              text: data.message,
+              showCancelButton: true,
+              confirmButtonText: 'Email me a new link',
+              cancelButtonText: 'Close'
+            }).then(async (result) => {
+              if (!result.isConfirmed) return;
+              try {
+                await fetch(`${AUTH_API}/request_password_reset`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ email: email })
+                });
+                Swal.fire({ icon: 'success', title: 'Check Your Inbox', text: 'If your account is awaiting setup, a new setup link is on its way.' });
+              } catch (err) {
+                Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server.' });
+              }
+            });
           } else if (data.status === 'SUCCESS') {
             // Save mock session and redirect
             localStorage.setItem('ams_user', JSON.stringify({ email: email, role: data.role, name: email.split('@')[0] }));
@@ -274,14 +294,15 @@
         const response = await fetch(`${AUTH_API}/setup_password`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: currentSetupEmail, password: pass })
+          body: JSON.stringify({ token: setupToken, password: pass }),
+          credentials: 'include'
         });
         
         const data = await response.json();
 
         if (response.ok) {
           // Immediately log them in
-          localStorage.setItem('ams_user', JSON.stringify({ email: currentSetupEmail, role: data.role, name: currentSetupEmail.split('@')[0] }));
+          localStorage.setItem('ams_user', JSON.stringify({ email: data.email, role: data.role, name: data.email.split('@')[0] }));
           Swal.fire({ icon: 'success', title: 'Account Activated', text: data.message, timer: 1500, showConfirmButton: false }).then(() => {
             window.location.href = data.redirect;
           });
@@ -290,7 +311,7 @@
         }
       } catch (err) {
         console.error(err);
-        Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server on port 5001.' });
+        Swal.fire({ icon: 'error', title: 'Connection Error', text: 'Could not reach the authentication server.' });
       }
     });
   </script>

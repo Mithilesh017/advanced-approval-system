@@ -34,6 +34,15 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    const signOut = () => {
+      fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+        .catch(() => {})
+        .finally(() => {
+          localStorage.removeItem('ams_user');
+          window.location.href = 'index.html';
+        });
+    };
+
     function AdminPortal() {
       const [view, setView] = useState('dashboard');
       const [allRequests, setAllRequests] = useState([]);
@@ -86,8 +95,7 @@
           confirmButtonText: 'Yes, log me out'
         }).then((result) => {
           if (result.isConfirmed) {
-            localStorage.removeItem('ams_user');
-            window.location.href = 'index.html';
+            signOut();
           }
         });
       };
@@ -668,7 +676,7 @@
             if (res.status === 401 || res.status === 403 || data.msg) {
                Swal.fire('Session Expired', 'Please log in again to manage users.', 'warning').then(() => { window.location.href = 'index.html'; });
             } else {
-               Swal.fire('Error', data.error || data.msg || 'Could not fetch users from Auth API', 'error');
+               Swal.fire({ title: 'Error', text: data.error || data.msg || 'Could not fetch users from Auth API', icon: 'error' });
             }
             setAllUsers([]);
           }
@@ -695,10 +703,10 @@
           });
           const data = await res.json();
           if (res.ok) {
-            Swal.fire('Approved!', data.message, 'success');
+            Swal.fire({ title: 'Approved!', text: data.message, icon: 'success' });
             fetchUsers(); // refresh list
           } else {
-            Swal.fire('Error', data.error, 'error');
+            Swal.fire({ title: 'Error', text: data.error, icon: 'error' });
           }
         } catch(err) {
           console.error(err);
@@ -716,10 +724,10 @@
           });
           const data = await res.json();
           if (res.ok) {
-            Swal.fire('Rejected!', data.message, 'success');
+            Swal.fire({ title: 'Rejected!', text: data.message, icon: 'success' });
             fetchUsers(); // refresh list
           } else {
-            Swal.fire('Error', data.error, 'error');
+            Swal.fire({ title: 'Error', text: data.error, icon: 'error' });
           }
         } catch(err) {
           console.error(err);
@@ -746,10 +754,10 @@
               });
               const data = await res.json();
               if (res.ok) {
-                Swal.fire('Deleted!', data.message, 'success');
+                Swal.fire({ title: 'Deleted!', text: data.message, icon: 'success' });
                 fetchUsers();
               } else {
-                Swal.fire('Error', data.message, 'error');
+                Swal.fire({ title: 'Error', text: data.message, icon: 'error' });
               }
             } catch(err) {
               Swal.fire('Error', 'Could not communicate with Auth API', 'error');
@@ -900,9 +908,9 @@
           });
           const data = await res.json();
           if(res.ok) {
-             Swal.fire('Updated!', data.message, 'success');
+             Swal.fire({ title: 'Updated!', text: data.message, icon: 'success' });
           } else {
-             Swal.fire('Error', data.error, 'error');
+             Swal.fire({ title: 'Error', text: data.error, icon: 'error' });
           }
         } catch(err) {
           Swal.fire('Error', 'Connection failed', 'error');
@@ -929,12 +937,9 @@
               const data = await res.json();
               if (res.ok) {
                  Swal.fire('Notification Sent', 'A Notification Email is Sent to your Email to confirm, please check Your Inbox Or Spam Box', 'success')
-                 .then(() => {
-                    localStorage.removeItem('ams_user');
-                    window.location.href = 'index.html';
-                 });
+                 .then(signOut);
               } else {
-                 Swal.fire('Error', data.error, 'error');
+                 Swal.fire({ title: 'Error', text: data.error, icon: 'error' });
               }
             } catch(e) {
                Swal.fire('Error', 'Network error', 'error');
@@ -990,8 +995,7 @@
                   confirmButtonText: 'Yes, logout'
                 }).then((result) => {
                   if(result.isConfirmed) {
-                    localStorage.removeItem('ams_user');
-                    window.location.href = 'index.html';
+                    signOut();
                   }
                 });
             }} className="btn btn-secondary">

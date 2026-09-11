@@ -33,6 +33,15 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    const signOut = () => {
+      fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+        .catch(() => {})
+        .finally(() => {
+          localStorage.removeItem('ams_user');
+          window.location.href = 'index.html';
+        });
+    };
+
     function EmployeePortal() {
       const [view, setView] = useState('pending');
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'user@gmail.com'});
@@ -85,8 +94,7 @@
           confirmButtonText: 'Yes, log me out'
         }).then((result) => {
           if (result.isConfirmed) {
-            localStorage.removeItem('ams_user');
-            window.location.href = 'index.html';
+            signOut();
           }
         });
       };
@@ -417,9 +425,9 @@
           });
           const data = await res.json();
           if(res.ok) {
-             Swal.fire('Updated!', data.message, 'success');
+             Swal.fire({ title: 'Updated!', text: data.message, icon: 'success' });
           } else {
-             Swal.fire('Error', data.error, 'error');
+             Swal.fire({ title: 'Error', text: data.error, icon: 'error' });
           }
         } catch(err) {
           Swal.fire('Error', 'Connection failed', 'error');
@@ -446,12 +454,9 @@
               const data = await res.json();
               if (res.ok) {
                  Swal.fire('Notification Sent', 'A Notification Email is Sent to your Email to confirm, please check Your Inbox Or Spam Box', 'success')
-                 .then(() => {
-                    localStorage.removeItem('ams_user');
-                    window.location.href = 'index.html';
-                 });
+                 .then(signOut);
               } else {
-                 Swal.fire('Error', data.error, 'error');
+                 Swal.fire({ title: 'Error', text: data.error, icon: 'error' });
               }
             } catch(e) {
                Swal.fire('Error', 'Network error', 'error');
@@ -507,8 +512,7 @@
                   confirmButtonText: 'Yes, logout'
                 }).then((result) => {
                   if(result.isConfirmed) {
-                    localStorage.removeItem('ams_user');
-                    window.location.href = 'index.html';
+                    signOut();
                   }
                 });
             }} className="btn btn-secondary">

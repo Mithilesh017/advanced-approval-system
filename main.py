@@ -1,6 +1,9 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
+import hashlib
+import re
 import sqlite3
 import os
 import email_service
@@ -17,7 +20,14 @@ from functools import wraps
 load_dotenv()
 
 app = Flask(__name__)
+
+# Render terminates TLS at a proxy; trust exactly one hop so rate limits see the real client IP.
+if os.getenv('RENDER'):
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
 # Security configuration
+if not os.getenv('JWT_SECRET_KEY'):
+    print("[WARNING] JWT_SECRET_KEY is not set. A random key is used, so sessions reset on restart and break across multiple workers.")
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32))
 app.config['JWT_TOKEN_LOCATION'] = ['cookies']
 app.config['JWT_COOKIE_SECURE'] = os.getenv('RENDER', '') != '' or os.getenv('ENVIRONMENT', '') == 'production'  # Auto-detect Render (HTTPS) or explicit production
@@ -42,20 +52,6 @@ limiter = Limiter(
 allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5000').split(',')
 CORS(app, supports_credentials=True, origins=allowed_origins)
 
-@app.before_request
-def log_request_cookies():
-    if request.path.startswith('/api/auth'):
-        print(f"[DEBUG Cookie Check] Path: {request.path}")
-        print(f"[DEBUG Cookie Check] Cookies parsed: {list(request.cookies.keys())}")
-        print(f"[DEBUG Cookie Check] Cookie Header: {request.headers.get('Cookie', 'None')}")
-
-@app.after_request
-def log_response_errors(response):
-    if request.path.startswith('/api/auth') and response.status_code >= 400:
-        print(f"[DEBUG Auth Error] Status: {response.status_code}")
-        print(f"[DEBUG Auth Error] Payload: {response.get_data(as_text=True)}")
-    return response
-
 def require_role(role):
     def wrapper(fn):
         @wraps(fn)
@@ -67,6 +63,34 @@ def require_role(role):
             return fn(*args, **kwargs)
         return decorator
     return wrapper
+
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+SETUP_TOKEN_TTL = timedelta(hours=72)
+RESET_TOKEN_TTL = timedelta(minutes=15)
+
+def is_valid_email(value):
+    return isinstance(value, str) and len(value) <= 254 and EMAIL_PATTERN.fullmatch(value) is not None
+
+def hash_token(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+def issue_token(conn, email, ttl):
+    token = secrets.token_urlsafe(32)
+    expiry = (datetime.utcnow() + ttl).strftime('%Y-%m-%d %H:%M:%S')
+    conn.execute('UPDATE Users SET reset_token = ?, reset_expiry = ? WHERE email = ?', (hash_token(token), expiry, email))
+    conn.commit()
+    return token
+
+def token_expired(expiry):
+    if not expiry:
+        return True
+    # SQLite returns the stored string; PostgreSQL returns a datetime.
+    if isinstance(expiry, str):
+        expiry = datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S')
+    return datetime.utcnow() > expiry
+
+def public_base_url():
+    return (os.getenv('APP_BASE_URL') or request.host_url).rstrip('/')
 
 # ==========================================
 # 1. AUTHENTICATION & DATABASE CONFIGURATION
@@ -425,7 +449,7 @@ def login():
     elif user_status == 'Rejected':
         return jsonify({'status': 'REJECTED', 'message': 'Your access request was rejected.'}), 403
     elif user_status == 'Approved_Awaiting_Password':
-        return jsonify({'status': 'SETUP_REQUIRED', 'message': 'You have been approved! Please set up your password.'}), 200
+        return jsonify({'status': 'SETUP_REQUIRED', 'message': 'You have been approved! Use the setup link we emailed you to create your password.'}), 200
     elif user_status == 'Active':
         if not password:
             return jsonify({'error': 'Password required.'}), 400
@@ -451,11 +475,14 @@ def login():
 @limiter.limit("5 per hour")
 def request_access():
     data = request.json
-    email = data.get('email')
+    email = (data.get('email') or '').strip()
     role = data.get('role', 'User')
 
     if not email:
         return jsonify({'error': 'Email is required'}), 400
+
+    if not is_valid_email(email):
+        return jsonify({'error': 'Please enter a valid email address.'}), 400
         
     if role not in ['User', 'Admin']:
         return jsonify({'error': 'Invalid role requested.'}), 400
@@ -496,44 +523,45 @@ def request_access():
 
 
 @app.route('/api/auth/setup_password', methods=['POST'])
+@limiter.limit("10 per hour")
 def setup_password():
     data = request.json
-    email = data.get('email')
+    token = data.get('token')
     password = data.get('password')
 
-    if not email or not password:
-        return jsonify({'error': 'Email and password are required'}), 400
+    if not token or not password:
+        return jsonify({'error': 'A valid setup link and a password are required.'}), 400
+
+    if len(password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters.'}), 400
 
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM Users WHERE email = ?', (email,)).fetchone()
-    
-    if not user:
-        conn.close()
-        return jsonify({'error': 'User not found'}), 404
-        
-    if user['status'] != 'Approved_Awaiting_Password':
-        conn.close()
-        return jsonify({'error': 'User is not authorized to set a password at this time.'}), 403
+    user = conn.execute('SELECT * FROM Users WHERE reset_token = ?', (hash_token(token),)).fetchone()
 
-    hashed_pw = generate_password_hash(password)
-    
+    if not user or user['status'] != 'Approved_Awaiting_Password' or token_expired(user['reset_expiry']):
+        conn.close()
+        return jsonify({'error': 'This setup link is invalid or has expired. Try logging in to request a new one.'}), 400
+
+    email = user['email']
     conn.execute(
-        'UPDATE Users SET password_hash = ?, status = ? WHERE email = ?',
-        (hashed_pw, 'Active', email)
+        'UPDATE Users SET password_hash = ?, status = ?, reset_token = NULL, reset_expiry = NULL WHERE id = ?',
+        (generate_password_hash(password), 'Active', user['id'])
     )
     conn.commit()
     conn.close()
 
-    name = email.split('@')[0]
-    email_service.sendWelcomeEmail(email, name)
+    email_service.sendWelcomeEmail(email, email.split('@')[0])
 
     redirect_page = 'admin.html' if user['role'] in ['Admin', 'SuperAdmin'] else 'user.html'
-    return jsonify({
-        'status': 'SUCCESS', 
+    resp = jsonify({
+        'status': 'SUCCESS',
         'message': 'Password set successfully. Account is now active.',
         'redirect': redirect_page,
-        'role': user['role']
+        'role': user['role'],
+        'email': email
     })
+    set_access_cookies(resp, create_access_token(identity=email, additional_claims={'role': user['role']}))
+    return resp
 
 @app.route('/api/auth/pending_users', methods=['GET'])
 @require_role('Admin')
@@ -554,13 +582,6 @@ def get_all_users():
     
     users_list = [dict(u) for u in users]
     return jsonify(users_list)
-@app.route('/api/auth/debug_cookie', methods=['GET'])
-def debug_cookie():
-    return jsonify({
-        "cookies_received": list(request.cookies.keys()),
-        "cookie_header": request.headers.get('Cookie', 'None'),
-        "jwt_config_name": app.config.get('JWT_ACCESS_COOKIE_NAME')
-    })
 
 @app.route('/api/auth/delete_user', methods=['POST'])
 @require_role('Admin')
@@ -571,7 +592,15 @@ def delete_user():
     if not email:
         return jsonify({'error': 'Email is required'}), 400
 
+    if email == get_jwt_identity():
+        return jsonify({'status': 'ERROR', 'message': 'You cannot delete your own account.'}), 403
+
     conn = get_db_connection()
+    target = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
+    if target and get_jwt().get('role') != 'SuperAdmin' and target['role'] != 'User':
+        conn.close()
+        return jsonify({'status': 'ERROR', 'message': 'Admins can only remove employee accounts.'}), 403
+
     cursor = conn.execute('DELETE FROM Users WHERE email = ?', (email,))
     conn.commit()
     conn.close()
@@ -591,6 +620,11 @@ def approve_user():
         return jsonify({'error': 'Email is required'}), 400
 
     conn = get_db_connection()
+    target = conn.execute('SELECT role FROM Users WHERE email = ? AND status = "Pending"', (email,)).fetchone()
+    if target and target['role'] == 'Admin' and get_jwt().get('role') != 'SuperAdmin':
+        conn.close()
+        return jsonify({'error': 'Only a Super Admin can approve administrator requests.'}), 403
+
     cursor = conn.execute(
         'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending"',
         ('Approved_Awaiting_Password', email)
@@ -601,10 +635,11 @@ def approve_user():
         user = conn.execute('SELECT role FROM Users WHERE email = ?', (email,)).fetchone()
         if user:
             name = email.split('@')[0]
+            setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
             if user['role'] == 'Admin':
-                email_service.sendAdminApprovedEmail(email, name)
+                email_service.sendAdminApprovedEmail(email, name, setup_link)
             else:
-                email_service.sendUserApprovedEmail(email, name)
+                email_service.sendUserApprovedEmail(email, name, setup_link)
                 
     conn.close()
     
@@ -620,6 +655,11 @@ def reject_user():
         return jsonify({'error': 'Email is required'}), 400
 
     conn = get_db_connection()
+    target = conn.execute('SELECT role FROM Users WHERE email = ? AND status = "Pending"', (email,)).fetchone()
+    if target and target['role'] == 'Admin' and get_jwt().get('role') != 'SuperAdmin':
+        conn.close()
+        return jsonify({'error': 'Only a Super Admin can reject administrator requests.'}), 403
+
     cursor = conn.execute(
         'UPDATE Users SET status = ? WHERE email = ? AND status = "Pending"',
         ('Rejected', email)
@@ -642,9 +682,7 @@ def reject_user():
 @app.route('/api/auth/get_profile', methods=['GET'])
 @jwt_required()
 def get_profile():
-    email = request.args.get('email')
-    if not email:
-        return jsonify({'error': 'Email is required'}), 400
+    email = get_jwt_identity()
         
     conn = get_db_connection()
     user = conn.execute('SELECT name, emp_id, role, created_at FROM Users WHERE email = ?', (email,)).fetchone()
@@ -658,7 +696,7 @@ def get_profile():
 @jwt_required()
 def update_profile():
     data = request.json
-    email = data.get('email')
+    email = get_jwt_identity()
     name = data.get('name')
     emp_id = data.get('emp_id')
     
@@ -748,15 +786,28 @@ def request_password_reset():
         # Prevent user enumeration
         return jsonify({'status': 'SUCCESS', 'message': 'If the email exists, a password reset request has been generated.'}), 200
         
+    if user['status'] == 'Approved_Awaiting_Password':
+        setup_link = f"{public_base_url()}/index.html?setup_token={issue_token(conn, email, SETUP_TOKEN_TTL)}"
+        conn.close()
+        name = email.split('@')[0]
+        if user['role'] == 'Admin':
+            email_service.sendAdminApprovedEmail(email, name, setup_link)
+        else:
+            email_service.sendUserApprovedEmail(email, name, setup_link)
+        return jsonify({'status': 'SUCCESS', 'message': 'If the email exists, a password reset request has been generated.'})
+
+    if user['status'] != 'Active':
+        conn.close()
+        return jsonify({'status': 'SUCCESS', 'message': 'If the email exists, a password reset request has been generated.'})
+
     token = secrets.token_urlsafe(32)
-    expiry = (datetime.utcnow() + timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
+    expiry = (datetime.utcnow() + RESET_TOKEN_TTL).strftime('%Y-%m-%d %H:%M:%S')
     
-    conn.execute('UPDATE Users SET reset_token = ?, reset_expiry = ? WHERE email = ?', (token, expiry, email))
+    conn.execute('UPDATE Users SET reset_token = ?, reset_expiry = ? WHERE email = ?', (hash_token(token), expiry, email))
     conn.commit()
     conn.close()
     
-    # Generate dynamic links based on the request host
-    host_url = request.host_url.rstrip('/')
+    host_url = public_base_url()
     reset_link = f"{host_url}/index.html?reset_token={token}"
     reject_link = f"{host_url}/api/auth/reject_reset?token={token}"
     
@@ -772,19 +823,20 @@ def reset_password():
     
     if not token or not new_password:
         return jsonify({'error': 'Token and password are required'}), 400
+
+    if len(new_password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters.'}), 400
         
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM Users WHERE reset_token = ?', (token,)).fetchone()
+    user = conn.execute('SELECT * FROM Users WHERE reset_token = ?', (hash_token(token),)).fetchone()
     
     if not user:
         conn.close()
         return jsonify({'error': 'Invalid or expired token'}), 400
         
-    # Check expiry
-    expiry_dt = datetime.strptime(user['reset_expiry'], '%Y-%m-%d %H:%M:%S')
-    if datetime.utcnow() > expiry_dt:
+    if user['status'] != 'Active' or token_expired(user['reset_expiry']):
         conn.close()
-        return jsonify({'error': 'Reset token has expired'}), 400
+        return jsonify({'error': 'This reset link is invalid or has expired.'}), 400
         
     hashed_pw = generate_password_hash(new_password, method='pbkdf2:sha256')
     
@@ -801,7 +853,7 @@ def reject_reset():
         return "Invalid token", 400
         
     conn = get_db_connection()
-    conn.execute('UPDATE Users SET reset_token = NULL, reset_expiry = NULL WHERE reset_token = ?', (token,))
+    conn.execute('UPDATE Users SET reset_token = NULL, reset_expiry = NULL WHERE reset_token = ?', (hash_token(token),))
     conn.commit()
     conn.close()
     

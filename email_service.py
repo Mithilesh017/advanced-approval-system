@@ -7,6 +7,7 @@ from email.mime.multipart import MIMEMultipart
 import pytz
 from dotenv import load_dotenv
 import threading
+from html import escape
 
 # Load environment variables
 load_dotenv()
@@ -123,6 +124,13 @@ def _get_base_template(content):
     </html>
     """
 
+def _action_button(link, label):
+    return (
+        f'<div style="margin: 20px 0;"><a href="{escape(link, quote=True)}" '
+        'style="background-color: #0071e3; color: #ffffff; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">'
+        f'{escape(label)}</a></div>'
+    )
+
 def sendUserRegistrationNotification(admin_email, user_email, requested_role):
     subject = "New User Registration Request"
     content = f"""
@@ -130,8 +138,8 @@ def sendUserRegistrationNotification(admin_email, user_email, requested_role):
     <p>A new user has requested access to the Advanced Approval Management System.</p>
     <h4>User Information</h4>
     <ul>
-        <li><strong>Email:</strong> {user_email}</li>
-        <li><strong>Requested Role:</strong> {requested_role}</li>
+        <li><strong>Email:</strong> {escape(user_email)}</li>
+        <li><strong>Requested Role:</strong> {escape(requested_role)}</li>
         <li><strong>Registration Time:</strong> {get_ist_time()}</li>
         <li><strong>Current Status:</strong> Pending Approval</li>
     </ul>
@@ -141,14 +149,15 @@ def sendUserRegistrationNotification(admin_email, user_email, requested_role):
     html = _get_base_template(content)
     _send_email_async(admin_email, subject, html)
 
-def sendUserApprovedEmail(user_email, user_name):
+def sendUserApprovedEmail(user_email, user_name, setup_link):
     subject = "Your Account Has Been Approved"
     content = f"""
-    <h3>Hello {user_name},</h3>
+    <h3>Hello {escape(user_name)},</h3>
     <p>Congratulations.</p>
     <p>Your account has been approved by the Administrator.</p>
-    <p>You now have access to the Advanced Approval Management System.</p>
-    <p>You may now log in and begin submitting approval requests.</p>
+    <p>Create your password using the secure link below to activate your account. The link expires in 72 hours.</p>
+    {_action_button(setup_link, 'Set Up Your Password')}
+    <p>After that, you can log in and begin submitting approval requests.</p>
     <p>Thank you.</p>
     """
     html = _get_base_template(content)
@@ -157,7 +166,7 @@ def sendUserApprovedEmail(user_email, user_name):
 def sendUserRejectedEmail(user_email, user_name):
     subject = "Account Registration Update"
     content = f"""
-    <h3>Hello {user_name},</h3>
+    <h3>Hello {escape(user_name)},</h3>
     <p>Your registration request has been reviewed.</p>
     <p>Unfortunately, your account has not been approved.</p>
     <p>If you believe this is an error, please contact the system administrator.</p>
@@ -173,7 +182,7 @@ def sendAdminRegistrationNotification(superadmin_email, admin_email):
     <p>A new administrator account has been requested.</p>
     <h4>Applicant Details</h4>
     <ul>
-        <li><strong>Email:</strong> {admin_email}</li>
+        <li><strong>Email:</strong> {escape(admin_email)}</li>
         <li><strong>Registration Time:</strong> {get_ist_time()}</li>
         <li><strong>Status:</strong> Pending Approval</li>
     </ul>
@@ -183,13 +192,15 @@ def sendAdminRegistrationNotification(superadmin_email, admin_email):
     html = _get_base_template(content)
     _send_email_async(superadmin_email, subject, html)
 
-def sendAdminApprovedEmail(admin_email, admin_name):
+def sendAdminApprovedEmail(admin_email, admin_name, setup_link):
     subject = "Administrator Access Approved"
     content = f"""
-    <h3>Hello {admin_name},</h3>
+    <h3>Hello {escape(admin_name)},</h3>
     <p>Congratulations.</p>
     <p>Your administrator account has been approved.</p>
-    <p>You now have access to the Admin Dashboard.</p>
+    <p>Create your password using the secure link below to activate your account. The link expires in 72 hours.</p>
+    {_action_button(setup_link, 'Set Up Your Password')}
+    <p>After that, you can access the Admin Dashboard.</p>
     <p>Thank you.</p>
     """
     html = _get_base_template(content)
@@ -198,7 +209,7 @@ def sendAdminApprovedEmail(admin_email, admin_name):
 def sendAdminRejectedEmail(admin_email, admin_name):
     subject = "Administrator Registration Update"
     content = f"""
-    <h3>Hello {admin_name},</h3>
+    <h3>Hello {escape(admin_name)},</h3>
     <p>Your administrator registration request has been reviewed.</p>
     <p>Unfortunately, your request has been rejected.</p>
     <p>Please contact the Super Administrator if additional information is required.</p>
@@ -210,7 +221,7 @@ def sendAdminRejectedEmail(admin_email, admin_name):
 def sendWelcomeEmail(user_email, user_name):
     subject = "Welcome to the Advanced Approval Management System"
     content = f"""
-    <h3>Hello {user_name},</h3>
+    <h3>Hello {escape(user_name)},</h3>
     <p>Welcome to the Advanced Approval Management System.</p>
     <p>We are pleased to have you onboard.</p>
     <p>Thank you.</p>
@@ -225,8 +236,8 @@ def sendPasswordResetEmail(user_email, reset_link, reject_link):
     <p>We received a request to reset your password for your Advanced Approval Management System account.</p>
     <p>Please confirm your request by clicking one of the buttons below:</p>
     <div style="margin: 20px 0;">
-        <a href="{reset_link}" style="background-color: #28a745; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-right: 10px;">Reset Password</a>
-        <a href="{reject_link}" style="background-color: #dc3545; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Reject this Request</a>
+        <a href="{escape(reset_link, quote=True)}" style="background-color: #28a745; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-right: 10px;">Reset Password</a>
+        <a href="{escape(reject_link, quote=True)}" style="background-color: #dc3545; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Reject this Request</a>
     </div>
     <p style="font-size: 13px; color: #555; background: #eee; padding: 10px; border-left: 4px solid #0056b3;">
         <strong>Note:</strong> After you confirm the reset password, please set the new Password by logging into your account through the Portal. Thank You.
