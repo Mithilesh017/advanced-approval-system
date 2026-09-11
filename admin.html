@@ -93,6 +93,9 @@
       return element;
     };
 
+    // SweetAlert2 renders select option labels as HTML, so names and emails are escaped first.
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+
     const formatHistoryTime = (value) => new Date(value).toLocaleString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
     const submissionDetails = (event) => {
@@ -200,7 +203,8 @@
               purpose: r.purpose,
               expenseDate: r.expense_date,
               endDate: r.end_date,
-              receiptCount: r.receipt_count || 0
+              receiptCount: r.receipt_count || 0,
+              approverEmail: r.approver_email
             }));
             setAllRequests(myRequests);
           }
@@ -705,6 +709,9 @@
                             <i className="fas fa-scale-balanced"></i> {violation.name}
                           </span>
                         ))}
+                        {req.status === 'Pending' && req.approverEmail && (
+                          <span className="badge badge-block badge-purple"><i className="fas fa-user-tie"></i> Waiting for manager {req.approverEmail}</span>
+                        )}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
                       <td className="cell-nowrap">
@@ -846,6 +853,40 @@
         }
       };
 
+      const handleSetManager = async (employee) => {
+        const inputOptions = { '': 'No manager (admins decide)' };
+        allUsers
+          .filter(u => u.status === 'Active' && u.email !== employee.email)
+          .forEach(u => { inputOptions[u.email] = escapeHtml(u.name ? `${u.name} (${u.email})` : u.email); });
+
+        const result = await Swal.fire({
+          titleText: `Manager for ${employee.email}`,
+          text: 'Requests that need a person go to this manager first. Requests already waiting move to the new manager.',
+          input: 'select',
+          inputOptions,
+          inputValue: employee.manager_email || '',
+          showCancelButton: true,
+          confirmButtonText: 'Save'
+        });
+        if (!result.isConfirmed) return;
+
+        try {
+          const res = await fetch('/api/auth/set_manager', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: employee.email, manager_email: result.value || null }),
+            credentials: 'include'
+          });
+          if (isSessionExpired(res)) return;
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || 'The manager could not be saved.');
+          fetchUsers();
+          Swal.fire({ icon: 'success', title: 'Manager Saved', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Could Not Save', text: err.message });
+        }
+      };
+
       const pendingUsers = allUsers.filter(u => u.status === 'Pending');
       const activeUsers = allUsers.filter(u => u.status !== 'Pending' && (activeRoleFilter === 'All' || u.role === activeRoleFilter));
 
@@ -940,6 +981,7 @@
                       <tr>
                         <th>Email Address</th>
                         <th>Role</th>
+                        <th>Manager</th>
                         <th>Status</th>
                         <th>Action</th>
                       </tr>
@@ -953,6 +995,14 @@
                           </td>
                           <td>
                             <span className={`badge ${u.role === 'SuperAdmin' ? 'badge-purple' : u.role === 'Admin' ? 'badge-accent' : ''}`}>{u.role}</span>
+                          </td>
+                          <td>
+                            <div className="cell-secondary">{u.manager_email || 'No manager'}</div>
+                            {u.status === 'Active' && (userRole === 'SuperAdmin' || u.role === 'User') && (
+                              <button type="button" className="btn btn-secondary btn-sm" onClick={() => handleSetManager(u)}>
+                                <i className="fas fa-user-tie"></i> {u.manager_email ? 'Change' : 'Assign'}
+                              </button>
+                            )}
                           </td>
                           <td>
                             <span className={`status-badge ${u.status === 'Active' ? 'status-approved' : u.status === 'Rejected' ? 'status-rejected' : 'status-pending'}`}>{u.status}</span>

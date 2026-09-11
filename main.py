@@ -80,7 +80,7 @@ def require_login(fn):
         conn = get_db_connection()
         try:
             user = conn.execute(
-                'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, '
+                'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, Users.manager_email, '
                 'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
@@ -530,6 +530,8 @@ REQUEST_EXTRA_COLUMNS = {
     'purpose': 'TEXT',
     'expense_date': 'TEXT',
     'end_date': 'TEXT',
+    # Who must decide a request that is waiting: the employee's manager, or NULL when the admins decide.
+    'approver_email': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -547,6 +549,7 @@ def check_and_add_columns():
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
+        cursor.execute('ALTER TABLE Users ADD COLUMN IF NOT EXISTS manager_email TEXT')
         conn.commit()
         conn.close()
         return
@@ -564,6 +567,8 @@ def check_and_add_columns():
         cursor.execute("ALTER TABLE Users ADD COLUMN reset_token TEXT")
     if 'reset_expiry' not in columns:
         cursor.execute("ALTER TABLE Users ADD COLUMN reset_expiry DATETIME")
+    if 'manager_email' not in columns:
+        cursor.execute("ALTER TABLE Users ADD COLUMN manager_email TEXT")
 
     cursor.execute("PRAGMA table_info(Requests)")
     request_columns = {col[1] for col in cursor.fetchall()}
@@ -826,12 +831,27 @@ def save_receipts(conn, organization_id, request_id, uploader, receipts):
         record_event(conn, 'receipt.added', organization_id=organization_id, request_id=request_id, actor=uploader,
                      details={'receipt_id': receipt_id, **details})
 
-def can_view_request(conn, request_id):
-    # Employees see receipts on their own requests; admins see every receipt in their organization.
+def is_manager_of(conn, employee_email):
+    return bool(conn.execute(
+        'SELECT 1 FROM Users WHERE email = ? AND organization_id = ? AND manager_email = ?',
+        (employee_email, g.user['organization_id'], g.user['email'])
+    ).fetchone())
+
+def can_review_request(conn, request_id):
+    # Admins review every request in their organization; managers review their direct reports' requests.
+    if g.user['role'] in ('Admin', 'SuperAdmin'):
+        return True
     row = conn.execute(
         'SELECT submitted_by FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])
     ).fetchone()
-    return bool(row) and (row['submitted_by'] == g.user['email'] or g.user['role'] in ('Admin', 'SuperAdmin'))
+    return bool(row) and is_manager_of(conn, row['submitted_by'])
+
+def can_view_request(conn, request_id):
+    # Employees see receipts on their own requests; their manager and the organization's admins see them too.
+    row = conn.execute(
+        'SELECT submitted_by FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])
+    ).fetchone()
+    return bool(row) and (row['submitted_by'] == g.user['email'] or can_review_request(conn, request_id))
 
 @app.errorhandler(413)
 def upload_too_large(error):
@@ -1262,17 +1282,19 @@ def predict():
         })
         if violations:
             status = 'ESCALATED_RULE'
+        # A request that needs a person goes to the employee's manager first; without a manager, the admins decide.
+        approver_email = g.user['manager_email'] if status.startswith('ESCALATED') else None
         request_id = conn.execute(
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
                 final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode,
-                policy_violations, purpose, expense_date, end_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
+                policy_violations, purpose, expense_date, end_date, approver_email
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
              status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode,
-             json.dumps(violations) if violations else None, purpose, expense_date, end_date)
+             json.dumps(violations) if violations else None, purpose, expense_date, end_date, approver_email)
         ).fetchall()[0][0]
         record_event(
             conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
@@ -1281,6 +1303,7 @@ def predict():
                 'approval_mode': approval_mode,
                 'ai_recommendation': ai_decision,
                 'policy_violations': violations,
+                'approver': approver_email,
                 'approval_score': round(xgb_prob, 4),
                 'unrecognized_category': is_unknown_category,
                 'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
@@ -1821,6 +1844,74 @@ def update_approval_settings():
         conn.close()
     return jsonify({'status': 'SUCCESS', 'auto_approve_above': value})
 
+@app.route('/api/auth/set_manager', methods=['POST'])
+@require_role('Admin')
+def set_manager():
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    manager_email = data.get('manager_email') or None
+    if not isinstance(email, str) or (manager_email is not None and not isinstance(manager_email, str)):
+        return jsonify({'error': 'email and manager_email must be email addresses.'}), 400
+    if manager_email == email:
+        return jsonify({'error': 'An employee cannot be their own manager.'}), 400
+
+    organization_id = g.user['organization_id']
+    conn = get_db_connection()
+    try:
+        employee = conn.execute(
+            'SELECT email, role, manager_email FROM Users WHERE email = ? AND organization_id = ?', (email, organization_id)
+        ).fetchone()
+        if not employee:
+            return jsonify({'error': 'User not found.'}), 404
+        # Admins manage employees' reporting lines; only Super Admins change an administrator's manager.
+        if employee['role'] != 'User' and g.user['role'] != 'SuperAdmin':
+            return jsonify({'error': "Only a Super Admin can change an administrator's manager."}), 403
+
+        if manager_email:
+            manager = conn.execute(
+                "SELECT email FROM Users WHERE email = ? AND organization_id = ? AND status = 'Active'", (manager_email, organization_id)
+            ).fetchone()
+            if not manager:
+                return jsonify({'error': 'The manager must be an active account in your organization.'}), 404
+            # Walk up from the new manager: reaching the employee again would make a reporting loop.
+            current, seen = manager_email, set()
+            while current and current not in seen:
+                if current == email:
+                    return jsonify({'error': 'This would make a loop where people manage each other.'}), 409
+                seen.add(current)
+                row = conn.execute('SELECT manager_email FROM Users WHERE email = ? AND organization_id = ?', (current, organization_id)).fetchone()
+                current = row['manager_email'] if row else None
+
+        if employee['manager_email'] != manager_email:
+            conn.execute('UPDATE Users SET manager_email = ? WHERE email = ? AND organization_id = ?', (manager_email, email, organization_id))
+            # Requests already waiting for a decision move to the new manager, or to the admins when there is none.
+            conn.execute(
+                "UPDATE Requests SET approver_email = ? WHERE submitted_by = ? AND organization_id = ? AND final_decision LIKE 'ESCALATED%'",
+                (manager_email, email, organization_id)
+            )
+            record_event(conn, 'user.manager_changed', organization_id=organization_id, actor=g.user['email'],
+                         details={'email': email, 'from': employee['manager_email'], 'to': manager_email})
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/team_requests', methods=['GET'])
+@require_login
+def team_requests():
+    # A manager sees the requests of the people who report to them; approver_email shows which are waiting for them.
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT Requests.*, {RECEIPT_COUNT_SQL} FROM Requests "
+            "JOIN Users ON Users.email = Requests.submitted_by AND Users.organization_id = Requests.organization_id "
+            "WHERE Requests.organization_id = ? AND Users.manager_email = ? ORDER BY Requests.created_at DESC",
+            (g.user['organization_id'], g.user['email'])
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({'requests': [to_json_row(row) for row in rows]})
+
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
 def request_access():
@@ -1944,7 +2035,7 @@ def get_pending_users():
 def get_all_users():
     conn = get_db_connection()
     users = conn.execute(
-        'SELECT id, email, name, role, status, created_at FROM Users WHERE organization_id = ?', (g.user['organization_id'],)
+        'SELECT id, email, name, role, status, manager_email, created_at FROM Users WHERE organization_id = ?', (g.user['organization_id'],)
     ).fetchall()
     conn.close()
     
@@ -1973,6 +2064,9 @@ def delete_user():
 
     cursor = conn.execute('DELETE FROM Users WHERE email = ? AND organization_id = ?', (email, g.user['organization_id']))
     if cursor.rowcount:
+        # People who reported to the removed account lose their manager, and requests waiting for it go to the admins.
+        conn.execute('UPDATE Users SET manager_email = NULL WHERE manager_email = ? AND organization_id = ?', (email, g.user['organization_id']))
+        conn.execute('UPDATE Requests SET approver_email = NULL WHERE approver_email = ? AND organization_id = ?', (email, g.user['organization_id']))
         record_event(conn, 'user.deleted', organization_id=g.user['organization_id'], actor=g.user['email'],
                      details={'email': email, 'role': target['role'] if target else None})
     conn.commit()
@@ -2076,7 +2170,13 @@ def get_profile():
     email = get_jwt_identity()
         
     conn = get_db_connection()
-    user = conn.execute('SELECT name, emp_id, role, created_at FROM Users WHERE email = ?', (email,)).fetchone()
+    user = conn.execute(
+        'SELECT name, emp_id, role, manager_email, created_at, '
+        '(SELECT COUNT(*) FROM Users AS reports WHERE reports.manager_email = Users.email '
+        'AND reports.organization_id = Users.organization_id) AS report_count '
+        'FROM Users WHERE email = ?',
+        (email,)
+    ).fetchone()
     conn.close()
     
     if user:
@@ -2152,7 +2252,7 @@ def is_decided(decision):
 
 COMMENT_MAX_LENGTH = 1000
 
-def change_request_decision(new_decision, allowed_from, conflict_message, action, reason_required=False):
+def change_request_decision(new_decision, allowed_from, conflict_message, action, reason_required=False, managers_allowed=False):
     data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
@@ -2165,10 +2265,14 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
     conn = get_db_connection()
     try:
         target = conn.execute(
-            'SELECT id, submitted_by, final_decision FROM Requests WHERE id = ? AND organization_id = ?',
+            'SELECT id, submitted_by, final_decision, approver_email FROM Requests WHERE id = ? AND organization_id = ?',
             (req_id, g.user['organization_id'])
         ).fetchone()
         if not target:
+            return jsonify({'error': 'Request not found.'}), 404
+        # Admins decide any request in their organization; a manager decides only the requests waiting for them.
+        is_assigned_manager = managers_allowed and target['approver_email'] == g.user['email']
+        if g.user['role'] not in ('Admin', 'SuperAdmin') and not is_assigned_manager:
             return jsonify({'error': 'Request not found.'}), 404
         if target['submitted_by'] == g.user['email']:
             return jsonify({'error': 'You cannot review your own request.'}), 403
@@ -2178,18 +2282,27 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
             return jsonify({'error': 'Please give a reason. It is saved in the request history.'}), 400
 
         reviewer = g.user['email'] if is_decided(new_decision) else None
-        # Matching the status that was checked stops two admins acting at once from overwriting each other.
+        next_approver = None
+        if not is_decided(new_decision):
+            # A reopened request goes back to the employee's current manager, or to the admins if they have none.
+            submitter = conn.execute(
+                'SELECT manager_email FROM Users WHERE email = ? AND organization_id = ?',
+                (target['submitted_by'], g.user['organization_id'])
+            ).fetchone()
+            next_approver = submitter['manager_email'] if submitter else None
+        # Matching the status that was checked stops two people acting at once from overwriting each other.
         cursor = conn.execute(
-            f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'} "
-            'WHERE id = ? AND organization_id = ? AND final_decision = ?',
-            (new_decision, reviewer, target['id'], g.user['organization_id'], target['final_decision'])
+            f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'}, "
+            'approver_email = ? WHERE id = ? AND organization_id = ? AND final_decision = ?',
+            (new_decision, reviewer, next_approver, target['id'], g.user['organization_id'], target['final_decision'])
         )
         if not cursor.rowcount:
             return jsonify({'error': conflict_message}), 409
         # The decision and its history entry are saved together, or neither is.
         record_event(
             conn, action, organization_id=g.user['organization_id'], request_id=target['id'], actor=g.user['email'],
-            from_status=target['final_decision'], to_status=new_decision, comment=comment
+            from_status=target['final_decision'], to_status=new_decision, comment=comment,
+            details={'decided_as': 'manager' if is_assigned_manager else 'admin'}
         )
         conn.commit()
     finally:
@@ -2197,17 +2310,19 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
     return jsonify({'status': 'SUCCESS'})
 
 @app.route('/api/auth/approve_request', methods=['POST'])
-@require_role('Admin')
+@require_login
 def approve_request():
     return change_request_decision(
-        'APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.', 'request.approved'
+        'APPROVED', is_awaiting_review, 'Only requests awaiting review can be approved.', 'request.approved',
+        managers_allowed=True
     )
 
 @app.route('/api/auth/reject_request', methods=['POST'])
-@require_role('Admin')
+@require_login
 def reject_request():
     return change_request_decision(
-        'REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.', 'request.rejected', reason_required=True
+        'REJECTED', is_awaiting_review, 'Only requests awaiting review can be rejected.', 'request.rejected',
+        reason_required=True, managers_allowed=True
     )
 
 @app.route('/api/auth/reopen_request', methods=['POST'])
@@ -2219,7 +2334,7 @@ def reopen_request():
     )
 
 @app.route('/api/auth/request_history', methods=['GET'])
-@require_role('Admin')
+@require_login
 def request_history():
     request_id = request.args.get('id', type=int)
     if request_id is None:
@@ -2229,6 +2344,8 @@ def request_history():
     try:
         if not conn.execute('SELECT id FROM Requests WHERE id = ? AND organization_id = ?', (request_id, g.user['organization_id'])).fetchone():
             return jsonify({'error': 'Request not found.'}), 404
+        if not can_review_request(conn, request_id):
+            return jsonify({'error': "Only administrators and the employee's manager can see this history."}), 403
         rows = conn.execute(
             'SELECT action, actor_email, from_status, to_status, comment, details, created_at FROM AuditEvents '
             'WHERE request_id = ? AND organization_id = ? ORDER BY id',
