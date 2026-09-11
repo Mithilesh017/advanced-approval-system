@@ -58,7 +58,7 @@ def _send_email_task(to_email, subject, html_content):
                 'Authorization': f'Bearer {SENDGRID_API_KEY}',
                 'Content-Type': 'application/json'
             })
-            urllib.request.urlopen(req)
+            urllib.request.urlopen(req, timeout=10)
             logger.info(f"Email Sent via SendGrid | Recipient: {to_email} | Subject: {subject} | Timestamp: {get_ist_time()} | Status: Success")
             return True
         except Exception as e:

@@ -802,7 +802,7 @@
                             <span className={`badge ${u.role === 'Admin' ? 'badge-accent' : ''}`}>{u.role}</span>
                           </td>
                           <td className="cell-muted">
-                            {new Date(u.created_at.replace(' ', 'T') + 'Z').toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                            {new Date(u.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true, year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                           </td>
                           <td>
                             <div className="cell-actions">

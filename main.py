@@ -2,7 +2,9 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from decimal import Decimal
 import hashlib
+import math
 import re
 import sqlite3
 import os
@@ -92,10 +94,31 @@ def token_expired(expiry):
 def public_base_url():
     return (os.getenv('APP_BASE_URL') or request.host_url).rstrip('/')
 
+SQLITE_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+def to_json_row(row):
+    # Both databases store CURRENT_TIMESTAMP in UTC; emit one ISO-8601 format so every browser parses it.
+    result = {}
+    for key, value in dict(row).items():
+        if isinstance(value, datetime):
+            value = value.strftime('%Y-%m-%dT%H:%M:%SZ')
+        elif isinstance(value, Decimal):
+            value = float(value)
+        elif key.endswith('_at') and isinstance(value, str) and SQLITE_TIMESTAMP.fullmatch(value):
+            value = value.replace(' ', 'T') + 'Z'
+        result[key] = value
+    return result
+
 # ==========================================
 # 1. AUTHENTICATION & DATABASE CONFIGURATION
 # ==========================================
 DB_FILE = 'auth.db'
+
+try:
+    import psycopg2
+    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg2.IntegrityError)
+except ImportError:
+    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
 
 # Initialize Super Admin via environment variables if provided
 def bootstrap_super_admin():
@@ -262,6 +285,7 @@ bootstrap_super_admin()
 # 2. MACHINE LEARNING CONFIGURATION
 # ==========================================
 print("Loading ensemble model artifacts...")
+MODEL_READY = False
 try:
     artifacts = joblib.load("ensemble_ai_model.pkl")
     xgb_model = artifacts['xgboost_model']
@@ -271,6 +295,7 @@ try:
     encoders = artifacts['encoders']
     scaler = artifacts['scaler']
     features = artifacts['features']
+    MODEL_READY = True
     print("Model artifacts loaded successfully.")
 except Exception as e:
     print(f"Error loading model artifacts: {e}")
@@ -309,9 +334,15 @@ def index():
 @limiter.limit("20 per minute")
 @jwt_required()
 def predict():
+    if not MODEL_READY:
+        return jsonify({
+            'error': 'The AI model is currently unavailable. Please try again later.',
+            'status': 'ESCALATED_SYSTEM_ERROR'
+        }), 503
+
     try:
         current_email = get_jwt_identity()
-        data = request.json
+        data = request.get_json(silent=True) or {}
         
         # Extract inputs
         role = data.get('Role')
@@ -323,11 +354,14 @@ def predict():
 
         required_fields = ['Role', 'Department', 'Request_Type', 'Destination', 'Currency']
         if not all(data.get(f) for f in required_fields):
-            return jsonify({'error': f'Missing required fields.'}), 400
+            return jsonify({'error': 'Missing required fields.'}), 400
+
+        if currency not in exchange_rates:
+            return jsonify({'error': 'Unsupported currency.'}), 400
             
         try:
             amount = float(amount)
-            if amount <= 0:
+            if not math.isfinite(amount) or amount <= 0:
                 raise ValueError
         except (TypeError, ValueError):
             return jsonify({'error': 'Amount must be a positive number.'}), 400
@@ -414,9 +448,10 @@ def predict():
             'shap_explanations': shap_impact
         })
 
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Prediction failed")
         return jsonify({
-            'error': str(e),
+            'error': 'An internal system error occurred during AI processing.',
             'status': 'ESCALATED_SYSTEM_ERROR',
             'message': 'An internal system error occurred during AI processing.'
         }), 500
@@ -428,7 +463,7 @@ def predict():
 @app.route('/api/auth/login', methods=['POST'])
 @limiter.limit("5 per minute")
 def login():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     password = data.get('password')
 
@@ -474,7 +509,7 @@ def login():
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
 def request_access():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = (data.get('email') or '').strip()
     role = data.get('role', 'User')
 
@@ -492,13 +527,16 @@ def request_access():
     if existing_user and existing_user['role'] == 'SuperAdmin':
         conn.close()
         return jsonify({'error': 'This email is reserved for Super Admins.'}), 400
+    if existing_user:
+        conn.close()
+        return jsonify({'error': 'Email already exists or is pending.'}), 409
     try:
         conn.execute(
             'INSERT INTO Users (email, role, status) VALUES (?, ?, ?)',
             (email, role, 'Pending')
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERRORS:
         return jsonify({'error': 'Email already exists or is pending.'}), 409
     finally:
         conn.close()
@@ -525,7 +563,7 @@ def request_access():
 @app.route('/api/auth/setup_password', methods=['POST'])
 @limiter.limit("10 per hour")
 def setup_password():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     token = data.get('token')
     password = data.get('password')
 
@@ -570,7 +608,7 @@ def get_pending_users():
     users = conn.execute('SELECT id, email, role, status, created_at FROM Users WHERE status = "Pending"').fetchall()
     conn.close()
     
-    users_list = [dict(u) for u in users]
+    users_list = [to_json_row(u) for u in users]
     return jsonify(users_list)
 
 @app.route('/api/auth/users', methods=['GET'])
@@ -580,13 +618,13 @@ def get_all_users():
     users = conn.execute('SELECT id, email, name, role, status, created_at FROM Users').fetchall()
     conn.close()
     
-    users_list = [dict(u) for u in users]
+    users_list = [to_json_row(u) for u in users]
     return jsonify(users_list)
 
 @app.route('/api/auth/delete_user', methods=['POST'])
 @require_role('Admin')
 def delete_user():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
@@ -613,7 +651,7 @@ def delete_user():
 @app.route('/api/auth/approve_user', methods=['POST'])
 @require_role('Admin')
 def approve_user():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
@@ -648,7 +686,7 @@ def approve_user():
 @app.route('/api/auth/reject_user', methods=['POST'])
 @require_role('Admin')
 def reject_user():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
@@ -689,13 +727,13 @@ def get_profile():
     conn.close()
     
     if user:
-        return jsonify(dict(user))
+        return jsonify(to_json_row(user))
     return jsonify({'error': 'User not found'}), 404
 
 @app.route('/api/auth/update_profile', methods=['POST'])
 @jwt_required()
 def update_profile():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = get_jwt_identity()
     name = data.get('name')
     emp_id = data.get('emp_id')
@@ -718,7 +756,7 @@ def my_requests():
     requests = conn.execute('SELECT * FROM Requests WHERE submitted_by = ? ORDER BY created_at DESC', (current_email,)).fetchall()
     conn.close()
     
-    requests_list = [dict(r) for r in requests]
+    requests_list = [to_json_row(r) for r in requests]
     return jsonify(requests_list)
 
 @app.route('/api/auth/pending_approval_requests', methods=['GET'])
@@ -728,7 +766,7 @@ def pending_approval_requests():
     requests = conn.execute("SELECT * FROM Requests WHERE final_decision LIKE 'ESCALATED%' ORDER BY created_at DESC").fetchall()
     conn.close()
     
-    requests_list = [dict(r) for r in requests]
+    requests_list = [to_json_row(r) for r in requests]
     return jsonify(requests_list)
 
 @app.route('/api/auth/all_requests', methods=['GET'])
@@ -738,41 +776,47 @@ def all_requests():
     requests = conn.execute("SELECT * FROM Requests ORDER BY created_at DESC").fetchall()
     conn.close()
     
-    requests_list = [dict(r) for r in requests]
+    requests_list = [to_json_row(r) for r in requests]
     return jsonify(requests_list)
 
 @app.route('/api/auth/approve_request', methods=['POST'])
 @require_role('Admin')
 def approve_request():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
         return jsonify({'error': 'Request ID is required'}), 400
         
     conn = get_db_connection()
-    conn.execute("UPDATE Requests SET final_decision = 'APPROVED' WHERE id = ?", (req_id,))
+    cursor = conn.execute("UPDATE Requests SET final_decision = 'APPROVED' WHERE id = ?", (req_id,))
     conn.commit()
+    updated = cursor.rowcount
     conn.close()
+    if not updated:
+        return jsonify({'error': 'Request not found.'}), 404
     return jsonify({'status': 'SUCCESS'})
 
 @app.route('/api/auth/reject_request', methods=['POST'])
 @require_role('Admin')
 def reject_request():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     req_id = data.get('id')
     if not req_id:
         return jsonify({'error': 'Request ID is required'}), 400
         
     conn = get_db_connection()
-    conn.execute("UPDATE Requests SET final_decision = 'REJECTED' WHERE id = ?", (req_id,))
+    cursor = conn.execute("UPDATE Requests SET final_decision = 'REJECTED' WHERE id = ?", (req_id,))
     conn.commit()
+    updated = cursor.rowcount
     conn.close()
+    if not updated:
+        return jsonify({'error': 'Request not found.'}), 404
     return jsonify({'status': 'SUCCESS'})
 
 @app.route('/api/auth/request_password_reset', methods=['POST'])
 @limiter.limit("3 per hour")
 def request_password_reset():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
@@ -817,7 +861,7 @@ def request_password_reset():
 
 @app.route('/api/auth/reset_password', methods=['POST'])
 def reset_password():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     token = data.get('token')
     new_password = data.get('password')
     
