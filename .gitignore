@@ -3,3 +3,11 @@
 *.sqlite
 *.csv
 __pycache__/
+*.pyc
+.venv/
+venv/
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
