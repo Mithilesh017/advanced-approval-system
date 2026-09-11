@@ -1,10 +1,11 @@
 """Neuzem sets each organization's approval mode; organizations may only make auto-approval stricter."""
 import json
 
-import numpy as np
 import pytest
 
-from conftest import SUPER_ADMIN, create_organization, create_platform_owner, create_user, execute, login, query
+from conftest import (
+    SUPER_ADMIN, create_organization, create_platform_owner, create_user, execute, login, query, use_model_score,
+)
 
 REQUEST = {
     'Role': 'Junior Developer', 'Department': 'Engineering', 'Request_Type': 'Hotel Booking',
@@ -13,31 +14,10 @@ REQUEST = {
 UPDATE_SETTINGS = '/api/auth/update_approval_settings'
 
 
-class FixedScore:
-    def __init__(self, score):
-        self.score = score
-
-    def predict_proba(self, features):
-        return np.array([[1 - self.score, self.score]])
-
-
-class NoAnomaly:
-    def predict(self, features):
-        return np.array([1])
-
-
 def session(app_db, email):
     client = app_db.app.test_client()
     login(client, email)
     return client
-
-
-def use_model_score(app_db, monkeypatch, score):
-    artifacts = {
-        **app_db.load_bundled_artifacts(),
-        'xgboost_model': FixedScore(score), 'isolation_forest': NoAnomaly(), 'one_class_svm': NoAnomaly(),
-    }
-    monkeypatch.setattr(app_db, 'get_active_model', lambda force=False: (artifacts, None))
 
 
 def submit(client):

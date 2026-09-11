@@ -552,7 +552,7 @@
             <div className="panel">
               <h3 className="panel-title"><i className="fas fa-cogs"></i> Decision Pipeline</h3>
               <p className="panel-subtitle">
-                Requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% are auto-approved. Unknown categories, detected anomalies, and lower scores are escalated for manual review.
+                In organizations using automatic approval, requests scoring above {Math.round(info.thresholds.auto_approve_above * 100)}% (or the organization's stricter threshold) are auto-approved. In shadow mode a person decides every request and the AI's recommendation is saved. Unknown categories, detected anomalies, and lower scores are always escalated for manual review.
               </p>
               <div className="table-scroll">
                 <table className="data-table">

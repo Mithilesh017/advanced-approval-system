@@ -57,7 +57,8 @@
       ESCALATED_UNKNOWN: 'Unrecognized category',
       ESCALATED_ANOMALY: 'Anomaly detected',
       ESCALATED_POLICY: 'Low AI confidence',
-      ESCALATED_MANUAL_REVIEW: 'Needs manual review'
+      ESCALATED_MANUAL_REVIEW: 'Needs manual review',
+      ESCALATED_SHADOW: 'AI recommends approval'
     };
 
     const DECISION_PROMPTS = {
@@ -88,7 +89,8 @@
       const details = event.details || {};
       const outcome = event.to_status === 'APPROVED' ? 'Approved automatically' : (DECISION_LABELS[event.to_status] || event.to_status);
       const model = details.model_version ? `model version ${details.model_version}` : 'original model';
-      const parts = [historyNode('div', 'history-meta', [`Outcome: ${outcome} · AI approval score ${(details.approval_score * 100).toFixed(1)}% · ${model}`])];
+      const mode = details.approval_mode === 'shadow' ? ' · shadow mode' : '';
+      const parts = [historyNode('div', 'history-meta', [`Outcome: ${outcome} · AI approval score ${(details.approval_score * 100).toFixed(1)}% · ${model}${mode}`])];
       if (details.explanation) {
         const rows = Object.entries(details.explanation)
           .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
@@ -159,7 +161,8 @@
               raw_status: r.final_decision,
               aiScore: (r.xgb_score * 100).toFixed(1) + '%',
               confidence: r.xgb_score == null ? undefined : Math.round(r.xgb_score * 1000) / 10,
-              reason: DECISION_LABELS[r.final_decision]
+              reason: DECISION_LABELS[r.final_decision],
+              shadowRecommendation: r.approval_mode === 'shadow' ? r.ai_decision : null
             }));
             setAllRequests(myRequests);
           }
@@ -643,6 +646,11 @@
                           </span>
                         )}
                         {req.reason && <span className="badge badge-block badge-accent">{req.reason}</span>}
+                        {req.shadowRecommendation && req.status !== 'Pending' && (
+                          <span className={`badge badge-block ${req.shadowRecommendation === 'APPROVED' ? 'badge-green' : 'badge-orange'}`}>
+                            <i className="fas fa-eye"></i> AI {req.shadowRecommendation === 'APPROVED' ? 'recommended approval' : 'flagged for review'}
+                          </span>
+                        )}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
                       <td className="cell-nowrap">

@@ -462,6 +462,9 @@ REQUEST_EXTRA_COLUMNS = {
     'employee_id': 'TEXT',
     'reviewed_by': 'TEXT',
     'reviewed_at': 'TIMESTAMP',
+    # What the AI decided on its own and the approval mode in force, kept to measure agreement with people.
+    'ai_decision': 'TEXT',
+    'approval_mode': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -801,22 +804,31 @@ def predict():
         else:
             status = "ESCALATED_MANUAL_REVIEW"
 
+        # In shadow mode the AI only recommends, so a request it would approve still waits for a person.
+        # Any mode other than an explicit "automatic" is treated as shadow, so a bad value never auto-approves.
+        ai_decision = status
+        approval_mode = 'automatic' if g.user['approval_mode'] == 'automatic' else 'shadow'
+        if approval_mode == 'shadow' and ai_decision == 'APPROVED':
+            status = 'ESCALATED_SHADOW'
+
         # Persist to DB
         conn = get_db_connection()
         request_id = conn.execute(
             '''INSERT INTO Requests (
                 role, department, request_type, destination, amount, currency, 
                 normalized_amount, xgb_score, iso_score, svm_score, risk_score, 
-                final_decision, submitted_by, employee_name, employee_id, organization_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
+                final_decision, submitted_by, employee_name, employee_id, organization_id, ai_decision, approval_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id''',
             (role, department, req_type, destination, amount, currency,
              normalized_inr, xgb_prob, iso_pred, svm_pred, (1 - xgb_prob)*100,
-             status, current_email, employee_name, employee_id, g.user['organization_id'])
+             status, current_email, employee_name, employee_id, g.user['organization_id'], ai_decision, approval_mode)
         ).fetchall()[0][0]
         record_event(
             conn, 'request.submitted', organization_id=g.user['organization_id'], request_id=request_id,
             actor=current_email, to_status=status, details={
                 'model_version': model_version_id,
+                'approval_mode': approval_mode,
+                'ai_recommendation': ai_decision,
                 'approval_score': round(xgb_prob, 4),
                 'unrecognized_category': is_unknown_category,
                 'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
