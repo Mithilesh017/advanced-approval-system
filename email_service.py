@@ -263,3 +263,28 @@ def sendPasswordResetEmail(user_email, reset_link, reject_link):
     """
     html = _get_base_template(content)
     _send_email_async(user_email, subject, html)
+
+def sendApprovalWaitingEmail(approver_email, summary, portal_link, organization_name, note=None):
+    subject = f"Approval needed: {summary.get('reference', 'a request')}"
+    rows = [
+        ('Reference', summary.get('reference')),
+        ('Employee', summary.get('employee')),
+        ('Request', summary.get('details')),
+        ('Amount', summary.get('amount')),
+        ('Purpose', summary.get('purpose')),
+    ]
+    listed = ''.join(
+        f"<li><strong>{escape(label)}:</strong> {escape(str(value))}</li>" for label, value in rows if value
+    )
+    content = f"""
+    <h3>Hello,</h3>
+    <p>A request in {_organization(organization_name)} is waiting for your decision.</p>
+    {f'<p>{escape(note)}</p>' if note else ''}
+    <h4>Request Details</h4>
+    <ul>{listed}</ul>
+    {_action_button(portal_link, 'Open the Portal')}
+    <p>Approving or rejecting takes a moment, and your decision is saved in the request history.</p>
+    <p>Thank you.</p>
+    """
+    html = _get_base_template(content)
+    _send_email_async(approver_email, subject, html)

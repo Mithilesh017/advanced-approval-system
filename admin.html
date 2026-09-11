@@ -59,7 +59,9 @@
       ESCALATED_POLICY: 'Low AI confidence',
       ESCALATED_MANUAL_REVIEW: 'Needs manual review',
       ESCALATED_SHADOW: 'AI recommends approval',
-      ESCALATED_RULE: 'Breaks a policy rule'
+      ESCALATED_RULE: 'Breaks a policy rule',
+      ESCALATED_HIGH_VALUE: 'Large amount',
+      ESCALATED_SECOND_APPROVAL: 'Waiting for a second approval'
     };
 
     const parseViolations = (value) => {
@@ -79,6 +81,7 @@
     const HISTORY_ACTIONS = {
       'request.submitted': 'Submitted',
       'request.approved': 'Approved',
+      'request.first_approved': 'First approval given',
       'request.rejected': 'Rejected',
       'request.reopened': 'Moved back to pending',
       'receipt.added': 'Receipt added'
@@ -204,7 +207,8 @@
               expenseDate: r.expense_date,
               endDate: r.end_date,
               receiptCount: r.receipt_count || 0,
-              approverEmail: r.approver_email
+              approverEmail: r.approver_email,
+              firstApprovedBy: r.first_approved_by
             }));
             setAllRequests(myRequests);
           }
@@ -331,6 +335,7 @@
                     requests={allRequests} 
                     currentStatus={view === 'pending' ? 'Pending' : view === 'approved' ? 'Approved' : 'Rejected'} 
                     refresh={loadData} 
+                    currentUserEmail={user.email}
                 />
             }
             {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
@@ -518,7 +523,7 @@
       );
     }
 
-    function TableView({ requests, currentStatus, refresh }) {
+    function TableView({ requests, currentStatus, refresh, currentUserEmail }) {
       const tableRef = useRef(null);
       const [department, setDepartment] = useState('');
       const [reqType, setReqType] = useState('');
@@ -587,7 +592,14 @@
           const data = await res.json().catch(() => ({}));
           if (res.ok) {
             refresh();
-            Swal.fire({ icon: 'success', title: newStatus === 'Pending' ? 'Moved to Pending' : `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+            if (data.final_decision === 'ESCALATED_SECOND_APPROVAL') {
+              Swal.fire({
+                icon: 'info', title: 'First Approval Saved',
+                text: 'This amount needs two approvals, so another administrator must approve it as well.'
+              });
+            } else {
+              Swal.fire({ icon: 'success', title: newStatus === 'Pending' ? 'Moved to Pending' : `Request ${newStatus}`, timer: 1500, showConfirmButton: false });
+            }
           } else {
             Swal.fire({ icon: 'error', title: 'Update Failed', text: data.error || data.msg || 'The request could not be updated.' });
           }
@@ -712,12 +724,19 @@
                         {req.status === 'Pending' && req.approverEmail && (
                           <span className="badge badge-block badge-purple"><i className="fas fa-user-tie"></i> Waiting for manager {req.approverEmail}</span>
                         )}
+                        {req.firstApprovedBy && (
+                          <span className="badge badge-block badge-purple"><i className="fas fa-user-check"></i> First approved by {req.firstApprovedBy}</span>
+                        )}
                       </td>
                       <td>{getStatusBadge(req.status)}</td>
                       <td className="cell-nowrap">
                         {req.status === 'Pending' ? (
                           <>
-                            <button type="button" className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve" aria-label="Approve"><i className="fas fa-check"></i></button>
+                            {req.firstApprovedBy === currentUserEmail ? (
+                              <span className="cell-muted" title="You gave the first approval, so somebody else must give the second one.">Approved by you</span>
+                            ) : (
+                              <button type="button" className="action-btn edit" onClick={() => handleAction(req.id, 'Approved')} title="Approve" aria-label="Approve"><i className="fas fa-check"></i></button>
+                            )}
                             <button type="button" className="action-btn delete" onClick={() => handleAction(req.id, 'Rejected')} title="Reject" aria-label="Reject"><i className="fas fa-xmark"></i></button>
                           </>
                         ) : (
@@ -1256,11 +1275,17 @@
     function SettingsView({ organization, onSaved }) {
       const settings = organization && organization.approval_settings;
       const [percent, setPercent] = useState('');
+      const [secondApproval, setSecondApproval] = useState('');
       const [saving, setSaving] = useState(false);
+      const [savingSecond, setSavingSecond] = useState(false);
 
       useEffect(() => {
         if (settings) setPercent(String(Math.round(settings.auto_approve_above * 100)));
       }, [settings && settings.auto_approve_above]);
+
+      useEffect(() => {
+        if (settings) setSecondApproval(settings.second_approval_above == null ? '' : String(settings.second_approval_above));
+      }, [settings && settings.second_approval_above]);
 
       if (!settings) {
         return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading approval settings...</div></div>;
@@ -1270,19 +1295,13 @@
       const maximum = Math.round(settings.maximum_auto_approve_above * 100);
       const shadow = settings.approval_mode === 'shadow';
 
-      const handleSave = async (e) => {
-        e.preventDefault();
-        const value = Number(percent);
-        if (!Number.isInteger(value) || value < minimum || value > maximum) {
-          Swal.fire({ icon: 'error', title: 'Invalid Threshold', text: `Enter a whole number from ${minimum} to ${maximum}.` });
-          return;
-        }
-        setSaving(true);
+      const saveSettings = async (body, setBusy) => {
+        setBusy(true);
         try {
           const res = await fetch('/api/auth/update_approval_settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ auto_approve_above: value / 100 }),
+            body: JSON.stringify(body),
             credentials: 'include'
           });
           if (isSessionExpired(res)) return;
@@ -1293,8 +1312,29 @@
         } catch (err) {
           Swal.fire({ icon: 'error', title: 'Save Failed', text: err.message });
         } finally {
-          setSaving(false);
+          setBusy(false);
         }
+      };
+
+      const handleSave = async (e) => {
+        e.preventDefault();
+        const value = Number(percent);
+        if (!Number.isInteger(value) || value < minimum || value > maximum) {
+          Swal.fire({ icon: 'error', title: 'Invalid Threshold', text: `Enter a whole number from ${minimum} to ${maximum}.` });
+          return;
+        }
+        await saveSettings({ auto_approve_above: value / 100 }, setSaving);
+      };
+
+      const handleSaveSecondApproval = async (e) => {
+        e.preventDefault();
+        const entered = secondApproval.trim();
+        const value = entered === '' ? null : Number(entered);
+        if (value !== null && (!Number.isFinite(value) || value < 1 || value > settings.maximum_second_approval_above)) {
+          Swal.fire({ icon: 'error', title: 'Invalid Amount', text: 'Enter an amount of ₹1 or more, or leave the box empty to turn this off.' });
+          return;
+        }
+        await saveSettings({ second_approval_above: value }, setSavingSecond);
       };
 
       return (
@@ -1325,6 +1365,27 @@
             </div>
             <button type="submit" className="btn btn-primary" disabled={saving}>
               {saving ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Settings</span>}
+            </button>
+          </form>
+        </div>
+
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-user-check"></i> Second Approval for Large Requests</h3>
+          <p className="panel-subtitle">
+            Requests worth this much or more need two approvals: the employee's manager decides first, then a different
+            administrator. They are never approved automatically, whatever the AI score says.
+          </p>
+          <form onSubmit={handleSaveSecondApproval} className="profile-form">
+            <div className="form-group">
+              <label htmlFor="second-approval-above">Ask for a second approval from (₹)</label>
+              <input id="second-approval-above" type="number" min="1" step="1" placeholder="Off" value={secondApproval}
+                     onChange={e => setSecondApproval(e.target.value)} />
+              <small className="field-hint">
+                Amounts are compared in rupees, after other currencies are converted. Leave the box empty to turn this off.
+              </small>
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={savingSecond}>
+              {savingSecond ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Amount</span>}
             </button>
           </form>
         </div>

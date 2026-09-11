@@ -68,6 +68,7 @@ def test_admins_see_approval_settings_but_employees_do_not(app_db):
     assert admin_view['approval_settings'] == {
         'approval_mode': 'automatic', 'auto_approve_above': 0.8,
         'minimum_auto_approve_above': 0.8, 'maximum_auto_approve_above': 0.99,
+        'second_approval_above': None, 'maximum_second_approval_above': app_db.SECOND_APPROVAL_MAX_INR,
     }
     assert 'approval_settings' not in session(app_db, 'staff@example.com').get('/api/auth/organization').get_json()
 

@@ -694,7 +694,14 @@
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.error || 'The decision could not be saved.');
           await load();
-          Swal.fire({ icon: 'success', title: decision.done, timer: 1500, showConfirmButton: false });
+          if (data.final_decision === 'ESCALATED_SECOND_APPROVAL') {
+            Swal.fire({
+              icon: 'info', title: 'First Approval Saved',
+              text: 'This amount needs two approvals, so an administrator must approve it as well.'
+            });
+          } else {
+            Swal.fire({ icon: 'success', title: decision.done, timer: 1500, showConfirmButton: false });
+          }
         } catch (err) {
           Swal.fire({ icon: 'error', title: 'Decision Failed', text: err.message });
         }
@@ -769,7 +776,9 @@
                               <button type="button" className="btn btn-tinted-danger btn-sm" onClick={() => decide(req, 'reject')}><i className="fas fa-times"></i> Reject</button>
                             </div>
                           ) : (
-                            <span className="cell-muted">{pending ? 'With the admins' : '—'}</span>
+                            <span className="cell-muted">
+                              {!pending ? '—' : req.final_decision === 'ESCALATED_SECOND_APPROVAL' ? 'Waiting for a second approval' : 'With the admins'}
+                            </span>
                           )}
                         </td>
                       </tr>

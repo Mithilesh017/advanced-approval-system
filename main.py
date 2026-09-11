@@ -81,7 +81,8 @@ def require_login(fn):
         try:
             user = conn.execute(
                 'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, Users.manager_email, '
-                'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above '
+                'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above, '
+                'Organizations.second_approval_above '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
             ).fetchone()
@@ -532,6 +533,8 @@ REQUEST_EXTRA_COLUMNS = {
     'end_date': 'TEXT',
     # Who must decide a request that is waiting: the employee's manager, or NULL when the admins decide.
     'approver_email': 'TEXT',
+    # Set when a large request has one approval and is waiting for a second one from an administrator.
+    'first_approved_by': 'TEXT',
 }
 
 ORGANIZATION_SCOPED_TABLES = ('Users', 'Requests')
@@ -549,6 +552,7 @@ def check_and_add_columns():
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{table.lower()}_organization ON {table} (organization_id)')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS second_approval_above DOUBLE PRECISION')
         cursor.execute('ALTER TABLE Users ADD COLUMN IF NOT EXISTS manager_email TEXT')
         conn.commit()
         conn.close()
@@ -584,7 +588,7 @@ def check_and_add_columns():
 
     cursor.execute("PRAGMA table_info(Organizations)")
     organization_columns = {col[1] for col in cursor.fetchall()}
-    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL')):
+    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL'), ('second_approval_above', 'REAL')):
         if column not in organization_columns:
             cursor.execute(f"ALTER TABLE Organizations ADD COLUMN {column} {column_type}")
 
@@ -747,6 +751,68 @@ APPROVAL_MODES = ('shadow', 'automatic')
 def organization_auto_approve_threshold(organization):
     value = organization.get('auto_approve_above')
     return AUTO_APPROVE_THRESHOLD if value is None else max(AUTO_APPROVE_THRESHOLD, float(value))
+
+# A request worth at least this much needs two approvals. Nothing is set until a Super Admin turns it on.
+SECOND_APPROVAL_MAX_INR = 1_000_000_000.0
+
+def organization_second_approval_amount(organization):
+    value = organization.get('second_approval_above')
+    return None if value is None else float(value)
+
+def needs_second_approval(organization, amount_inr):
+    above = organization_second_approval_amount(organization)
+    return above is not None and float(amount_inr or 0) >= above
+
+
+# ==========================================
+# WAITING-APPROVER NOTICES
+# ==========================================
+def request_reference(request_id):
+    return f"REQ_{int(request_id):04d}"
+
+def approvers_to_notify(conn, organization_id, approver_email):
+    """The manager a request is waiting for, or every administrator when it waits for the admins."""
+    if approver_email:
+        rows = conn.execute(
+            "SELECT email, role FROM Users WHERE email = ? AND organization_id = ? AND status = 'Active'",
+            (approver_email, organization_id)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT email, role FROM Users WHERE organization_id = ? AND status = 'Active' AND role IN ('Admin', 'SuperAdmin')",
+            (organization_id,)
+        ).fetchall()
+    return [(row["email"], home_page(row["role"])) for row in rows]
+
+def notify_waiting_approvers(recipients, summary, organization_name, note=None):
+    """Email trouble must never fail a decision that is already saved, so every send is guarded."""
+    for email, page in recipients:
+        try:
+            email_service.sendApprovalWaitingEmail(email, summary, f"{public_base_url()}/{page}", organization_name, note)
+        except Exception:
+            app.logger.exception("Could not tell %s that a request is waiting for them", email)
+
+def waiting_notice(conn, organization_id, request_id, approver_email, note=None):
+    """Collects what the notice needs while the connection is open. Call the returned function after the commit."""
+    row = conn.execute(
+        "SELECT Requests.id, Requests.submitted_by, Requests.employee_name, Requests.amount, Requests.currency, "
+        "Requests.request_type, Requests.destination, Requests.purpose, Organizations.name AS organization_name "
+        "FROM Requests JOIN Organizations ON Organizations.id = Requests.organization_id "
+        "WHERE Requests.id = ? AND Requests.organization_id = ?",
+        (request_id, organization_id)
+    ).fetchone()
+    recipients = approvers_to_notify(conn, organization_id, approver_email)
+    if not row or not recipients:
+        return lambda: None
+    summary = {
+        "reference": request_reference(row["id"]),
+        "employee": row["employee_name"] or row["submitted_by"],
+        "amount": f"{row['amount']} {row['currency']}",
+        "details": f"{row['request_type']} - {row['destination']}",
+        "purpose": row["purpose"],
+    }
+    organization_name = row["organization_name"]
+    return lambda: notify_waiting_approvers(recipients, summary, organization_name, note)
 
 
 # ==========================================
@@ -1282,6 +1348,9 @@ def predict():
         })
         if violations:
             status = 'ESCALATED_RULE'
+        # A large request always needs two people, so it never passes on the AI's word alone.
+        if status == 'APPROVED' and needs_second_approval(g.user, normalized_inr):
+            status = 'ESCALATED_HIGH_VALUE'
         # A request that needs a person goes to the employee's manager first; without a manager, the admins decide.
         approver_email = g.user['manager_email'] if status.startswith('ESCALATED') else None
         request_id = conn.execute(
@@ -1307,13 +1376,18 @@ def predict():
                 'approval_score': round(xgb_prob, 4),
                 'unrecognized_category': is_unknown_category,
                 'anomaly_detectors': {'isolation_forest': iso_pred == -1, 'one_class_svm': svm_pred == -1},
-                'thresholds': {'auto_approve_above': auto_approve_above, 'escalate_below': ESCALATE_THRESHOLD},
+                'thresholds': {'auto_approve_above': auto_approve_above, 'escalate_below': ESCALATE_THRESHOLD,
+                               'second_approval_above': organization_second_approval_amount(g.user)},
                 'explanation': shap_impact,
             }
         )
         save_receipts(conn, g.user['organization_id'], request_id, current_email, receipts)
+        # Whoever must decide is told once the request is safely saved.
+        send_notice = waiting_notice(conn, g.user['organization_id'], request_id, approver_email) if status.startswith('ESCALATED') else None
         conn.commit()
         conn.close()
+        if send_notice:
+            send_notice()
 
         # Employees only learn the outcome. Scores and escalation reasons stay with administrators,
         # so nobody can map the model's boundaries by resubmitting variations of a request.
@@ -1815,6 +1889,8 @@ def current_organization():
             'auto_approve_above': organization_auto_approve_threshold(g.user),
             'minimum_auto_approve_above': AUTO_APPROVE_THRESHOLD,
             'maximum_auto_approve_above': AUTO_APPROVE_THRESHOLD_MAX,
+            'second_approval_above': organization_second_approval_amount(g.user),
+            'maximum_second_approval_above': SECOND_APPROVAL_MAX_INR,
         }
     return jsonify(body)
 
@@ -1825,24 +1901,40 @@ def update_approval_settings():
     if 'approval_mode' in data:
         return jsonify({'error': 'Only Neuzem can switch an organization between shadow and automatic approval.'}), 403
 
-    value = data.get('auto_approve_above')
-    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-            or not AUTO_APPROVE_THRESHOLD <= value <= AUTO_APPROVE_THRESHOLD_MAX):
-        return jsonify({
-            'error': f'The auto-approval threshold must be between {AUTO_APPROVE_THRESHOLD:.0%} and {AUTO_APPROVE_THRESHOLD_MAX:.0%}.'
-        }), 400
-    value = round(float(value), 4)
-    previous = organization_auto_approve_threshold(g.user)
+    changes = {}
+    if 'auto_approve_above' in data:
+        value = data['auto_approve_above']
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or not AUTO_APPROVE_THRESHOLD <= value <= AUTO_APPROVE_THRESHOLD_MAX):
+            return jsonify({
+                'error': f'The auto-approval threshold must be between {AUTO_APPROVE_THRESHOLD:.0%} and {AUTO_APPROVE_THRESHOLD_MAX:.0%}.'
+            }), 400
+        changes['auto_approve_above'] = (organization_auto_approve_threshold(g.user), round(float(value), 4))
+
+    if 'second_approval_above' in data:
+        # None turns the second approval off; any amount from ₹1 upwards turns it on.
+        value = data['second_approval_above']
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not math.isfinite(value) or not 1 <= value <= SECOND_APPROVAL_MAX_INR):
+            return jsonify({
+                'error': f'The second-approval amount must be between ₹1 and ₹{SECOND_APPROVAL_MAX_INR:,.0f}, or empty to turn it off.'
+            }), 400
+        changes['second_approval_above'] = (organization_second_approval_amount(g.user),
+                                            None if value is None else round(float(value), 2))
+
+    if not changes:
+        return jsonify({'error': 'There is nothing to change.'}), 400
 
     conn = get_db_connection()
     try:
-        conn.execute('UPDATE Organizations SET auto_approve_above = ? WHERE id = ?', (value, g.user['organization_id']))
+        for column, (previous, value) in changes.items():
+            conn.execute(f'UPDATE Organizations SET {column} = ? WHERE id = ?', (value, g.user['organization_id']))
         record_event(conn, 'settings.updated', organization_id=g.user['organization_id'], actor=g.user['email'],
-                     details={'auto_approve_above': {'from': previous, 'to': value}})
+                     details={column: {'from': previous, 'to': value} for column, (previous, value) in changes.items()})
         conn.commit()
     finally:
         conn.close()
-    return jsonify({'status': 'SUCCESS', 'auto_approve_above': value})
+    return jsonify({'status': 'SUCCESS', **{column: value for column, (_, value) in changes.items()}})
 
 @app.route('/api/auth/set_manager', methods=['POST'])
 @require_role('Admin')
@@ -1885,8 +1977,10 @@ def set_manager():
         if employee['manager_email'] != manager_email:
             conn.execute('UPDATE Users SET manager_email = ? WHERE email = ? AND organization_id = ?', (manager_email, email, organization_id))
             # Requests already waiting for a decision move to the new manager, or to the admins when there is none.
+            # A request already waiting for its second approval stays with the administrators.
             conn.execute(
-                "UPDATE Requests SET approver_email = ? WHERE submitted_by = ? AND organization_id = ? AND final_decision LIKE 'ESCALATED%'",
+                "UPDATE Requests SET approver_email = ? WHERE submitted_by = ? AND organization_id = ? "
+                "AND final_decision LIKE 'ESCALATED%' AND final_decision != 'ESCALATED_SECOND_APPROVAL'",
                 (manager_email, email, organization_id)
             )
             record_event(conn, 'user.manager_changed', organization_id=organization_id, actor=g.user['email'],
@@ -2265,7 +2359,8 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
     conn = get_db_connection()
     try:
         target = conn.execute(
-            'SELECT id, submitted_by, final_decision, approver_email FROM Requests WHERE id = ? AND organization_id = ?',
+            'SELECT id, submitted_by, final_decision, approver_email, normalized_amount, first_approved_by '
+            'FROM Requests WHERE id = ? AND organization_id = ?',
             (req_id, g.user['organization_id'])
         ).fetchone()
         if not target:
@@ -2281,33 +2376,55 @@ def change_request_decision(new_decision, allowed_from, conflict_message, action
         if reason_required and not comment:
             return jsonify({'error': 'Please give a reason. It is saved in the request history.'}), 400
 
+        details = {'decided_as': 'manager' if is_assigned_manager else 'admin'}
+        first_approver = target['first_approved_by']
+        if new_decision == 'APPROVED':
+            if first_approver == g.user['email']:
+                return jsonify({'error': 'You gave the first approval, so somebody else must give the second one.'}), 403
+            if first_approver is None and needs_second_approval(g.user, target['normalized_amount']):
+                # A large request is only half approved: an administrator must add the second approval.
+                new_decision, action = 'ESCALATED_SECOND_APPROVAL', 'request.first_approved'
+                first_approver = g.user['email']
+                details['second_approval_above'] = organization_second_approval_amount(g.user)
+            elif first_approver:
+                details['first_approved_by'] = first_approver
+
         reviewer = g.user['email'] if is_decided(new_decision) else None
         next_approver = None
-        if not is_decided(new_decision):
-            # A reopened request goes back to the employee's current manager, or to the admins if they have none.
+        if new_decision == 'ESCALATED_SECOND_APPROVAL':
+            pass  # No single approver: any other administrator can give the second approval.
+        elif not is_decided(new_decision):
+            # A reopened request starts over with the employee's current manager, or with the admins if they have none.
             submitter = conn.execute(
                 'SELECT manager_email FROM Users WHERE email = ? AND organization_id = ?',
                 (target['submitted_by'], g.user['organization_id'])
             ).fetchone()
             next_approver = submitter['manager_email'] if submitter else None
+            first_approver = None
         # Matching the status that was checked stops two people acting at once from overwriting each other.
         cursor = conn.execute(
             f"UPDATE Requests SET final_decision = ?, reviewed_by = ?, reviewed_at = {'CURRENT_TIMESTAMP' if reviewer else 'NULL'}, "
-            'approver_email = ? WHERE id = ? AND organization_id = ? AND final_decision = ?',
-            (new_decision, reviewer, next_approver, target['id'], g.user['organization_id'], target['final_decision'])
+            'approver_email = ?, first_approved_by = ? WHERE id = ? AND organization_id = ? AND final_decision = ?',
+            (new_decision, reviewer, next_approver, first_approver, target['id'], g.user['organization_id'], target['final_decision'])
         )
         if not cursor.rowcount:
             return jsonify({'error': conflict_message}), 409
         # The decision and its history entry are saved together, or neither is.
         record_event(
             conn, action, organization_id=g.user['organization_id'], request_id=target['id'], actor=g.user['email'],
-            from_status=target['final_decision'], to_status=new_decision, comment=comment,
-            details={'decided_as': 'manager' if is_assigned_manager else 'admin'}
+            from_status=target['final_decision'], to_status=new_decision, comment=comment, details=details
         )
+        send_notice = None
+        if is_awaiting_review(new_decision):
+            note = ('This request already has one approval and needs a second one from an administrator.'
+                    if new_decision == 'ESCALATED_SECOND_APPROVAL' else None)
+            send_notice = waiting_notice(conn, g.user['organization_id'], target['id'], next_approver, note)
         conn.commit()
     finally:
         conn.close()
-    return jsonify({'status': 'SUCCESS'})
+    if send_notice:
+        send_notice()
+    return jsonify({'status': 'SUCCESS', 'final_decision': new_decision})
 
 @app.route('/api/auth/approve_request', methods=['POST'])
 @require_login
