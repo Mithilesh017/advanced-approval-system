@@ -24,14 +24,18 @@ class TrainingDataMissing(Exception):
     pass
 
 
-def compact_training_frame(frame):
-    compact = frame[TRAINING_COLUMNS].copy().reset_index(drop=True)
-    compact['row_key'] = compact['row_key'].astype(str)
-    for col in ['source'] + CATEGORICAL_FEATURES:
-        compact[col] = compact[col].astype(str).astype('category')
-    compact['Amount_INR'] = compact['Amount_INR'].astype('float64')
-    compact['label'] = compact['label'].astype('int8')
-    return compact
+def pack_training_data(frame):
+    # Plain NumPy arrays keep saved models loadable without pyarrow, which pandas 3 uses for text whenever it is installed.
+    packed = {col: frame[col].astype(str).to_numpy(dtype=object) for col in ['row_key', 'source'] + CATEGORICAL_FEATURES}
+    packed['Amount_INR'] = frame['Amount_INR'].to_numpy(dtype='float64')
+    packed['label'] = frame['label'].to_numpy(dtype='int8')
+    return packed
+
+
+def unpack_training_data(data):
+    if isinstance(data, pd.DataFrame):
+        return data
+    return pd.DataFrame({col: data[col] for col in TRAINING_COLUMNS})
 
 
 def base_training_data_from_csv(csv_path):
@@ -45,12 +49,12 @@ def base_training_data_from_csv(csv_path):
     })
     for col in CATEGORICAL_FEATURES:
         frame[col] = df[col].astype(str)
-    return compact_training_frame(frame)
+    return frame[TRAINING_COLUMNS]
 
 
 def base_training_data(current_artifacts, csv_path=None):
     if current_artifacts is not None and current_artifacts.get('training_data') is not None:
-        return current_artifacts['training_data']
+        return unpack_training_data(current_artifacts['training_data'])
     if csv_path and os.path.exists(csv_path):
         return base_training_data_from_csv(csv_path)
     raise TrainingDataMissing(
@@ -164,7 +168,7 @@ def train_ensemble(base, feedback=None):
         feedback_rows=int((frame['source'] == 'feedback').sum()),
     )
     artifacts.update(
-        training_data=compact_training_frame(frame[frame['source'] != 'feedback']),
+        training_data=pack_training_data(frame[frame['source'] != 'feedback']),
         form_options=form_options(train),
         metrics=metrics,
         trained_at=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
