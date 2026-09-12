@@ -82,7 +82,7 @@ def require_login(fn):
             user = conn.execute(
                 'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, Users.manager_email, '
                 'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above, '
-                'Organizations.second_approval_above '
+                'Organizations.second_approval_above, Organizations.spot_check_percent '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
             ).fetchone()
@@ -392,6 +392,19 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS SpotChecks (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL UNIQUE REFERENCES Requests(id),
+                verdict TEXT,
+                reviewed_by TEXT,
+                reviewed_at TIMESTAMP,
+                comment TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_spot_checks_organization ON SpotChecks (organization_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -513,6 +526,19 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS SpotChecks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL UNIQUE REFERENCES Requests(id),
+                verdict TEXT,
+                reviewed_by TEXT,
+                reviewed_at DATETIME,
+                comment TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_spot_checks_organization ON SpotChecks (organization_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -553,6 +579,7 @@ def check_and_add_columns():
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS second_approval_above DOUBLE PRECISION')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS spot_check_percent INTEGER')
         cursor.execute('ALTER TABLE Users ADD COLUMN IF NOT EXISTS manager_email TEXT')
         conn.commit()
         conn.close()
@@ -588,7 +615,8 @@ def check_and_add_columns():
 
     cursor.execute("PRAGMA table_info(Organizations)")
     organization_columns = {col[1] for col in cursor.fetchall()}
-    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL'), ('second_approval_above', 'REAL')):
+    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL'), ('second_approval_above', 'REAL'),
+                                ('spot_check_percent', 'INTEGER')):
         if column not in organization_columns:
             cursor.execute(f"ALTER TABLE Organizations ADD COLUMN {column} {column_type}")
 
@@ -762,6 +790,328 @@ def organization_second_approval_amount(organization):
 def needs_second_approval(organization, amount_inr):
     above = organization_second_approval_amount(organization)
     return above is not None and float(amount_inr or 0) >= above
+
+
+# ==========================================
+# SPOT CHECKS ON AUTOMATIC APPROVALS
+# ==========================================
+# Nobody looks at a request the AI approves on its own, so a random few are checked afterwards by a person.
+# Their verdicts are the only honest measure of how good those approvals really are.
+SPOT_CHECK_MIN_PERCENT = 5
+SPOT_CHECK_MAX_PERCENT = 100
+SPOT_CHECK_VERDICTS = ('CORRECT', 'WRONG')
+
+def organization_spot_check_percent(organization):
+    value = organization.get('spot_check_percent')
+    if value is None:
+        return SPOT_CHECK_MIN_PERCENT
+    return max(SPOT_CHECK_MIN_PERCENT, min(SPOT_CHECK_MAX_PERCENT, int(value)))
+
+def spot_check_selected(percent):
+    """True for a random share of automatic approvals. Tests replace this to choose exactly which ones."""
+    return percent > 0 and secrets.randbelow(100) < percent
+
+
+# ==========================================
+# DECISION QUALITY
+# ==========================================
+# What the AI decided is stored next to what a person decided, so the two can be compared on real work.
+QUALITY_WINDOWS = (30, 90, 365)
+QUALITY_DEFAULT_WINDOW = 90
+# Below this many decisions the rates jump around too much to mean anything.
+QUALITY_ENOUGH_DECISIONS = 20
+
+def share(part, whole):
+    return None if not whole else round(part / whole, 4)
+
+
+# Before an organization is allowed to let the AI approve on its own, its own numbers have to earn it.
+AUTOMATIC_APPROVAL_WINDOW = 90
+AUTOMATIC_APPROVAL_MIN_AGREEMENT = 0.85
+AUTOMATIC_APPROVAL_MAX_MISSED = 0.05
+AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG = 0.10
+
+def automatic_approval_readiness(quality):
+    """Each check a company must pass before the AI may approve without a person. Rates are shares, not percentages."""
+    comparison, spot_checks = quality['comparison'], quality['spot_checks']
+    checks = [{
+        'name': 'decisions',
+        'label': f"People have decided at least {QUALITY_ENOUGH_DECISIONS} requests the AI also scored",
+        'value': comparison['pairs'],
+        'target': QUALITY_ENOUGH_DECISIONS,
+        'passed': comparison['pairs'] >= QUALITY_ENOUGH_DECISIONS,
+    }, {
+        'name': 'agreement',
+        'label': f"The AI and the people agree on at least {AUTOMATIC_APPROVAL_MIN_AGREEMENT:.0%} of them",
+        'value': comparison['agreement_rate'],
+        'target': AUTOMATIC_APPROVAL_MIN_AGREEMENT,
+        'passed': comparison['agreement_rate'] is not None and comparison['agreement_rate'] >= AUTOMATIC_APPROVAL_MIN_AGREEMENT,
+    }, {
+        'name': 'missed_problems',
+        'label': f"At most {AUTOMATIC_APPROVAL_MAX_MISSED:.0%} of what the AI would approve was refused by a person",
+        'value': comparison['missed_problem_rate'],
+        'target': AUTOMATIC_APPROVAL_MAX_MISSED,
+        'passed': comparison['missed_problem_rate'] is not None and comparison['missed_problem_rate'] <= AUTOMATIC_APPROVAL_MAX_MISSED,
+    }]
+    # Spot checks only exist once an organization is already approving automatically, so they count only when there are some.
+    if spot_checks['done']:
+        checks.append({
+            'name': 'spot_checks',
+            'label': f"At most {AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG:.0%} of the checked automatic approvals were wrong",
+            'value': spot_checks['wrong_rate'],
+            'target': AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG,
+            'passed': spot_checks['wrong_rate'] <= AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG,
+        })
+    return {
+        'ready': all(check['passed'] for check in checks),
+        'days': quality['days'],
+        'checks': checks,
+        'blocked_by': [check['label'] for check in checks if not check['passed']],
+    }
+
+# ==========================================
+# WEEK BY WEEK MONITORING
+# ==========================================
+# The work a company sends in changes over time. Comparing the last week with the weeks before it
+# shows when the AI is suddenly meeting requests it was never trained for.
+MONITORING_WEEKS = 12
+DRIFT_MIN_REQUESTS = 10
+DRIFT_RATE_JUMP = 0.15
+DRIFT_UNUSUAL_JUMP = 0.10
+DRIFT_SCORE_MOVE = 0.10
+DRIFT_VOLUME_CHANGE = 0.6
+
+# ==========================================
+# WHO THE DECISIONS FALL ON
+# ==========================================
+# The same system can treat two departments very differently without anybody noticing.
+# These numbers do not prove unfairness; they show where somebody should go and look.
+FAIRNESS_FIELDS = ('department', 'role')
+FAIRNESS_MIN_REQUESTS = 10
+FAIRNESS_GAP = 0.15
+
+def group_summary(rows):
+    finished = [row for row in rows if is_decided(row['final_decision'])]
+    approved = sum(1 for row in finished if row['final_decision'] == 'APPROVED')
+    needed_person = sum(1 for row in rows if not (row['final_decision'] == 'APPROVED' and not row['reviewed_by']))
+    return {
+        'requests': len(rows),
+        'decided': len(finished),
+        'approved': approved,
+        'approval_rate': share(approved, len(finished)),
+        'needed_person': needed_person,
+        'needed_person_rate': share(needed_person, len(rows)),
+    }
+
+def fairness_report(conn, organization_id, days):
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = conn.execute(
+        'SELECT role, department, final_decision, reviewed_by FROM Requests WHERE organization_id = ? AND created_at >= ?',
+        (organization_id, since)
+    ).fetchall()
+    overall = group_summary(rows)
+
+    report = {'days': days, 'minimum_requests': FAIRNESS_MIN_REQUESTS, 'overall': overall, 'notes': []}
+    for field in FAIRNESS_FIELDS:
+        buckets = {}
+        for row in rows:
+            buckets.setdefault((row[field] or '').strip() or 'Not given', []).append(row)
+
+        groups = []
+        for name, items in buckets.items():
+            group = {'value': name, **group_summary(items)}
+            group['compared'] = group['requests'] >= FAIRNESS_MIN_REQUESTS
+            group['approval_gap'] = bool(
+                group['compared'] and group['decided'] >= FAIRNESS_MIN_REQUESTS and group['approval_rate'] is not None
+                and overall['approval_rate'] is not None and overall['approval_rate'] - group['approval_rate'] > FAIRNESS_GAP
+            )
+            group['review_gap'] = bool(
+                group['compared'] and group['needed_person_rate'] is not None and overall['needed_person_rate'] is not None
+                and group['needed_person_rate'] - overall['needed_person_rate'] > FAIRNESS_GAP
+            )
+            groups.append(group)
+            if group['approval_gap']:
+                report['notes'].append({'field': field, 'value': name, 'message':
+                    f"{name} requests are approved {group['approval_rate']:.0%} of the time, "
+                    f"against {overall['approval_rate']:.0%} across the company."})
+            # A rejected request always went past a person, so a group flagged for approvals is not flagged twice.
+            if group['review_gap'] and not group['approval_gap']:
+                report['notes'].append({'field': field, 'value': name, 'message':
+                    f"{group['needed_person_rate']:.0%} of {name} requests are sent to a person, "
+                    f"against {overall['needed_person_rate']:.0%} across the company."})
+
+        report[f'by_{field}'] = sorted(groups, key=lambda group: (-group['requests'], group['value']))
+    return report
+
+
+def summarize_week(rows):
+    total = len(rows)
+    needed_person = sum(1 for row in rows if not (row['final_decision'] == 'APPROVED' and not row['reviewed_by']))
+    unknown = sum(1 for row in rows if row['ai_decision'] == 'ESCALATED_UNKNOWN')
+    unusual = sum(1 for row in rows if row['ai_decision'] == 'ESCALATED_ANOMALY')
+    scores = [float(row['xgb_score']) for row in rows if row['xgb_score'] is not None]
+    return {
+        'requests': total,
+        'needed_person': needed_person,
+        'needed_person_rate': share(needed_person, total),
+        'unknown_category': unknown,
+        'unknown_category_rate': share(unknown, total),
+        'unusual': unusual,
+        'unusual_rate': share(unusual, total),
+        'average_score': round(sum(scores) / len(scores), 4) if scores else None,
+    }
+
+def moved_up(latest, baseline, limit):
+    return latest is not None and baseline is not None and latest - baseline > limit
+
+def drift_warnings(latest, baseline, rates=True):
+    """Plain sentences about what changed, never a number on its own."""
+    warnings = []
+    def add(name, message):
+        warnings.append({'name': name, 'message': message})
+
+    # A week with few requests says nothing about rates, but a week that is suddenly empty says plenty.
+    if not rates:
+        volume_warnings(latest, baseline, add)
+        return warnings
+
+    if moved_up(latest['needed_person_rate'], baseline['needed_person_rate'], DRIFT_RATE_JUMP):
+        add('needed_person', f"People are being asked to decide {latest['needed_person_rate']:.0%} of requests, "
+                             f"against {baseline['needed_person_rate']:.0%} in the weeks before.")
+    if moved_up(latest['unknown_category_rate'], baseline['unknown_category_rate'], DRIFT_UNUSUAL_JUMP):
+        add('unknown_category', f"{latest['unknown_category_rate']:.0%} of requests used a role, department, type or "
+                                f"destination the AI has never seen, against {baseline['unknown_category_rate']:.0%} before. "
+                                'The AI is working outside what it was trained on.')
+    if moved_up(latest['unusual_rate'], baseline['unusual_rate'], DRIFT_UNUSUAL_JUMP):
+        add('unusual', f"{latest['unusual_rate']:.0%} of requests looked unusual to the AI, "
+                       f"against {baseline['unusual_rate']:.0%} before.")
+    if (latest['average_score'] is not None and baseline['average_score'] is not None
+            and abs(latest['average_score'] - baseline['average_score']) > DRIFT_SCORE_MOVE):
+        direction = 'up' if latest['average_score'] > baseline['average_score'] else 'down'
+        add('average_score', f"The AI's average approval score moved {direction} to {latest['average_score']:.0%}, "
+                             f"from {baseline['average_score']:.0%} in the weeks before.")
+
+    volume_warnings(latest, baseline, add)
+    return warnings
+
+def volume_warnings(latest, baseline, add):
+    weekly_baseline = baseline['requests'] / max(1, baseline['weeks'])
+    if weekly_baseline < DRIFT_MIN_REQUESTS:
+        return
+    if latest['requests'] > weekly_baseline * (1 + DRIFT_VOLUME_CHANGE):
+        add('volume', f"{latest['requests']} requests came in this week, well above the usual "
+                      f"{weekly_baseline:.0f} a week.")
+    elif latest['requests'] < weekly_baseline * (1 - DRIFT_VOLUME_CHANGE):
+        add('volume', f"Only {latest['requests']} requests came in this week, well below the usual "
+                      f"{weekly_baseline:.0f} a week.")
+
+def weekly_monitoring(conn, organization_id, weeks=MONITORING_WEEKS):
+    """The last few weeks side by side, plus a warning whenever the newest week stands out."""
+    today = datetime.utcnow()
+    since = (today - timedelta(days=7 * weeks)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = conn.execute(
+        'SELECT created_at, final_decision, ai_decision, xgb_score, reviewed_by FROM Requests '
+        'WHERE organization_id = ? AND created_at >= ?',
+        (organization_id, since)
+    ).fetchall()
+
+    buckets = [[] for _ in range(weeks)]
+    for row in rows:
+        index = (today - as_datetime(row['created_at'])).days // 7
+        if 0 <= index < weeks:
+            buckets[index].append(row)
+
+    listed = []
+    for index in range(weeks - 1, -1, -1):
+        week = summarize_week(buckets[index])
+        week['starting'] = (today - timedelta(days=7 * (index + 1))).strftime('%Y-%m-%d')
+        week['ending'] = (today - timedelta(days=7 * index)).strftime('%Y-%m-%d')
+        listed.append(week)
+
+    latest = listed[-1]
+    earlier = [row for bucket in buckets[1:] for row in bucket]
+    baseline = summarize_week(earlier)
+    baseline['weeks'] = sum(1 for bucket in buckets[1:] if bucket)
+    enough = latest['requests'] >= DRIFT_MIN_REQUESTS and baseline['requests'] >= DRIFT_MIN_REQUESTS
+    return {
+        'weeks': listed,
+        'latest': latest,
+        'baseline': baseline,
+        'enough_data': enough,
+        'minimum_requests': DRIFT_MIN_REQUESTS,
+        'warnings': drift_warnings(latest, baseline, rates=enough) if baseline['requests'] else [],
+    }
+
+
+def decision_quality(conn, organization_id, days):
+    """How often the AI and the people agreed, plus volume, speed and the spot-check answers."""
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = conn.execute(
+        'SELECT ai_decision, final_decision, reviewed_by, created_at, reviewed_at '
+        'FROM Requests WHERE organization_id = ? AND created_at >= ?',
+        (organization_id, since)
+    ).fetchall()
+
+    totals = {'requests': len(rows), 'automatic_approvals': 0, 'decided_by_people': 0, 'waiting': 0}
+    agreed = missed = unnecessary = ai_approved_pairs = ai_flagged_pairs = 0
+    hours = []
+    for row in rows:
+        decision, recommendation = row['final_decision'], row['ai_decision']
+        if is_awaiting_review(decision):
+            totals['waiting'] += 1
+        elif decision == 'APPROVED' and not row['reviewed_by']:
+            totals['automatic_approvals'] += 1
+
+        if not is_decided(decision) or not row['reviewed_by']:
+            continue
+        totals['decided_by_people'] += 1
+        if row['reviewed_at'] and row['created_at']:
+            hours.append((as_datetime(row['reviewed_at']) - as_datetime(row['created_at'])).total_seconds() / 3600)
+        if not recommendation:
+            continue
+        # The AI only ever says "approve" or "a person should look at this", so that is what is compared.
+        ai_approved = recommendation == 'APPROVED'
+        person_approved = decision == 'APPROVED'
+        if ai_approved:
+            ai_approved_pairs += 1
+        else:
+            ai_flagged_pairs += 1
+        if ai_approved and not person_approved:
+            missed += 1  # The AI would have let through something a person refused.
+        elif not ai_approved and person_approved:
+            unnecessary += 1  # Safe, but somebody was asked to look at a request that was fine.
+        else:
+            agreed += 1
+
+    checks = conn.execute(
+        'SELECT verdict FROM SpotChecks WHERE organization_id = ? AND created_at >= ?', (organization_id, since)
+    ).fetchall()
+    done = [check['verdict'] for check in checks if check['verdict']]
+    wrong = [verdict for verdict in done if verdict == 'WRONG']
+
+    pairs = ai_approved_pairs + ai_flagged_pairs
+    return {
+        'days': days,
+        'enough_decisions': pairs >= QUALITY_ENOUGH_DECISIONS,
+        'minimum_decisions': QUALITY_ENOUGH_DECISIONS,
+        'totals': totals,
+        'comparison': {
+            'pairs': pairs, 'agreed': agreed, 'missed_problems': missed, 'unnecessary_reviews': unnecessary,
+            'ai_approved': ai_approved_pairs, 'ai_flagged': ai_flagged_pairs,
+            'agreement_rate': share(agreed, pairs),
+            'missed_problem_rate': share(missed, ai_approved_pairs),
+            'unnecessary_review_rate': share(unnecessary, ai_flagged_pairs),
+        },
+        'spot_checks': {
+            'done': len(done), 'waiting': len(checks) - len(done), 'wrong': len(wrong),
+            'wrong_rate': share(len(wrong), len(done)),
+        },
+        'speed': {
+            'decided': len(hours),
+            'average_hours': round(sum(hours) / len(hours), 1) if hours else None,
+            'slowest_hours': round(max(hours), 1) if hours else None,
+        },
+    }
 
 
 # ==========================================
@@ -1381,6 +1731,14 @@ def predict():
                 'explanation': shap_impact,
             }
         )
+        if status == 'APPROVED' and approval_mode == 'automatic':
+            spot_check_percent = organization_spot_check_percent(g.user)
+            if spot_check_selected(spot_check_percent):
+                conn.execute(
+                    'INSERT INTO SpotChecks (organization_id, request_id) VALUES (?, ?)', (g.user['organization_id'], request_id)
+                )
+                record_event(conn, 'spotcheck.sampled', organization_id=g.user['organization_id'], request_id=request_id,
+                             details={'percent': spot_check_percent})
         save_receipts(conn, g.user['organization_id'], request_id, current_email, receipts)
         # Whoever must decide is told once the request is safely saved.
         send_notice = waiting_notice(conn, g.user['organization_id'], request_id, approver_email) if status.startswith('ESCALATED') else None
@@ -1741,6 +2099,27 @@ def platform_create_organization():
         'message': f'{name} was created. A setup link was emailed to {email}.',
     }), 201
 
+@app.route('/api/platform/decision_quality', methods=['GET'])
+@require_platform_owner
+def platform_decision_quality():
+    # Neuzem sees how well an organization's decisions are going, never the requests behind them.
+    organization_id = request.args.get('organization_id', type=int)
+    days = request.args.get('days', type=int) or AUTOMATIC_APPROVAL_WINDOW
+    if days not in QUALITY_WINDOWS:
+        return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
+
+    conn = get_db_connection()
+    try:
+        if not organization_id or not conn.execute('SELECT id FROM Organizations WHERE id = ?', (organization_id,)).fetchone():
+            return jsonify({'error': 'Organization not found.'}), 404
+        quality = decision_quality(conn, organization_id, days)
+        monitoring = weekly_monitoring(conn, organization_id)
+    finally:
+        conn.close()
+    return jsonify({
+        **quality, 'readiness': automatic_approval_readiness(quality), 'drift_warnings': monitoring['warnings'],
+    })
+
 @app.route('/api/platform/update_organization', methods=['POST'])
 @require_platform_owner
 def platform_update_organization():
@@ -1762,6 +2141,9 @@ def platform_update_organization():
         if not isinstance(data['allow_training_data'], bool):
             return jsonify({'error': 'allow_training_data must be true or false.'}), 400
         changes['allow_training_data'] = int(data['allow_training_data'])
+    forced = data.get('force', False)
+    if not isinstance(forced, bool):
+        return jsonify({'error': 'force must be true or false.'}), 400
     if not changes:
         return jsonify({'error': 'Nothing to update.'}), 400
 
@@ -1772,11 +2154,23 @@ def platform_update_organization():
             return jsonify({'error': 'Organization not found.'}), 404
         if organization['is_default'] and changes.get('status') == 'Paused':
             return jsonify({'error': 'The default organization holds the original accounts and cannot be paused.'}), 409
+        # An organization only stops using shadow mode once its own decisions show the AI can be trusted.
+        readiness = None
+        if changes.get('approval_mode') == 'automatic':
+            readiness = automatic_approval_readiness(decision_quality(conn, organization_id, AUTOMATIC_APPROVAL_WINDOW))
+            if not readiness['ready'] and not forced:
+                return jsonify({
+                    'error': 'This organization is not ready for automatic approval yet.', 'readiness': readiness,
+                }), 409
         # Column names come from the fixed keys above, never from the request.
         assignments = ', '.join(f'{column} = ?' for column in changes)
         conn.execute(f'UPDATE Organizations SET {assignments} WHERE id = ?', (*changes.values(), organization_id))
-        record_event(conn, 'organization.updated', organization_id=organization_id, actor=g.user['email'],
-                     details={'changes': {column: data[column] for column in changes}})
+        details = {'changes': {column: data[column] for column in changes}}
+        if readiness is not None:
+            details['readiness'] = {'ready': readiness['ready'], 'blocked_by': readiness['blocked_by']}
+            if not readiness['ready']:
+                details['forced'] = True  # Neuzem overruled the gate, and the audit log says so.
+        record_event(conn, 'organization.updated', organization_id=organization_id, actor=g.user['email'], details=details)
         conn.commit()
     finally:
         conn.close()
@@ -1891,6 +2285,9 @@ def current_organization():
             'maximum_auto_approve_above': AUTO_APPROVE_THRESHOLD_MAX,
             'second_approval_above': organization_second_approval_amount(g.user),
             'maximum_second_approval_above': SECOND_APPROVAL_MAX_INR,
+            'spot_check_percent': organization_spot_check_percent(g.user),
+            'minimum_spot_check_percent': SPOT_CHECK_MIN_PERCENT,
+            'maximum_spot_check_percent': SPOT_CHECK_MAX_PERCENT,
         }
     return jsonify(body)
 
@@ -1921,6 +2318,15 @@ def update_approval_settings():
             }), 400
         changes['second_approval_above'] = (organization_second_approval_amount(g.user),
                                             None if value is None else round(float(value), 2))
+
+    if 'spot_check_percent' in data:
+        value = data['spot_check_percent']
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or not SPOT_CHECK_MIN_PERCENT <= value <= SPOT_CHECK_MAX_PERCENT):
+            return jsonify({
+                'error': f'The share of approvals to check must be a whole number between {SPOT_CHECK_MIN_PERCENT}% and {SPOT_CHECK_MAX_PERCENT}%.'
+            }), 400
+        changes['spot_check_percent'] = (organization_spot_check_percent(g.user), value)
 
     if not changes:
         return jsonify({'error': 'There is nothing to change.'}), 400
@@ -2005,6 +2411,105 @@ def team_requests():
     finally:
         conn.close()
     return jsonify({'requests': [to_json_row(row) for row in rows]})
+
+SPOT_CHECKS_LISTED = 100
+
+@app.route('/api/auth/spot_checks', methods=['GET'])
+@require_role('Admin')
+def spot_checks():
+    # The approvals nobody saw, picked at random for a person to look at afterwards.
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT SpotChecks.id, SpotChecks.verdict, SpotChecks.reviewed_by, SpotChecks.reviewed_at, SpotChecks.comment, '
+            'SpotChecks.created_at, Requests.id AS request_id, Requests.submitted_by, Requests.employee_name, '
+            'Requests.request_type, Requests.destination, Requests.amount, Requests.currency, Requests.purpose, '
+            'Requests.expense_date, Requests.end_date, Requests.xgb_score, Requests.final_decision, '
+            f'{RECEIPT_COUNT_SQL} '
+            'FROM SpotChecks JOIN Requests ON Requests.id = SpotChecks.request_id '
+            'WHERE SpotChecks.organization_id = ? ORDER BY SpotChecks.id DESC LIMIT ?',
+            (g.user['organization_id'], SPOT_CHECKS_LISTED)
+        ).fetchall()
+    finally:
+        conn.close()
+    checks = [to_json_row(row) for row in rows]
+    return jsonify({
+        'checks': checks,
+        'waiting': sum(1 for check in checks if check['verdict'] is None),
+        'spot_check_percent': organization_spot_check_percent(g.user),
+    })
+
+@app.route('/api/auth/review_spot_check', methods=['POST'])
+@require_role('Admin')
+def review_spot_check():
+    data = request.get_json(silent=True) or {}
+    check_id = data.get('id')
+    verdict = data.get('verdict')
+    if not check_id or verdict not in SPOT_CHECK_VERDICTS:
+        return jsonify({'error': 'Say whether the automatic approval was right or wrong.'}), 400
+    comment = data.get('comment')
+    if comment is not None and not isinstance(comment, str):
+        return jsonify({'error': 'The comment must be text.'}), 400
+    comment = (comment or '').strip()[:COMMENT_MAX_LENGTH] or None
+    if verdict == 'WRONG' and not comment:
+        return jsonify({'error': 'Please say what was wrong with this approval. It is saved in the request history.'}), 400
+
+    conn = get_db_connection()
+    try:
+        check = conn.execute(
+            'SELECT id, request_id, verdict FROM SpotChecks WHERE id = ? AND organization_id = ?',
+            (check_id, g.user['organization_id'])
+        ).fetchone()
+        if not check:
+            return jsonify({'error': 'Spot check not found.'}), 404
+        # Matching the empty verdict stops two administrators checking the same approval at once.
+        cursor = conn.execute(
+            'UPDATE SpotChecks SET verdict = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, comment = ? '
+            'WHERE id = ? AND organization_id = ? AND verdict IS NULL',
+            (verdict, g.user['email'], comment, check['id'], g.user['organization_id'])
+        )
+        if not cursor.rowcount:
+            return jsonify({'error': 'This spot check has already been done.'}), 409
+        record_event(conn, 'spotcheck.reviewed', organization_id=g.user['organization_id'], request_id=check['request_id'],
+                     actor=g.user['email'], comment=comment, details={'verdict': verdict})
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/decision_quality', methods=['GET'])
+@require_role('Admin')
+def organization_decision_quality():
+    days = request.args.get('days', type=int) or QUALITY_DEFAULT_WINDOW
+    if days not in QUALITY_WINDOWS:
+        return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
+    conn = get_db_connection()
+    try:
+        quality = decision_quality(conn, g.user['organization_id'], days)
+    finally:
+        conn.close()
+    return jsonify({**quality, 'readiness': automatic_approval_readiness(quality)})
+
+@app.route('/api/auth/monitoring', methods=['GET'])
+@require_role('Admin')
+def organization_monitoring():
+    conn = get_db_connection()
+    try:
+        return jsonify(weekly_monitoring(conn, g.user['organization_id']))
+    finally:
+        conn.close()
+
+@app.route('/api/auth/fairness', methods=['GET'])
+@require_role('Admin')
+def organization_fairness():
+    days = request.args.get('days', type=int) or QUALITY_DEFAULT_WINDOW
+    if days not in QUALITY_WINDOWS:
+        return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
+    conn = get_db_connection()
+    try:
+        return jsonify(fairness_report(conn, g.user['organization_id'], days))
+    finally:
+        conn.close()
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")

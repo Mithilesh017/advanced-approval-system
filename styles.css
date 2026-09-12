@@ -920,6 +920,102 @@ select:disabled {
   color: var(--label-3);
 }
 
+.check-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 10px;
+  text-align: left;
+}
+
+.check-list li {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 4px 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--fill-soft);
+  font-size: 0.875rem;
+  color: var(--label);
+}
+
+.check-list li > i { margin-top: 3px; }
+.check-list li.is-passed > i { color: var(--green-text); }
+.check-list li.is-blocked > i { color: var(--red-text); }
+.check-list .check-text { min-width: 0; }
+.check-list .cell-secondary { grid-column: 2; }
+
+.quality-summary { display: grid; gap: 8px; text-align: left; }
+
+.quality-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 2px;
+  font-size: 0.875rem;
+  color: var(--label-2);
+  border-bottom: 1px solid var(--separator);
+}
+
+.cell-flagged { color: var(--red-text); font-weight: 600; }
+.panel-gap { height: 18px; }
+
+.callout-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.quality-warning {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--orange-tint);
+  font-size: 0.875rem;
+  color: var(--label);
+}
+
+.quality-warning > i { margin-top: 3px; color: var(--orange-text); }
+
+.quality-summary .check-list { margin-top: 10px; }
+
+.stat-note {
+  margin-top: 10px;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--label-2);
+}
+
+.segmented {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  padding: 4px;
+  border-radius: var(--radius-md);
+  background: var(--fill);
+}
+
+.segmented button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: calc(var(--radius-md) - 4px);
+  background: transparent;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--label-2);
+  cursor: pointer;
+  transition: background 160ms var(--ease-standard), color 160ms var(--ease-standard);
+}
+
+.segmented button:hover { color: var(--label); }
+.segmented button.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-card); }
+
 .stat-card.is-inline { flex-direction: row; align-items: center; gap: 14px; }
 .stat-card.is-inline .stat-icon { width: 44px; height: 44px; margin: 0; border-radius: 12px; font-size: 18px; }
 .stat-body { min-width: 0; }

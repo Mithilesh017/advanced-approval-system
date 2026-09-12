@@ -120,7 +120,11 @@
       const response = await fetch(path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...options });
       if (handleAccessFailure(response)) return null;
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || data.msg || 'The request failed.');
+      if (!response.ok) {
+        const error = new Error(data.error || data.msg || 'The request failed.');
+        error.data = data;  // For example the readiness checklist behind a refused change.
+        throw error;
+      }
       return data;
     }
 
@@ -149,6 +153,55 @@
       return new Date(value).toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' });
     }
 
+    const asPercent = (value) => (value == null ? 'not enough yet' : `${Math.round(value * 1000) / 10}%`);
+
+    function checkValue(check) {
+      if (check.name !== 'decisions') return `now ${asPercent(check.value)}`;
+      return check.passed ? `${check.value} so far` : `${check.value} of the ${check.target} needed`;
+    }
+
+    function readinessNode(readiness) {
+      return el('ul', 'check-list', readiness.checks.map(check => el('li', check.passed ? 'is-passed' : 'is-blocked', [
+        icon(check.passed ? 'fa-circle-check' : 'fa-circle-xmark'),
+        el('span', 'check-text', [` ${check.label}`]),
+        el('div', 'cell-secondary', [checkValue(check)])
+      ])));
+    }
+
+    function qualityNode(report) {
+      const { comparison, spot_checks: spotChecks, totals } = report;
+      const line = (label, value) => el('div', 'quality-line', [el('span', '', [label]), el('strong', '', [value])]);
+      const children = [
+        line('Decisions made by people', String(comparison.pairs)),
+        line('AI and people agree', asPercent(comparison.agreement_rate)),
+        line('Would have slipped through', asPercent(comparison.missed_problem_rate)),
+        line('Reviews that were not needed', asPercent(comparison.unnecessary_review_rate)),
+        line('Spot checks marked wrong', spotChecks.done ? `${asPercent(spotChecks.wrong_rate)} of ${spotChecks.done}` : 'none checked'),
+        line('Requests in this period', String(totals.requests)),
+      ];
+      // Anything that changed in the newest week is worth reading before switching a company over.
+      (report.drift_warnings || []).forEach(warning => children.push(
+        el('div', 'quality-warning', [icon('fa-triangle-exclamation'), el('span', '', [` ${warning.message}`])])
+      ));
+      children.push(readinessNode(report.readiness));
+      return el('div', 'quality-summary', children);
+    }
+
+    async function showQuality(org) {
+      try {
+        const report = await api(`${PLATFORM_API}/decision_quality?organization_id=${org.id}`);
+        if (!report) return;
+        Swal.fire({
+          title: `${org.name}: last ${report.days} days`,
+          html: qualityNode(report),
+          width: 640,
+          confirmButtonText: 'Close'
+        });
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'Quality Unavailable', text: err.message });
+      }
+    }
+
     function renderOrganizationRow(org) {
       const name = el('div', 'cell-primary', [org.name]);
       if (org.is_default) name.append(' ', el('span', 'badge badge-purple', ['Default']));
@@ -173,7 +226,8 @@
         el('div', 'cell-actions', [
           el('span', `badge ${automatic ? 'badge-accent' : 'badge-orange'}`, [automatic ? 'Automatic' : 'Shadow']),
           button(automatic ? 'Use shadow' : 'Go automatic', automatic ? 'fa-eye' : 'fa-bolt', 'btn-secondary',
-            () => updateOrganization(org, { approval_mode: automatic ? 'shadow' : 'automatic' }))
+            () => updateOrganization(org, { approval_mode: automatic ? 'shadow' : 'automatic' })),
+          button('Quality', 'fa-chart-simple', 'btn-secondary', () => showQuality(org))
         ]),
         el('div', 'cell-secondary', [automatic ? `Auto-approves above ${Math.round(org.auto_approve_above * 100)}%` : 'AI only recommends'])
       ]);
@@ -216,7 +270,7 @@
       if (changes.approval_mode === 'automatic') {
         return {
           titleText: `Turn on automatic approval for ${org.name}?`,
-          text: 'Requests the AI is confident about will be approved without a person. Only do this once the organization has agreed and its shadow-mode results look good.',
+          text: 'Requests the AI is confident about will be approved without a person. This is refused unless the organization\'s own decisions pass the quality checks.',
           confirmButtonText: 'Go automatic'
         };
       }
@@ -239,15 +293,37 @@
         : { titleText: `Stop using ${org.name}'s data for AI training?`, text: 'Their decisions will be left out of future model training.', confirmButtonText: 'Stop sharing' };
     }
 
-    async function updateOrganization(org, changes) {
-      const result = await Swal.fire({ icon: 'question', showCancelButton: true, ...confirmationFor(org, changes) });
-      if (!result.isConfirmed) return;
+    async function offerOverride(org, changes, readiness) {
+      const result = await Swal.fire({
+        icon: 'warning',
+        title: `${org.name} is not ready for automatic approval`,
+        html: readinessNode(readiness),
+        width: 640,
+        showCancelButton: true,
+        cancelButtonText: 'Keep shadow mode',
+        confirmButtonText: 'Turn it on anyway',
+        confirmButtonColor: '#d70015'
+      });
+      if (result.isConfirmed) await updateOrganization(org, changes, { force: true });
+    }
+
+    async function updateOrganization(org, changes, options = {}) {
+      // A forced change was already confirmed in the dialog that offered the override.
+      if (!options.force) {
+        const result = await Swal.fire({ icon: 'question', showCancelButton: true, ...confirmationFor(org, changes) });
+        if (!result.isConfirmed) return;
+      }
       try {
-        const data = await api(`${PLATFORM_API}/update_organization`, { method: 'POST', body: JSON.stringify({ id: org.id, ...changes }) });
+        const body = JSON.stringify({ id: org.id, ...changes, ...(options.force ? { force: true } : {}) });
+        const data = await api(`${PLATFORM_API}/update_organization`, { method: 'POST', body });
         if (!data) return;
         await loadOrganizations();
         Swal.fire({ icon: 'success', title: 'Saved', timer: 1200, showConfirmButton: false });
       } catch (err) {
+        if (err.data && err.data.readiness) {
+          await offerOverride(org, changes, err.data.readiness);
+          return;
+        }
         Swal.fire({ icon: 'error', title: 'Update Failed', text: err.message });
       }
     }

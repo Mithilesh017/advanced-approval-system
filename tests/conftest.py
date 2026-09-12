@@ -79,6 +79,12 @@ def backend(request, tmp_path, monkeypatch):
     return request.param
 
 
+@pytest.fixture(autouse=True)
+def no_random_spot_checks(monkeypatch):
+    """Sampling is random, so no test samples an approval unless it says so."""
+    monkeypatch.setattr(main, 'spot_check_selected', lambda percent: False)
+
+
 @pytest.fixture
 def app_db(backend):
     """A fresh, fully migrated database for each test."""

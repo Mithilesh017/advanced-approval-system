@@ -99,5 +99,7 @@ def test_switching_to_automatic_applies_to_the_next_request(app_db, monkeypatch,
     assert submit(pilot['staff']) == 'PENDING_REVIEW'
 
     owner = session(app_db, create_platform_owner(app_db))
-    assert owner.post('/api/platform/update_organization', json={'id': pilot['org'], 'approval_mode': 'automatic'}).status_code == 200
+    # A brand new pilot has no history yet, so Neuzem overrules the quality gate on purpose (see test_quality_gate.py).
+    switch = {'id': pilot['org'], 'approval_mode': 'automatic', 'force': True}
+    assert owner.post('/api/platform/update_organization', json=switch).status_code == 200
     assert submit(pilot['staff']) == 'APPROVED'
