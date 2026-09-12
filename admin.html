@@ -1439,6 +1439,7 @@
         </div>
 
         <MonitoringPanel />
+        <FairnessPanel days={days} />
         </>
       );
     }
@@ -1515,6 +1516,86 @@
               </tbody>
             </table>
           </div>
+        </div>
+      );
+    }
+
+    function FairnessPanel({ days }) {
+      const [report, setReport] = useState(null);
+
+      useEffect(() => {
+        let current = true;
+        fetch(`/api/auth/fairness?days=${days}`, { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (current && data) setReport(data); })
+          .catch(() => {});
+        return () => { current = false; };
+      }, [days]);
+
+      if (!report) {
+        return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Grouping the decisions...</div></div>;
+      }
+
+      const table = (field, heading) => (
+        <div className="table-scroll">
+          <table className="data-table">
+            <thead>
+              <tr><th>{heading}</th><th>Requests</th><th>Approved</th><th>Sent to a person</th></tr>
+            </thead>
+            <tbody>
+              {report[`by_${field}`].map(row => (
+                <tr key={row.value}>
+                  <td className="cell-primary">
+                    {row.value}
+                    {!row.compared && <div className="cell-secondary">too few to compare</div>}
+                  </td>
+                  <td>{row.requests}</td>
+                  <td className={row.approval_gap ? 'cell-flagged' : ''}>
+                    {row.decided ? `${asPercent(row.approval_rate)} (${row.approved} of ${row.decided})` : '—'}
+                  </td>
+                  <td className={row.review_gap ? 'cell-flagged' : ''}>
+                    {asPercent(row.needed_person_rate)} ({row.needed_person})
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+
+      return (
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-scale-balanced"></i> Who the Decisions Fall On</h3>
+          <p className="panel-subtitle">
+            The same system can treat two departments very differently without anybody noticing. These are the last {report.days} days
+            by department and by role. A gap is not proof of unfairness, and departments do spend differently, but it is worth
+            a look. Groups with fewer than {report.minimum_requests} requests are shown but never judged.
+          </p>
+
+          {report.notes.length > 0 ? (
+            <div className="callout callout-warning">
+              <i className="fas fa-magnifying-glass" aria-hidden="true"></i>
+              <div>
+                <strong>{report.notes.length === 1 ? 'One group stands out' : `${report.notes.length} groups stand out`}</strong>
+                <ul className="callout-list">
+                  {report.notes.map(note => <li key={`${note.field}-${note.value}`}>{note.message}</li>)}
+                </ul>
+              </div>
+            </div>
+          ) : (
+            <div className="callout callout-info">
+              <i className="fas fa-circle-check" aria-hidden="true"></i>
+              <div>
+                <strong>No group stands out</strong>
+                Every group large enough to compare is close to the company as a whole
+                ({asPercent(report.overall.approval_rate)} approved, {asPercent(report.overall.needed_person_rate)} sent to a person).
+              </div>
+            </div>
+          )}
+
+          {table('department', 'Department')}
+          <div className="panel-gap"></div>
+          {table('role', 'Role')}
         </div>
       );
     }

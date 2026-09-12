@@ -958,6 +958,9 @@ select:disabled {
   border-bottom: 1px solid var(--separator);
 }
 
+.cell-flagged { color: var(--red-text); font-weight: 600; }
+.panel-gap { height: 18px; }
+
 .callout-list {
   margin: 6px 0 0;
   padding-left: 18px;

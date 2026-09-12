@@ -881,6 +881,69 @@ DRIFT_UNUSUAL_JUMP = 0.10
 DRIFT_SCORE_MOVE = 0.10
 DRIFT_VOLUME_CHANGE = 0.6
 
+# ==========================================
+# WHO THE DECISIONS FALL ON
+# ==========================================
+# The same system can treat two departments very differently without anybody noticing.
+# These numbers do not prove unfairness; they show where somebody should go and look.
+FAIRNESS_FIELDS = ('department', 'role')
+FAIRNESS_MIN_REQUESTS = 10
+FAIRNESS_GAP = 0.15
+
+def group_summary(rows):
+    finished = [row for row in rows if is_decided(row['final_decision'])]
+    approved = sum(1 for row in finished if row['final_decision'] == 'APPROVED')
+    needed_person = sum(1 for row in rows if not (row['final_decision'] == 'APPROVED' and not row['reviewed_by']))
+    return {
+        'requests': len(rows),
+        'decided': len(finished),
+        'approved': approved,
+        'approval_rate': share(approved, len(finished)),
+        'needed_person': needed_person,
+        'needed_person_rate': share(needed_person, len(rows)),
+    }
+
+def fairness_report(conn, organization_id, days):
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = conn.execute(
+        'SELECT role, department, final_decision, reviewed_by FROM Requests WHERE organization_id = ? AND created_at >= ?',
+        (organization_id, since)
+    ).fetchall()
+    overall = group_summary(rows)
+
+    report = {'days': days, 'minimum_requests': FAIRNESS_MIN_REQUESTS, 'overall': overall, 'notes': []}
+    for field in FAIRNESS_FIELDS:
+        buckets = {}
+        for row in rows:
+            buckets.setdefault((row[field] or '').strip() or 'Not given', []).append(row)
+
+        groups = []
+        for name, items in buckets.items():
+            group = {'value': name, **group_summary(items)}
+            group['compared'] = group['requests'] >= FAIRNESS_MIN_REQUESTS
+            group['approval_gap'] = bool(
+                group['compared'] and group['decided'] >= FAIRNESS_MIN_REQUESTS and group['approval_rate'] is not None
+                and overall['approval_rate'] is not None and overall['approval_rate'] - group['approval_rate'] > FAIRNESS_GAP
+            )
+            group['review_gap'] = bool(
+                group['compared'] and group['needed_person_rate'] is not None and overall['needed_person_rate'] is not None
+                and group['needed_person_rate'] - overall['needed_person_rate'] > FAIRNESS_GAP
+            )
+            groups.append(group)
+            if group['approval_gap']:
+                report['notes'].append({'field': field, 'value': name, 'message':
+                    f"{name} requests are approved {group['approval_rate']:.0%} of the time, "
+                    f"against {overall['approval_rate']:.0%} across the company."})
+            # A rejected request always went past a person, so a group flagged for approvals is not flagged twice.
+            if group['review_gap'] and not group['approval_gap']:
+                report['notes'].append({'field': field, 'value': name, 'message':
+                    f"{group['needed_person_rate']:.0%} of {name} requests are sent to a person, "
+                    f"against {overall['needed_person_rate']:.0%} across the company."})
+
+        report[f'by_{field}'] = sorted(groups, key=lambda group: (-group['requests'], group['value']))
+    return report
+
+
 def summarize_week(rows):
     total = len(rows)
     needed_person = sum(1 for row in rows if not (row['final_decision'] == 'APPROVED' and not row['reviewed_by']))
@@ -2433,6 +2496,18 @@ def organization_monitoring():
     conn = get_db_connection()
     try:
         return jsonify(weekly_monitoring(conn, g.user['organization_id']))
+    finally:
+        conn.close()
+
+@app.route('/api/auth/fairness', methods=['GET'])
+@require_role('Admin')
+def organization_fairness():
+    days = request.args.get('days', type=int) or QUALITY_DEFAULT_WINDOW
+    if days not in QUALITY_WINDOWS:
+        return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
+    conn = get_db_connection()
+    try:
+        return jsonify(fairness_report(conn, g.user['organization_id'], days))
     finally:
         conn.close()
 
