@@ -171,15 +171,20 @@
     function qualityNode(report) {
       const { comparison, spot_checks: spotChecks, totals } = report;
       const line = (label, value) => el('div', 'quality-line', [el('span', '', [label]), el('strong', '', [value])]);
-      return el('div', 'quality-summary', [
+      const children = [
         line('Decisions made by people', String(comparison.pairs)),
         line('AI and people agree', asPercent(comparison.agreement_rate)),
         line('Would have slipped through', asPercent(comparison.missed_problem_rate)),
         line('Reviews that were not needed', asPercent(comparison.unnecessary_review_rate)),
         line('Spot checks marked wrong', spotChecks.done ? `${asPercent(spotChecks.wrong_rate)} of ${spotChecks.done}` : 'none checked'),
         line('Requests in this period', String(totals.requests)),
-        readinessNode(report.readiness)
-      ]);
+      ];
+      // Anything that changed in the newest week is worth reading before switching a company over.
+      (report.drift_warnings || []).forEach(warning => children.push(
+        el('div', 'quality-warning', [icon('fa-triangle-exclamation'), el('span', '', [` ${warning.message}`])])
+      ));
+      children.push(readinessNode(report.readiness));
+      return el('div', 'quality-summary', children);
     }
 
     async function showQuality(org) {

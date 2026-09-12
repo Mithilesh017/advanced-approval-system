@@ -958,6 +958,27 @@ select:disabled {
   border-bottom: 1px solid var(--separator);
 }
 
+.callout-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.quality-warning {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--orange-tint);
+  font-size: 0.875rem;
+  color: var(--label);
+}
+
+.quality-warning > i { margin-top: 3px; color: var(--orange-text); }
+
 .quality-summary .check-list { margin-top: 10px; }
 
 .stat-note {

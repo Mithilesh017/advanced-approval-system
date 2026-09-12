@@ -1437,7 +1437,85 @@
             ))}
           </ul>
         </div>
+
+        <MonitoringPanel />
         </>
+      );
+    }
+
+    const formatWeek = (week) => {
+      const options = { day: 'numeric', month: 'short' };
+      return `${new Date(week.starting).toLocaleDateString('en-IN', options)} - ${new Date(week.ending).toLocaleDateString('en-IN', options)}`;
+    };
+
+    function MonitoringPanel() {
+      const [report, setReport] = useState(null);
+
+      useEffect(() => {
+        fetch('/api/auth/monitoring', { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (data) setReport(data); })
+          .catch(() => {});
+      }, []);
+
+      if (!report) {
+        return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Looking at the last few weeks...</div></div>;
+      }
+
+      const weeks = [...report.weeks].reverse().filter((week, index) => index === 0 || week.requests > 0);
+
+      return (
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-wave-square"></i> Week by Week</h3>
+          <p className="panel-subtitle">
+            The work your people send in changes over time. When the newest week stops looking like the weeks before it,
+            the AI is being asked about things it was not trained on, and it is time to tell Neuzem.
+          </p>
+
+          {report.warnings.length > 0 ? (
+            <div className="callout callout-warning">
+              <i className="fas fa-triangle-exclamation" aria-hidden="true"></i>
+              <div>
+                <strong>{report.warnings.length === 1 ? 'Something changed this week' : `${report.warnings.length} things changed this week`}</strong>
+                <ul className="callout-list">
+                  {report.warnings.map(warning => <li key={warning.name}>{warning.message}</li>)}
+                </ul>
+              </div>
+            </div>
+          ) : (
+            <div className="callout callout-info">
+              <i className={`fas ${report.enough_data ? 'fa-circle-check' : 'fa-hourglass-half'}`} aria-hidden="true"></i>
+              <div>
+                <strong>{report.enough_data ? 'Nothing unusual this week' : 'Not enough this week to compare'}</strong>
+                {report.enough_data
+                  ? 'This week looks like the weeks before it.'
+                  : `Under ${report.minimum_requests} requests in a week, the shares below move too much to compare. The counts are still real.`}
+              </div>
+            </div>
+          )}
+
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Week</th><th>Requests</th><th>Needed a person</th><th>New categories</th><th>Looked unusual</th><th>Average AI score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {weeks.map(week => (
+                  <tr key={week.starting}>
+                    <td className="cell-nowrap">{formatWeek(week)}</td>
+                    <td>{week.requests}</td>
+                    <td>{week.requests ? `${asPercent(week.needed_person_rate)} (${week.needed_person})` : '—'}</td>
+                    <td>{week.requests ? `${asPercent(week.unknown_category_rate)} (${week.unknown_category})` : '—'}</td>
+                    <td>{week.requests ? `${asPercent(week.unusual_rate)} (${week.unusual})` : '—'}</td>
+                    <td>{asPercent(week.average_score)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       );
     }
 

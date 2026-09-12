@@ -869,6 +869,117 @@ def automatic_approval_readiness(quality):
         'blocked_by': [check['label'] for check in checks if not check['passed']],
     }
 
+# ==========================================
+# WEEK BY WEEK MONITORING
+# ==========================================
+# The work a company sends in changes over time. Comparing the last week with the weeks before it
+# shows when the AI is suddenly meeting requests it was never trained for.
+MONITORING_WEEKS = 12
+DRIFT_MIN_REQUESTS = 10
+DRIFT_RATE_JUMP = 0.15
+DRIFT_UNUSUAL_JUMP = 0.10
+DRIFT_SCORE_MOVE = 0.10
+DRIFT_VOLUME_CHANGE = 0.6
+
+def summarize_week(rows):
+    total = len(rows)
+    needed_person = sum(1 for row in rows if not (row['final_decision'] == 'APPROVED' and not row['reviewed_by']))
+    unknown = sum(1 for row in rows if row['ai_decision'] == 'ESCALATED_UNKNOWN')
+    unusual = sum(1 for row in rows if row['ai_decision'] == 'ESCALATED_ANOMALY')
+    scores = [float(row['xgb_score']) for row in rows if row['xgb_score'] is not None]
+    return {
+        'requests': total,
+        'needed_person': needed_person,
+        'needed_person_rate': share(needed_person, total),
+        'unknown_category': unknown,
+        'unknown_category_rate': share(unknown, total),
+        'unusual': unusual,
+        'unusual_rate': share(unusual, total),
+        'average_score': round(sum(scores) / len(scores), 4) if scores else None,
+    }
+
+def moved_up(latest, baseline, limit):
+    return latest is not None and baseline is not None and latest - baseline > limit
+
+def drift_warnings(latest, baseline, rates=True):
+    """Plain sentences about what changed, never a number on its own."""
+    warnings = []
+    def add(name, message):
+        warnings.append({'name': name, 'message': message})
+
+    # A week with few requests says nothing about rates, but a week that is suddenly empty says plenty.
+    if not rates:
+        volume_warnings(latest, baseline, add)
+        return warnings
+
+    if moved_up(latest['needed_person_rate'], baseline['needed_person_rate'], DRIFT_RATE_JUMP):
+        add('needed_person', f"People are being asked to decide {latest['needed_person_rate']:.0%} of requests, "
+                             f"against {baseline['needed_person_rate']:.0%} in the weeks before.")
+    if moved_up(latest['unknown_category_rate'], baseline['unknown_category_rate'], DRIFT_UNUSUAL_JUMP):
+        add('unknown_category', f"{latest['unknown_category_rate']:.0%} of requests used a role, department, type or "
+                                f"destination the AI has never seen, against {baseline['unknown_category_rate']:.0%} before. "
+                                'The AI is working outside what it was trained on.')
+    if moved_up(latest['unusual_rate'], baseline['unusual_rate'], DRIFT_UNUSUAL_JUMP):
+        add('unusual', f"{latest['unusual_rate']:.0%} of requests looked unusual to the AI, "
+                       f"against {baseline['unusual_rate']:.0%} before.")
+    if (latest['average_score'] is not None and baseline['average_score'] is not None
+            and abs(latest['average_score'] - baseline['average_score']) > DRIFT_SCORE_MOVE):
+        direction = 'up' if latest['average_score'] > baseline['average_score'] else 'down'
+        add('average_score', f"The AI's average approval score moved {direction} to {latest['average_score']:.0%}, "
+                             f"from {baseline['average_score']:.0%} in the weeks before.")
+
+    volume_warnings(latest, baseline, add)
+    return warnings
+
+def volume_warnings(latest, baseline, add):
+    weekly_baseline = baseline['requests'] / max(1, baseline['weeks'])
+    if weekly_baseline < DRIFT_MIN_REQUESTS:
+        return
+    if latest['requests'] > weekly_baseline * (1 + DRIFT_VOLUME_CHANGE):
+        add('volume', f"{latest['requests']} requests came in this week, well above the usual "
+                      f"{weekly_baseline:.0f} a week.")
+    elif latest['requests'] < weekly_baseline * (1 - DRIFT_VOLUME_CHANGE):
+        add('volume', f"Only {latest['requests']} requests came in this week, well below the usual "
+                      f"{weekly_baseline:.0f} a week.")
+
+def weekly_monitoring(conn, organization_id, weeks=MONITORING_WEEKS):
+    """The last few weeks side by side, plus a warning whenever the newest week stands out."""
+    today = datetime.utcnow()
+    since = (today - timedelta(days=7 * weeks)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = conn.execute(
+        'SELECT created_at, final_decision, ai_decision, xgb_score, reviewed_by FROM Requests '
+        'WHERE organization_id = ? AND created_at >= ?',
+        (organization_id, since)
+    ).fetchall()
+
+    buckets = [[] for _ in range(weeks)]
+    for row in rows:
+        index = (today - as_datetime(row['created_at'])).days // 7
+        if 0 <= index < weeks:
+            buckets[index].append(row)
+
+    listed = []
+    for index in range(weeks - 1, -1, -1):
+        week = summarize_week(buckets[index])
+        week['starting'] = (today - timedelta(days=7 * (index + 1))).strftime('%Y-%m-%d')
+        week['ending'] = (today - timedelta(days=7 * index)).strftime('%Y-%m-%d')
+        listed.append(week)
+
+    latest = listed[-1]
+    earlier = [row for bucket in buckets[1:] for row in bucket]
+    baseline = summarize_week(earlier)
+    baseline['weeks'] = sum(1 for bucket in buckets[1:] if bucket)
+    enough = latest['requests'] >= DRIFT_MIN_REQUESTS and baseline['requests'] >= DRIFT_MIN_REQUESTS
+    return {
+        'weeks': listed,
+        'latest': latest,
+        'baseline': baseline,
+        'enough_data': enough,
+        'minimum_requests': DRIFT_MIN_REQUESTS,
+        'warnings': drift_warnings(latest, baseline, rates=enough) if baseline['requests'] else [],
+    }
+
+
 def decision_quality(conn, organization_id, days):
     """How often the AI and the people agreed, plus volume, speed and the spot-check answers."""
     since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
@@ -1939,9 +2050,12 @@ def platform_decision_quality():
         if not organization_id or not conn.execute('SELECT id FROM Organizations WHERE id = ?', (organization_id,)).fetchone():
             return jsonify({'error': 'Organization not found.'}), 404
         quality = decision_quality(conn, organization_id, days)
+        monitoring = weekly_monitoring(conn, organization_id)
     finally:
         conn.close()
-    return jsonify({**quality, 'readiness': automatic_approval_readiness(quality)})
+    return jsonify({
+        **quality, 'readiness': automatic_approval_readiness(quality), 'drift_warnings': monitoring['warnings'],
+    })
 
 @app.route('/api/platform/update_organization', methods=['POST'])
 @require_platform_owner
@@ -2312,6 +2426,15 @@ def organization_decision_quality():
     finally:
         conn.close()
     return jsonify({**quality, 'readiness': automatic_approval_readiness(quality)})
+
+@app.route('/api/auth/monitoring', methods=['GET'])
+@require_role('Admin')
+def organization_monitoring():
+    conn = get_db_connection()
+    try:
+        return jsonify(weekly_monitoring(conn, g.user['organization_id']))
+    finally:
+        conn.close()
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
