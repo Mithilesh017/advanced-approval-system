@@ -10,6 +10,7 @@ import math
 import re
 import sqlite3
 import os
+import tempfile
 import threading
 import time
 import email_service
@@ -22,6 +23,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
+import zipfile
 from urllib.parse import quote
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
@@ -250,6 +252,14 @@ class PostgresWrapper:
 # At most one organization can be the default, even when several workers start at once.
 ORGANIZATIONS_SINGLE_DEFAULT_INDEX = (
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_single_default ON Organizations (is_default) WHERE is_default = 1'
+)
+
+# The audit log may only be added to. One definition of the guard, used when the database is created
+# and again after the one operation allowed to erase history: closing an organization.
+SQLITE_AUDIT_TRIGGERS = tuple(
+    f"CREATE TRIGGER IF NOT EXISTS audit_events_no_{operation.lower()} BEFORE {operation} ON AuditEvents "
+    "BEGIN SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted'); END"
+    for operation in ('UPDATE', 'DELETE')
 )
 
 AUDIT_EVENT_INDEXES = (
@@ -490,13 +500,8 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        for operation in ('UPDATE', 'DELETE'):
-            cursor.execute(f'''
-                CREATE TRIGGER IF NOT EXISTS audit_events_no_{operation.lower()} BEFORE {operation} ON AuditEvents
-                BEGIN
-                    SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted');
-                END
-            ''')
+        for statement in SQLITE_AUDIT_TRIGGERS:
+            cursor.execute(statement)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS PolicyRules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2136,6 +2141,95 @@ def platform_decision_quality():
         **quality, 'readiness': automatic_approval_readiness(quality), 'drift_warnings': monitoring['warnings'],
     })
 
+# ==========================================
+# CLOSING AN ORGANIZATION
+# ==========================================
+# When a company leaves, everything that names a person goes: accounts, receipts, purposes, comments and the
+# history. What stays is the shape of their decisions with nobody's name on it, which is what the AI learns from
+# and which their agreement already covers. A company that never agreed to share data is not trained on either
+# way, because closing them does not change that permission.
+ORGANIZATION_CLOSED = 'Closed'
+CLOSED_MARKER = 'closed'
+
+def erase_audit_events(conn, organization_id):
+    """Lifts the append-only guard for this one deletion, inside the same transaction that puts it back."""
+    if os.getenv('DATABASE_URL'):
+        conn.execute('ALTER TABLE AuditEvents DISABLE TRIGGER audit_events_append_only')
+        conn.execute('DELETE FROM AuditEvents WHERE organization_id = ?', (organization_id,))
+        conn.execute('ALTER TABLE AuditEvents ENABLE TRIGGER audit_events_append_only')
+        return
+    for name in ('audit_events_no_update', 'audit_events_no_delete'):
+        conn.execute(f'DROP TRIGGER IF EXISTS {name}')
+    conn.execute('DELETE FROM AuditEvents WHERE organization_id = ?', (organization_id,))
+    for statement in SQLITE_AUDIT_TRIGGERS:
+        conn.execute(statement)
+
+@app.route('/api/platform/close_organization', methods=['POST'])
+@require_platform_owner
+def close_organization():
+    data = request.get_json(silent=True) or {}
+    organization_id = data.get('id')
+    if isinstance(organization_id, bool) or not isinstance(organization_id, int):
+        return jsonify({'error': 'id must be an organization number.'}), 400
+
+    conn = get_db_connection()
+    try:
+        organization = conn.execute(
+            'SELECT id, name, status, is_default FROM Organizations WHERE id = ?', (organization_id,)
+        ).fetchone()
+        if not organization:
+            return jsonify({'error': 'Organization not found.'}), 404
+        if organization['is_default']:
+            return jsonify({'error': 'The default organization holds the original accounts and cannot be closed.'}), 409
+        if organization['status'] == ORGANIZATION_CLOSED:
+            return jsonify({'error': 'This organization is already closed.'}), 409
+        confirmation = data.get('name')
+        if not isinstance(confirmation, str) or confirmation.strip() != organization['name']:
+            return jsonify({'error': "Type the organization's name exactly as it is written to confirm."}), 400
+
+        counts = {
+            table.lower(): conn.execute(
+                f'SELECT COUNT(*) AS total FROM {table} WHERE organization_id = ?', (organization_id,)
+            ).fetchone()['total']
+            for table in ('Users', 'Requests', 'Receipts', 'PolicyRules', 'AuditEvents')
+        }
+
+        # Everything that names a person.
+        conn.execute('DELETE FROM Receipts WHERE organization_id = ?', (organization_id,))
+        conn.execute('DELETE FROM PolicyRules WHERE organization_id = ?', (organization_id,))
+        conn.execute('DELETE FROM Users WHERE organization_id = ?', (organization_id,))
+        conn.execute(
+            'UPDATE SpotChecks SET reviewed_by = ?, comment = NULL WHERE organization_id = ? AND reviewed_by IS NOT NULL',
+            (CLOSED_MARKER, organization_id)
+        )
+        conn.execute(
+            'UPDATE Requests SET submitted_by = ?, employee_name = NULL, employee_id = NULL, purpose = NULL, '
+            'approver_email = NULL, first_approved_by = NULL WHERE organization_id = ?',
+            (CLOSED_MARKER, organization_id)
+        )
+        # Only where somebody really did decide, so an approval the AI made alone still counts as one.
+        conn.execute(
+            'UPDATE Requests SET reviewed_by = ? WHERE organization_id = ? AND reviewed_by IS NOT NULL',
+            (CLOSED_MARKER, organization_id)
+        )
+        erase_audit_events(conn, organization_id)
+
+        # A new join code kills the old invitation link.
+        conn.execute(
+            'UPDATE Organizations SET status = ?, join_code = ? WHERE id = ?',
+            (ORGANIZATION_CLOSED, secrets.token_urlsafe(9), organization_id)
+        )
+        # The one line that outlives the history it replaced.
+        record_event(conn, 'organization.closed', organization_id=organization_id, actor=g.user['email'], details={
+            'accounts_removed': counts['users'], 'receipts_removed': counts['receipts'],
+            'rules_removed': counts['policyrules'], 'history_entries_removed': counts['auditevents'],
+            'anonymous_requests_kept': counts['requests'],
+        })
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'anonymous_requests_kept': counts['requests']})
+
 @app.route('/api/platform/update_organization', methods=['POST'])
 @require_platform_owner
 def platform_update_organization():
@@ -2276,6 +2370,90 @@ def join_info():
     if not organization:
         return jsonify({'error': JOIN_LINK_INVALID_MESSAGE}), 404
     return jsonify({'organization_name': organization['name']})
+
+# ==========================================
+# TAKING YOUR DATA WITH YOU
+# ==========================================
+# A company must be able to walk away with everything it put in, in a form it can still read
+# without this system. Passwords, join links and other organizations' data are never in it.
+EXPORT_TABLES = (
+    ('users', 'SELECT email, name, emp_id, role, status, manager_email, created_at FROM Users '
+              'WHERE organization_id = ? ORDER BY id'),
+    ('requests', 'SELECT * FROM Requests WHERE organization_id = ? ORDER BY id'),
+    ('receipts', 'SELECT id, request_id, filename, content_type, size, sha256, uploaded_by, created_at FROM Receipts '
+                 'WHERE organization_id = ? ORDER BY id'),
+    ('history', 'SELECT id, request_id, actor_email, action, from_status, to_status, comment, details, created_at '
+                'FROM AuditEvents WHERE organization_id = ? ORDER BY id'),
+    ('policy_rules', 'SELECT id, rule_type, name, config, is_active, created_by, created_at FROM PolicyRules '
+                     'WHERE organization_id = ? ORDER BY id'),
+    ('spot_checks', 'SELECT id, request_id, verdict, reviewed_by, reviewed_at, comment, created_at FROM SpotChecks '
+                    'WHERE organization_id = ? ORDER BY id'),
+)
+EXPORT_ORGANIZATION_SQL = (
+    'SELECT id, name, status, is_default, allow_training_data, approval_mode, auto_approve_above, '
+    'second_approval_above, spot_check_percent, created_by, created_at FROM Organizations WHERE id = ?'
+)
+EXPORT_README = """Your data from the Advanced Approval Management System
+======================================================
+
+data.json holds everything this system stores about your organization:
+
+  organization   your settings
+  users          the people in your organization, without passwords
+  requests       every request with its decision and scores
+  receipts       what each receipt file is; the files themselves are in the receipts folder
+  history        who did what and when, in order
+  policy_rules   your company rules
+  spot_checks    the answers your administrators gave on automatic approvals
+
+The receipts folder holds the original files exactly as they were uploaded.
+Nothing here belongs to any other organization, and no passwords or login links are included.
+"""
+
+def export_file_name(organization_name):
+    slug = re.sub(r'[^A-Za-z0-9]+', '-', organization_name or 'organization').strip('-').lower() or 'organization'
+    return f"{slug}-export-{datetime.utcnow().strftime('%Y-%m-%d')}.zip"
+
+@app.route('/api/auth/export', methods=['GET'])
+@limiter.limit("3 per hour")
+@require_role('SuperAdmin')
+def export_organization():
+    organization_id = g.user['organization_id']
+    conn = get_db_connection()
+    try:
+        organization = conn.execute(EXPORT_ORGANIZATION_SQL, (organization_id,)).fetchone()
+        data = {
+            'exported_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'exported_by': g.user['email'],
+            'organization': to_json_row(organization),
+        }
+        for name, sql in EXPORT_TABLES:
+            data[name] = [to_json_row(row) for row in conn.execute(sql, (organization_id,)).fetchall()]
+
+        # Written to a temporary file rather than held in memory, so a company with many receipts is fine.
+        archive = tempfile.TemporaryFile()
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr('README.txt', EXPORT_README)
+            bundle.writestr('data.json', json.dumps(data, indent=2, default=str))
+            files = conn.execute(
+                'SELECT id, filename, content FROM Receipts WHERE organization_id = ? ORDER BY id', (organization_id,)
+            ).fetchall()
+            for receipt in files:
+                bundle.writestr(f"receipts/{receipt['id']}-{secure_filename(receipt['filename'])}", bytes(receipt['content']))
+
+        record_event(conn, 'organization.exported', organization_id=organization_id, actor=g.user['email'],
+                     details={name: len(data[name]) for name, _ in EXPORT_TABLES})
+        conn.commit()
+    finally:
+        conn.close()
+
+    archive.seek(0)
+    response = send_file(
+        archive, mimetype='application/zip', as_attachment=True,
+        download_name=export_file_name(data['organization']['name']), etag=False
+    )
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
 
 @app.route('/api/auth/organization', methods=['GET'])
 @require_login

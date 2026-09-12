@@ -202,6 +202,63 @@
       }
     }
 
+    const CLOSED_STATUS = 'Closed';
+
+    function closeExplanation(org) {
+      const section = (title, items) => el('div', '', [
+        el('strong', '', [title]),
+        el('ul', 'callout-list', items.map(item => el('li', '', [item])))
+      ]);
+      return el('div', 'quality-summary', [
+        el('p', '', [`Nobody at ${org.name} will be able to log in again, and this cannot be undone.`]),
+        section('Gone for good:', [
+          'Every account, with its password',
+          'All receipt files',
+          'Employee names, employee IDs and the purpose written on each request',
+          'Their policy rules',
+          'Their whole history, replaced by one line saying you closed them'
+        ]),
+        section('Kept:', [
+          "Each decision with nobody's name on it: role, department, request type, destination, amount and the outcome",
+          'Used to train the AI only if this organization agreed to share its data'
+        ])
+      ]);
+    }
+
+    async function closeOrganization(org) {
+      const result = await Swal.fire({
+        icon: 'warning',
+        title: `Close ${org.name}?`,
+        html: closeExplanation(org),
+        width: 640,
+        input: 'text',
+        inputLabel: `Type the name exactly to confirm: ${org.name}`,
+        inputPlaceholder: org.name,
+        showCancelButton: true,
+        cancelButtonText: 'Keep the organization',
+        confirmButtonText: 'Close it',
+        confirmButtonColor: '#d70015',
+        inputValidator: (value) => ((value || '').trim() !== org.name ? 'Type the name exactly as it is written.' : undefined)
+      });
+      if (!result.isConfirmed) return;
+
+      try {
+        const data = await api(`${PLATFORM_API}/close_organization`, {
+          method: 'POST',
+          body: JSON.stringify({ id: org.id, name: (result.value || '').trim() })
+        });
+        if (!data) return;
+        await loadOrganizations();
+        Swal.fire({
+          icon: 'success',
+          title: 'Organization Closed',
+          text: `Their accounts, receipts and history are gone. ${data.anonymous_requests_kept} decisions stay with nobody's name on them.`
+        });
+      } catch (err) {
+        Swal.fire({ icon: 'error', title: 'Could Not Close', text: err.message });
+      }
+    }
+
     function renderOrganizationRow(org) {
       const name = el('div', 'cell-primary', [org.name]);
       if (org.is_default) name.append(' ', el('span', 'badge badge-purple', ['Default']));
@@ -214,19 +271,22 @@
           ]))
         : [el('span', 'cell-muted', ['None'])];
 
+      const closed = org.status === CLOSED_STATUS;
+
       const sharing = org.allow_training_data;
       const training = el('div', 'cell-actions', [
         el('span', `badge ${sharing ? 'badge-green' : ''}`, [sharing ? 'Shared' : 'Not shared']),
-        button(sharing ? 'Stop' : 'Allow', sharing ? 'fa-ban' : 'fa-check', 'btn-secondary',
-          () => updateOrganization(org, { allow_training_data: !sharing }))
+        // A company that has left cannot agree to anything new, so sharing can only be turned off.
+        ...(closed && !sharing ? [] : [button(sharing ? 'Stop' : 'Allow', sharing ? 'fa-ban' : 'fa-check', 'btn-secondary',
+          () => updateOrganization(org, { allow_training_data: !sharing }))])
       ]);
 
       const automatic = org.approval_mode === 'automatic';
       const approval = el('div', '', [
         el('div', 'cell-actions', [
           el('span', `badge ${automatic ? 'badge-accent' : 'badge-orange'}`, [automatic ? 'Automatic' : 'Shadow']),
-          button(automatic ? 'Use shadow' : 'Go automatic', automatic ? 'fa-eye' : 'fa-bolt', 'btn-secondary',
-            () => updateOrganization(org, { approval_mode: automatic ? 'shadow' : 'automatic' })),
+          ...(closed ? [] : [button(automatic ? 'Use shadow' : 'Go automatic', automatic ? 'fa-eye' : 'fa-bolt', 'btn-secondary',
+            () => updateOrganization(org, { approval_mode: automatic ? 'shadow' : 'automatic' }))]),
           button('Quality', 'fa-chart-simple', 'btn-secondary', () => showQuality(org))
         ]),
         el('div', 'cell-secondary', [automatic ? `Auto-approves above ${Math.round(org.auto_approve_above * 100)}%` : 'AI only recommends'])
@@ -235,9 +295,14 @@
       const active = org.status === 'Active';
       const action = org.is_default
         ? el('span', 'cell-muted', ['Always active'])
-        : active
-          ? button('Pause', 'fa-pause', 'btn-tinted-danger', () => updateOrganization(org, { status: 'Paused' }))
-          : button('Resume', 'fa-play', 'btn-primary', () => updateOrganization(org, { status: 'Active' }));
+        : closed
+          ? el('span', 'cell-muted', ['Closed'])
+          : el('div', 'cell-actions', [
+              active
+                ? button('Pause', 'fa-pause', 'btn-tinted-danger', () => updateOrganization(org, { status: 'Paused' }))
+                : button('Resume', 'fa-play', 'btn-primary', () => updateOrganization(org, { status: 'Active' })),
+              button('Close', 'fa-box-archive', 'btn-tinted-danger', () => closeOrganization(org))
+            ]);
 
       return el('tr', '', [
         el('td', '', [name, el('div', 'cell-secondary', [created])]),
