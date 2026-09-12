@@ -10,6 +10,7 @@ import math
 import re
 import sqlite3
 import os
+import tempfile
 import threading
 import time
 import email_service
@@ -22,6 +23,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from functools import wraps
+import zipfile
 from urllib.parse import quote
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
@@ -2276,6 +2278,90 @@ def join_info():
     if not organization:
         return jsonify({'error': JOIN_LINK_INVALID_MESSAGE}), 404
     return jsonify({'organization_name': organization['name']})
+
+# ==========================================
+# TAKING YOUR DATA WITH YOU
+# ==========================================
+# A company must be able to walk away with everything it put in, in a form it can still read
+# without this system. Passwords, join links and other organizations' data are never in it.
+EXPORT_TABLES = (
+    ('users', 'SELECT email, name, emp_id, role, status, manager_email, created_at FROM Users '
+              'WHERE organization_id = ? ORDER BY id'),
+    ('requests', 'SELECT * FROM Requests WHERE organization_id = ? ORDER BY id'),
+    ('receipts', 'SELECT id, request_id, filename, content_type, size, sha256, uploaded_by, created_at FROM Receipts '
+                 'WHERE organization_id = ? ORDER BY id'),
+    ('history', 'SELECT id, request_id, actor_email, action, from_status, to_status, comment, details, created_at '
+                'FROM AuditEvents WHERE organization_id = ? ORDER BY id'),
+    ('policy_rules', 'SELECT id, rule_type, name, config, is_active, created_by, created_at FROM PolicyRules '
+                     'WHERE organization_id = ? ORDER BY id'),
+    ('spot_checks', 'SELECT id, request_id, verdict, reviewed_by, reviewed_at, comment, created_at FROM SpotChecks '
+                    'WHERE organization_id = ? ORDER BY id'),
+)
+EXPORT_ORGANIZATION_SQL = (
+    'SELECT id, name, status, is_default, allow_training_data, approval_mode, auto_approve_above, '
+    'second_approval_above, spot_check_percent, created_by, created_at FROM Organizations WHERE id = ?'
+)
+EXPORT_README = """Your data from the Advanced Approval Management System
+======================================================
+
+data.json holds everything this system stores about your organization:
+
+  organization   your settings
+  users          the people in your organization, without passwords
+  requests       every request with its decision and scores
+  receipts       what each receipt file is; the files themselves are in the receipts folder
+  history        who did what and when, in order
+  policy_rules   your company rules
+  spot_checks    the answers your administrators gave on automatic approvals
+
+The receipts folder holds the original files exactly as they were uploaded.
+Nothing here belongs to any other organization, and no passwords or login links are included.
+"""
+
+def export_file_name(organization_name):
+    slug = re.sub(r'[^A-Za-z0-9]+', '-', organization_name or 'organization').strip('-').lower() or 'organization'
+    return f"{slug}-export-{datetime.utcnow().strftime('%Y-%m-%d')}.zip"
+
+@app.route('/api/auth/export', methods=['GET'])
+@limiter.limit("3 per hour")
+@require_role('SuperAdmin')
+def export_organization():
+    organization_id = g.user['organization_id']
+    conn = get_db_connection()
+    try:
+        organization = conn.execute(EXPORT_ORGANIZATION_SQL, (organization_id,)).fetchone()
+        data = {
+            'exported_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'exported_by': g.user['email'],
+            'organization': to_json_row(organization),
+        }
+        for name, sql in EXPORT_TABLES:
+            data[name] = [to_json_row(row) for row in conn.execute(sql, (organization_id,)).fetchall()]
+
+        # Written to a temporary file rather than held in memory, so a company with many receipts is fine.
+        archive = tempfile.TemporaryFile()
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr('README.txt', EXPORT_README)
+            bundle.writestr('data.json', json.dumps(data, indent=2, default=str))
+            files = conn.execute(
+                'SELECT id, filename, content FROM Receipts WHERE organization_id = ? ORDER BY id', (organization_id,)
+            ).fetchall()
+            for receipt in files:
+                bundle.writestr(f"receipts/{receipt['id']}-{secure_filename(receipt['filename'])}", bytes(receipt['content']))
+
+        record_event(conn, 'organization.exported', organization_id=organization_id, actor=g.user['email'],
+                     details={name: len(data[name]) for name, _ in EXPORT_TABLES})
+        conn.commit()
+    finally:
+        conn.close()
+
+    archive.seek(0)
+    response = send_file(
+        archive, mimetype='application/zip', as_attachment=True,
+        download_name=export_file_name(data['organization']['name']), etag=False
+    )
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
 
 @app.route('/api/auth/organization', methods=['GET'])
 @require_login

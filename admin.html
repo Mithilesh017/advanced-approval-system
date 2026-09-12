@@ -1909,6 +1909,18 @@
           </form>
         </div>
         <PolicyRulesPanel />
+
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-box-archive"></i> Your Data</h3>
+          <p className="panel-subtitle">
+            Download everything this system holds for your organization: every request with its decision and history,
+            your people, your rules, and the receipt files exactly as they were uploaded. Passwords and join links are
+            never included, and no other organization's data is in it.
+          </p>
+          <a className="btn btn-secondary" href="/api/auth/export">
+            <i className="fas fa-download"></i> Download my organization's data
+          </a>
+        </div>
         </>
       );
     }
