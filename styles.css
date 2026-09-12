@@ -920,6 +920,38 @@ select:disabled {
   color: var(--label-3);
 }
 
+.stat-note {
+  margin-top: 10px;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--label-2);
+}
+
+.segmented {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  padding: 4px;
+  border-radius: var(--radius-md);
+  background: var(--fill);
+}
+
+.segmented button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: calc(var(--radius-md) - 4px);
+  background: transparent;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--label-2);
+  cursor: pointer;
+  transition: background 160ms var(--ease-standard), color 160ms var(--ease-standard);
+}
+
+.segmented button:hover { color: var(--label); }
+.segmented button.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-card); }
+
 .stat-card.is-inline { flex-direction: row; align-items: center; gap: 14px; }
 .stat-card.is-inline .stat-icon { width: 44px; height: 44px; margin: 0; border-radius: 12px; font-size: 18px; }
 .stat-body { min-width: 0; }

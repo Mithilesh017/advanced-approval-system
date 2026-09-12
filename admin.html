@@ -299,6 +299,11 @@
                 </button>
               </li>
               <li>
+                <button className={view === 'quality' ? 'active' : ''} onClick={() => setView('quality')}>
+                  <i className="fas fa-chart-simple"></i> Decision Quality
+                </button>
+              </li>
+              <li>
                 <button className={view === 'spotchecks' ? 'active' : ''} onClick={() => setView('spotchecks')}>
                   <i className="fas fa-clipboard-check"></i> Spot Checks
                   {spotChecksWaiting > 0 && <span className="count warning">{spotChecksWaiting}</span>}
@@ -330,6 +335,7 @@
                 {view === 'pending' && <><i className="fas fa-clock"></i> Pending Requests</>}
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
                 {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
+                {view === 'quality' && <><i className="fas fa-chart-simple"></i> Decision Quality</>}
                 {view === 'spotchecks' && <><i className="fas fa-clipboard-check"></i> Spot Checks</>}
                 {view === 'users' && <><i className="fas fa-users-cog"></i> Manage Users</>}
                 {view === 'settings' && <><i className="fas fa-sliders"></i> Approval Settings</>}
@@ -352,6 +358,7 @@
                     currentUserEmail={user.email}
                 />
             }
+            {view === 'quality' && <QualityView />}
             {view === 'spotchecks' && <SpotChecksView onReviewed={loadSpotChecks} />}
             {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
             {view === 'profile' && <ProfileView user={user} />}
@@ -1284,6 +1291,123 @@
             </div>
           )}
         </div>
+      );
+    }
+
+    const QUALITY_WINDOWS = [30, 90, 365];
+    const asPercent = (value) => (value == null ? '—' : `${Math.round(value * 1000) / 10}%`);
+    const asHours = (value) => (value == null ? '—' : `${value} h`);
+
+    function QualityView() {
+      const [days, setDays] = useState(90);
+      const [report, setReport] = useState(null);
+      const [loading, setLoading] = useState(true);
+
+      useEffect(() => {
+        let current = true;
+        setLoading(true);
+        fetch(`/api/auth/decision_quality?days=${days}`, { credentials: 'include' })
+          .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+          .then(data => { if (current && data) setReport(data); })
+          .catch(() => {})
+          .finally(() => { if (current) setLoading(false); });
+        return () => { current = false; };
+      }, [days]);
+
+      if (loading && !report) {
+        return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Measuring decisions...</div></div>;
+      }
+      if (!report) {
+        return <div className="panel"><div className="empty-state is-neutral"><i className="fas fa-chart-simple"></i>The quality numbers could not be loaded.</div></div>;
+      }
+
+      const { totals, comparison, spot_checks: spotChecks, speed } = report;
+
+      return (
+        <>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-chart-simple"></i> How Good Are the Decisions?</h3>
+          <p className="panel-subtitle">
+            Every request stores what the AI decided and what a person decided. Comparing the two on your own work is the
+            only honest measure of the AI, and these are the numbers Neuzem looks at before letting it approve on its own.
+          </p>
+
+          <div className="segmented" role="group" aria-label="Time window">
+            {QUALITY_WINDOWS.map(window => (
+              <button key={window} type="button" className={days === window ? 'active' : ''} onClick={() => setDays(window)}>
+                Last {window} days
+              </button>
+            ))}
+          </div>
+
+          {!report.enough_decisions && (
+            <div className="callout callout-warning">
+              <i className="fas fa-triangle-exclamation" aria-hidden="true"></i>
+              <div>
+                <strong>Too early to judge</strong>
+                People have decided {comparison.pairs} request{comparison.pairs === 1 ? '' : 's'} the AI also scored in this period.
+                Below {report.minimum_decisions} the percentages jump around, so read them as a hint, not a verdict.
+              </div>
+            </div>
+          )}
+
+          <div className="stats-grid-3">
+            <div className="stat-card green">
+              <div className="stat-icon"><i className="fas fa-handshake"></i></div>
+              <div className="stat-value">{asPercent(comparison.agreement_rate)}</div>
+              <div className="stat-label">AI and people agree</div>
+              <div className="stat-note">The same answer on {comparison.agreed} of {comparison.pairs} decisions people made.</div>
+            </div>
+            <div className={`stat-card ${comparison.missed_problems > 0 ? 'red' : 'green'}`}>
+              <div className="stat-icon"><i className="fas fa-triangle-exclamation"></i></div>
+              <div className="stat-value">{asPercent(comparison.missed_problem_rate)}</div>
+              <div className="stat-label">Would have slipped through</div>
+              <div className="stat-note">
+                Of the {comparison.ai_approved} request{comparison.ai_approved === 1 ? '' : 's'} the AI wanted to approve, people
+                refused {comparison.missed_problems}. This is the number that matters most.
+              </div>
+            </div>
+            <div className="stat-card yellow">
+              <div className="stat-icon"><i className="fas fa-hourglass-half"></i></div>
+              <div className="stat-value">{asPercent(comparison.unnecessary_review_rate)}</div>
+              <div className="stat-label">Reviews that were not needed</div>
+              <div className="stat-note">
+                Of the {comparison.ai_flagged} request{comparison.ai_flagged === 1 ? '' : 's'} the AI sent to a person,
+                {' '}{comparison.unnecessary_reviews} were approved anyway. Extra work, but nothing unsafe.
+              </div>
+            </div>
+          </div>
+
+          <div className="stats-grid-3">
+            <div className={`stat-card ${spotChecks.wrong > 0 ? 'red' : 'blue'}`}>
+              <div className="stat-icon"><i className="fas fa-clipboard-check"></i></div>
+              <div className="stat-value">{asPercent(spotChecks.wrong_rate)}</div>
+              <div className="stat-label">Spot checks marked wrong</div>
+              <div className="stat-note">
+                {spotChecks.done} of the approvals the AI made alone were checked by a person; {spotChecks.wrong} should not have
+                been approved. {spotChecks.waiting} still waiting to be checked.
+              </div>
+            </div>
+            <div className="stat-card purple">
+              <div className="stat-icon"><i className="fas fa-folder-open"></i></div>
+              <div className="stat-value">{totals.requests}</div>
+              <div className="stat-label">Requests in this period</div>
+              <div className="stat-note">
+                {totals.automatic_approvals} approved by the AI alone, {totals.decided_by_people} decided by a person,
+                {' '}{totals.waiting} still waiting.
+              </div>
+            </div>
+            <div className="stat-card teal">
+              <div className="stat-icon"><i className="fas fa-stopwatch"></i></div>
+              <div className="stat-value">{asHours(speed.average_hours)}</div>
+              <div className="stat-label">Average wait for a person</div>
+              <div className="stat-note">
+                Across {speed.decided} decision{speed.decided === 1 ? '' : 's'}. The longest wait was {asHours(speed.slowest_hours)}.
+              </div>
+            </div>
+          </div>
+        </div>
+        </>
       );
     }
 

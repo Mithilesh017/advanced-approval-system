@@ -813,6 +813,89 @@ def spot_check_selected(percent):
 
 
 # ==========================================
+# DECISION QUALITY
+# ==========================================
+# What the AI decided is stored next to what a person decided, so the two can be compared on real work.
+QUALITY_WINDOWS = (30, 90, 365)
+QUALITY_DEFAULT_WINDOW = 90
+# Below this many decisions the rates jump around too much to mean anything.
+QUALITY_ENOUGH_DECISIONS = 20
+
+def share(part, whole):
+    return None if not whole else round(part / whole, 4)
+
+def decision_quality(conn, organization_id, days):
+    """How often the AI and the people agreed, plus volume, speed and the spot-check answers."""
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = conn.execute(
+        'SELECT ai_decision, final_decision, reviewed_by, created_at, reviewed_at '
+        'FROM Requests WHERE organization_id = ? AND created_at >= ?',
+        (organization_id, since)
+    ).fetchall()
+
+    totals = {'requests': len(rows), 'automatic_approvals': 0, 'decided_by_people': 0, 'waiting': 0}
+    agreed = missed = unnecessary = ai_approved_pairs = ai_flagged_pairs = 0
+    hours = []
+    for row in rows:
+        decision, recommendation = row['final_decision'], row['ai_decision']
+        if is_awaiting_review(decision):
+            totals['waiting'] += 1
+        elif decision == 'APPROVED' and not row['reviewed_by']:
+            totals['automatic_approvals'] += 1
+
+        if not is_decided(decision) or not row['reviewed_by']:
+            continue
+        totals['decided_by_people'] += 1
+        if row['reviewed_at'] and row['created_at']:
+            hours.append((as_datetime(row['reviewed_at']) - as_datetime(row['created_at'])).total_seconds() / 3600)
+        if not recommendation:
+            continue
+        # The AI only ever says "approve" or "a person should look at this", so that is what is compared.
+        ai_approved = recommendation == 'APPROVED'
+        person_approved = decision == 'APPROVED'
+        if ai_approved:
+            ai_approved_pairs += 1
+        else:
+            ai_flagged_pairs += 1
+        if ai_approved and not person_approved:
+            missed += 1  # The AI would have let through something a person refused.
+        elif not ai_approved and person_approved:
+            unnecessary += 1  # Safe, but somebody was asked to look at a request that was fine.
+        else:
+            agreed += 1
+
+    checks = conn.execute(
+        'SELECT verdict FROM SpotChecks WHERE organization_id = ? AND created_at >= ?', (organization_id, since)
+    ).fetchall()
+    done = [check['verdict'] for check in checks if check['verdict']]
+    wrong = [verdict for verdict in done if verdict == 'WRONG']
+
+    pairs = ai_approved_pairs + ai_flagged_pairs
+    return {
+        'days': days,
+        'enough_decisions': pairs >= QUALITY_ENOUGH_DECISIONS,
+        'minimum_decisions': QUALITY_ENOUGH_DECISIONS,
+        'totals': totals,
+        'comparison': {
+            'pairs': pairs, 'agreed': agreed, 'missed_problems': missed, 'unnecessary_reviews': unnecessary,
+            'ai_approved': ai_approved_pairs, 'ai_flagged': ai_flagged_pairs,
+            'agreement_rate': share(agreed, pairs),
+            'missed_problem_rate': share(missed, ai_approved_pairs),
+            'unnecessary_review_rate': share(unnecessary, ai_flagged_pairs),
+        },
+        'spot_checks': {
+            'done': len(done), 'waiting': len(checks) - len(done), 'wrong': len(wrong),
+            'wrong_rate': share(len(wrong), len(done)),
+        },
+        'speed': {
+            'decided': len(hours),
+            'average_hours': round(sum(hours) / len(hours), 1) if hours else None,
+            'slowest_hours': round(max(hours), 1) if hours else None,
+        },
+    }
+
+
+# ==========================================
 # WAITING-APPROVER NOTICES
 # ==========================================
 def request_reference(request_id):
@@ -2138,6 +2221,18 @@ def review_spot_check():
     finally:
         conn.close()
     return jsonify({'status': 'SUCCESS'})
+
+@app.route('/api/auth/decision_quality', methods=['GET'])
+@require_role('Admin')
+def organization_decision_quality():
+    days = request.args.get('days', type=int) or QUALITY_DEFAULT_WINDOW
+    if days not in QUALITY_WINDOWS:
+        return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
+    conn = get_db_connection()
+    try:
+        return jsonify(decision_quality(conn, g.user['organization_id'], days))
+    finally:
+        conn.close()
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
