@@ -920,6 +920,46 @@ select:disabled {
   color: var(--label-3);
 }
 
+.check-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 10px;
+  text-align: left;
+}
+
+.check-list li {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 4px 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--fill-soft);
+  font-size: 0.875rem;
+  color: var(--label);
+}
+
+.check-list li > i { margin-top: 3px; }
+.check-list li.is-passed > i { color: var(--green-text); }
+.check-list li.is-blocked > i { color: var(--red-text); }
+.check-list .check-text { min-width: 0; }
+.check-list .cell-secondary { grid-column: 2; }
+
+.quality-summary { display: grid; gap: 8px; text-align: left; }
+
+.quality-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 2px;
+  font-size: 0.875rem;
+  color: var(--label-2);
+  border-bottom: 1px solid var(--separator);
+}
+
+.quality-summary .check-list { margin-top: 10px; }
+
 .stat-note {
   margin-top: 10px;
   font-size: 0.75rem;

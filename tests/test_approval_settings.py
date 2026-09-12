@@ -51,13 +51,15 @@ def test_existing_organizations_stay_automatic_and_new_ones_start_in_shadow(app_
 
 def test_neuzem_switches_an_organizations_approval_mode(app_db, owner):
     org_id = create_organization(app_db, 'Acme Pvt Ltd', approval_mode='shadow')
-    assert owner.post('/api/platform/update_organization', json={'id': org_id, 'approval_mode': 'automatic'}).status_code == 200
+    # This organization has decided nothing yet, so the quality gate is overruled on purpose (see test_quality_gate.py).
+    assert owner.post('/api/platform/update_organization', json={'id': org_id, 'approval_mode': 'automatic', 'force': True}).status_code == 200
     assert owner.post('/api/platform/update_organization', json={'id': org_id, 'approval_mode': 'manual'}).status_code == 400
 
     acme = next(o for o in owner.get('/api/platform/organizations').get_json()['organizations'] if o['id'] == org_id)
     assert (acme['approval_mode'], acme['auto_approve_above']) == ('automatic', 0.8)
     [event] = query(app_db, "SELECT details FROM AuditEvents WHERE action = 'organization.updated'")
-    assert json.loads(event['details']) == {'changes': {'approval_mode': 'automatic'}}
+    details = json.loads(event['details'])
+    assert (details['changes'], details['forced']) == ({'approval_mode': 'automatic'}, True)
 
 
 def test_admins_see_approval_settings_but_employees_do_not(app_db):

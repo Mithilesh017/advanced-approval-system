@@ -1407,6 +1407,36 @@
             </div>
           </div>
         </div>
+
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-list-check"></i> Ready for Automatic Approval?</h3>
+          <p className="panel-subtitle">
+            While your organization is in shadow mode, a person decides every request. Neuzem can only switch it to
+            automatic approval once these checks pass on your own decisions, so nothing is turned on before it has earned it.
+          </p>
+          <div className={`callout ${report.readiness.ready ? 'callout-info' : 'callout-warning'}`}>
+            <i className={`fas ${report.readiness.ready ? 'fa-circle-check' : 'fa-hourglass-half'}`} aria-hidden="true"></i>
+            <div>
+              <strong>{report.readiness.ready ? 'All checks passed' : `${report.readiness.blocked_by.length} check${report.readiness.blocked_by.length === 1 ? '' : 's'} still to pass`}</strong>
+              {report.readiness.ready
+                ? 'Your numbers meet the bar. Ask Neuzem when you want the AI to approve straightforward requests on its own.'
+                : 'Keep deciding requests as usual. The checks below use the last 90 days, so they improve as your team works.'}
+            </div>
+          </div>
+          <ul className="check-list">
+            {report.readiness.checks.map(check => (
+              <li key={check.name} className={check.passed ? 'is-passed' : 'is-blocked'}>
+                <i className={`fas ${check.passed ? 'fa-circle-check' : 'fa-circle-xmark'}`} aria-hidden="true"></i>
+                <span className="check-text"> {check.label}</span>
+                <div className="cell-secondary">
+                  {check.name !== 'decisions'
+                    ? `now ${asPercent(check.value)}`
+                    : check.passed ? `${check.value} so far` : `${check.value} of the ${check.target} needed`}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
         </>
       );
     }

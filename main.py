@@ -824,6 +824,51 @@ QUALITY_ENOUGH_DECISIONS = 20
 def share(part, whole):
     return None if not whole else round(part / whole, 4)
 
+
+# Before an organization is allowed to let the AI approve on its own, its own numbers have to earn it.
+AUTOMATIC_APPROVAL_WINDOW = 90
+AUTOMATIC_APPROVAL_MIN_AGREEMENT = 0.85
+AUTOMATIC_APPROVAL_MAX_MISSED = 0.05
+AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG = 0.10
+
+def automatic_approval_readiness(quality):
+    """Each check a company must pass before the AI may approve without a person. Rates are shares, not percentages."""
+    comparison, spot_checks = quality['comparison'], quality['spot_checks']
+    checks = [{
+        'name': 'decisions',
+        'label': f"People have decided at least {QUALITY_ENOUGH_DECISIONS} requests the AI also scored",
+        'value': comparison['pairs'],
+        'target': QUALITY_ENOUGH_DECISIONS,
+        'passed': comparison['pairs'] >= QUALITY_ENOUGH_DECISIONS,
+    }, {
+        'name': 'agreement',
+        'label': f"The AI and the people agree on at least {AUTOMATIC_APPROVAL_MIN_AGREEMENT:.0%} of them",
+        'value': comparison['agreement_rate'],
+        'target': AUTOMATIC_APPROVAL_MIN_AGREEMENT,
+        'passed': comparison['agreement_rate'] is not None and comparison['agreement_rate'] >= AUTOMATIC_APPROVAL_MIN_AGREEMENT,
+    }, {
+        'name': 'missed_problems',
+        'label': f"At most {AUTOMATIC_APPROVAL_MAX_MISSED:.0%} of what the AI would approve was refused by a person",
+        'value': comparison['missed_problem_rate'],
+        'target': AUTOMATIC_APPROVAL_MAX_MISSED,
+        'passed': comparison['missed_problem_rate'] is not None and comparison['missed_problem_rate'] <= AUTOMATIC_APPROVAL_MAX_MISSED,
+    }]
+    # Spot checks only exist once an organization is already approving automatically, so they count only when there are some.
+    if spot_checks['done']:
+        checks.append({
+            'name': 'spot_checks',
+            'label': f"At most {AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG:.0%} of the checked automatic approvals were wrong",
+            'value': spot_checks['wrong_rate'],
+            'target': AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG,
+            'passed': spot_checks['wrong_rate'] <= AUTOMATIC_APPROVAL_MAX_SPOT_CHECK_WRONG,
+        })
+    return {
+        'ready': all(check['passed'] for check in checks),
+        'days': quality['days'],
+        'checks': checks,
+        'blocked_by': [check['label'] for check in checks if not check['passed']],
+    }
+
 def decision_quality(conn, organization_id, days):
     """How often the AI and the people agreed, plus volume, speed and the spot-check answers."""
     since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
@@ -1880,6 +1925,24 @@ def platform_create_organization():
         'message': f'{name} was created. A setup link was emailed to {email}.',
     }), 201
 
+@app.route('/api/platform/decision_quality', methods=['GET'])
+@require_platform_owner
+def platform_decision_quality():
+    # Neuzem sees how well an organization's decisions are going, never the requests behind them.
+    organization_id = request.args.get('organization_id', type=int)
+    days = request.args.get('days', type=int) or AUTOMATIC_APPROVAL_WINDOW
+    if days not in QUALITY_WINDOWS:
+        return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
+
+    conn = get_db_connection()
+    try:
+        if not organization_id or not conn.execute('SELECT id FROM Organizations WHERE id = ?', (organization_id,)).fetchone():
+            return jsonify({'error': 'Organization not found.'}), 404
+        quality = decision_quality(conn, organization_id, days)
+    finally:
+        conn.close()
+    return jsonify({**quality, 'readiness': automatic_approval_readiness(quality)})
+
 @app.route('/api/platform/update_organization', methods=['POST'])
 @require_platform_owner
 def platform_update_organization():
@@ -1901,6 +1964,9 @@ def platform_update_organization():
         if not isinstance(data['allow_training_data'], bool):
             return jsonify({'error': 'allow_training_data must be true or false.'}), 400
         changes['allow_training_data'] = int(data['allow_training_data'])
+    forced = data.get('force', False)
+    if not isinstance(forced, bool):
+        return jsonify({'error': 'force must be true or false.'}), 400
     if not changes:
         return jsonify({'error': 'Nothing to update.'}), 400
 
@@ -1911,11 +1977,23 @@ def platform_update_organization():
             return jsonify({'error': 'Organization not found.'}), 404
         if organization['is_default'] and changes.get('status') == 'Paused':
             return jsonify({'error': 'The default organization holds the original accounts and cannot be paused.'}), 409
+        # An organization only stops using shadow mode once its own decisions show the AI can be trusted.
+        readiness = None
+        if changes.get('approval_mode') == 'automatic':
+            readiness = automatic_approval_readiness(decision_quality(conn, organization_id, AUTOMATIC_APPROVAL_WINDOW))
+            if not readiness['ready'] and not forced:
+                return jsonify({
+                    'error': 'This organization is not ready for automatic approval yet.', 'readiness': readiness,
+                }), 409
         # Column names come from the fixed keys above, never from the request.
         assignments = ', '.join(f'{column} = ?' for column in changes)
         conn.execute(f'UPDATE Organizations SET {assignments} WHERE id = ?', (*changes.values(), organization_id))
-        record_event(conn, 'organization.updated', organization_id=organization_id, actor=g.user['email'],
-                     details={'changes': {column: data[column] for column in changes}})
+        details = {'changes': {column: data[column] for column in changes}}
+        if readiness is not None:
+            details['readiness'] = {'ready': readiness['ready'], 'blocked_by': readiness['blocked_by']}
+            if not readiness['ready']:
+                details['forced'] = True  # Neuzem overruled the gate, and the audit log says so.
+        record_event(conn, 'organization.updated', organization_id=organization_id, actor=g.user['email'], details=details)
         conn.commit()
     finally:
         conn.close()
@@ -2230,9 +2308,10 @@ def organization_decision_quality():
         return jsonify({'error': 'Choose one of these windows: ' + ', '.join(f'{window} days' for window in QUALITY_WINDOWS) + '.'}), 400
     conn = get_db_connection()
     try:
-        return jsonify(decision_quality(conn, g.user['organization_id'], days))
+        quality = decision_quality(conn, g.user['organization_id'], days)
     finally:
         conn.close()
+    return jsonify({**quality, 'readiness': automatic_approval_readiness(quality)})
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")
