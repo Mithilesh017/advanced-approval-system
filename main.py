@@ -17,7 +17,6 @@ import model_pipeline
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
-import pandas as pd
 import joblib
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, set_access_cookies, unset_jwt_cookies, get_jwt
 from flask_limiter import Limiter
@@ -1570,6 +1569,20 @@ def join_page(code):
 # ==========================================
 # 4. MACHINE LEARNING API ROUTES
 # ==========================================
+TYPICAL_AMOUNT_SAMPLE = 200
+
+def organization_typical_amount(conn, organization_id):
+    """What a normal request costs in this organization, so the AI can judge a size against their own work."""
+    rows = conn.execute(
+        'SELECT normalized_amount FROM Requests WHERE organization_id = ? AND normalized_amount IS NOT NULL '
+        'ORDER BY id DESC LIMIT ?',
+        (organization_id, TYPICAL_AMOUNT_SAMPLE)
+    ).fetchall()
+    if len(rows) < model_pipeline.TYPICAL_AMOUNT_MIN_ROWS:
+        return None  # Too new to have a normal of their own; the model falls back to the base data.
+    return model_pipeline.typical_amount([row['normalized_amount'] for row in rows])
+
+
 @app.route('/api/predict', methods=['POST'])
 @limiter.limit("20 per minute")
 @require_login
@@ -1588,9 +1601,6 @@ def predict():
         xgb_model = artifacts['xgboost_model']
         iso_forest = artifacts['isolation_forest']
         oc_svm = artifacts['one_class_svm']
-        encoders = artifacts['encoders']
-        scaler = artifacts['scaler']
-        features = artifacts['features']
         
         # Extract inputs
         role = data.get('Role')
@@ -1630,30 +1640,14 @@ def predict():
         rate = exchange_rates.get(currency, 1.0)
         normalized_inr = amount * rate
 
-        # Prepare DataFrame for preprocessing
-        input_data = pd.DataFrame({
-            'Role': [role],
-            'Department': [department],
-            'Request_Type': [req_type],
-            'Destination': [destination],
-            'Amount_INR': [normalized_inr]
+        conn = get_db_connection()
+        # Training and scoring build the model's columns in the same one place, so they cannot drift apart.
+        X_input, unknown_columns = model_pipeline.prepare_request(artifacts, {
+            'Role': role, 'Department': department, 'Request_Type': req_type,
+            'Destination': destination, 'Amount_INR': normalized_inr,
+            'typical_amount': organization_typical_amount(conn, g.user['organization_id']),
         })
-
-        is_unknown_category = False
-
-        # Map categorical text fields with OOV fallback
-        for col in ['Role', 'Department', 'Request_Type', 'Destination']:
-            if input_data[col].iloc[0] in encoders[col].classes_:
-                input_data[col] = encoders[col].transform(input_data[col])
-            else:
-                is_unknown_category = True
-                input_data[col] = 0  # Safe fallback to 0
-
-        # Scale the normalized amount
-        input_data['Amount_INR'] = scaler.transform(input_data[['Amount_INR']])
-
-        # Reorder columns to match feature order used in training
-        X_input = input_data[features]
+        is_unknown_category = bool(unknown_columns)
 
         # XGBoost Probabilities
         xgb_prob = float(xgb_model.predict_proba(X_input)[0][1])
@@ -1665,7 +1659,7 @@ def predict():
 
         # SHAP values show administrators which fields pushed the score up or down.
         shap_values = artifacts['shap_explainer'].shap_values(X_input)
-        shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
+        shap_impact = dict(zip(X_input.columns, [float(v) for v in shap_values[0]]))
         
         auto_approve_above = organization_auto_approve_threshold(g.user)
 
@@ -1688,8 +1682,6 @@ def predict():
         if approval_mode == 'shadow' and ai_decision == 'APPROVED':
             status = 'ESCALATED_SHADOW'
 
-        # Persist to DB
-        conn = get_db_connection()
         # Company policy rules are checked before anything is saved. A broken rule always sends the request to a
         # person; rules never approve or reject on their own, and the AI's own decision is still recorded.
         violations = policy_violations(conn, g.user['organization_id'], current_email, {
@@ -1776,7 +1768,7 @@ def model_info():
 
     conn = get_db_connection()
     try:
-        decided = conn.execute(f"SELECT COUNT(*) AS total {TRAINABLE_DECISIONS_SQL}").fetchone()['total']
+        decided = trainable_decision_count(conn)
     finally:
         conn.close()
 
@@ -1856,12 +1848,36 @@ TRAINABLE_DECISIONS_SQL = (
     "AND Organizations.allow_training_data = 1"
 )
 
+# A spot check is a person's verdict on an approval nobody else ever saw. Without these the model only ever
+# learns from the requests that were hard enough to reach a person, which is not what it decides on.
+SPOT_CHECKED_APPROVALS_SQL = (
+    "FROM SpotChecks JOIN Requests ON Requests.id = SpotChecks.request_id "
+    "JOIN Organizations ON Organizations.id = Requests.organization_id "
+    "WHERE SpotChecks.verdict IS NOT NULL AND Requests.reviewed_by IS NULL "
+    "AND Requests.final_decision = 'APPROVED' AND Organizations.allow_training_data = 1"
+)
+REQUEST_TRAINING_COLUMNS = (
+    "Requests.id, Requests.role, Requests.department, Requests.request_type, Requests.destination, "
+    "Requests.normalized_amount, Requests.organization_id"
+)
+
 def trainable_decisions(conn):
     rows = conn.execute(
-        "SELECT Requests.id, Requests.role, Requests.department, Requests.request_type, Requests.destination, "
-        f"Requests.normalized_amount, Requests.final_decision {TRAINABLE_DECISIONS_SQL}"
+        f"SELECT {REQUEST_TRAINING_COLUMNS}, Requests.final_decision {TRAINABLE_DECISIONS_SQL}"
     ).fetchall()
-    return [dict(row) for row in rows]
+    # An approval marked wrong in a spot check teaches the model exactly what it got wrong.
+    checked = conn.execute(
+        f"SELECT {REQUEST_TRAINING_COLUMNS}, "
+        "CASE WHEN SpotChecks.verdict = 'WRONG' THEN 'REJECTED' ELSE 'APPROVED' END AS final_decision "
+        f"{SPOT_CHECKED_APPROVALS_SQL}"
+    ).fetchall()
+    return [dict(row) for row in rows] + [dict(row) for row in checked]
+
+def trainable_decision_count(conn):
+    return sum(
+        conn.execute(f'SELECT COUNT(*) AS total {clause}').fetchone()['total']
+        for clause in (TRAINABLE_DECISIONS_SQL, SPOT_CHECKED_APPROVALS_SQL)
+    )
 
 def run_training_job(job_id, started_by):
     try:

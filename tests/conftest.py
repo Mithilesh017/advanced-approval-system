@@ -80,6 +80,12 @@ def backend(request, tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def forget_the_loaded_model():
+    """Workers keep the active model in memory for half a minute; each test starts from an empty database."""
+    main._model_state.update(artifacts=None, version_id=None, checked_at=None, unloadable_version_id=None)
+
+
+@pytest.fixture(autouse=True)
 def no_random_spot_checks(monkeypatch):
     """Sampling is random, so no test samples an approval unless it says so."""
     monkeypatch.setattr(main, 'spot_check_selected', lambda percent: False)

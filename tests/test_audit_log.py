@@ -46,7 +46,8 @@ def test_submission_records_score_explanation_and_model_version(app_db, team):
     assert 0 <= details['approval_score'] <= 1
     assert details['unrecognized_category'] is False
     assert set(details['anomaly_detectors']) == {'isolation_forest', 'one_class_svm'}
-    assert set(details['explanation']) == set(app_db.model_pipeline.FEATURES)
+    # The explanation names the columns the model that scored the request actually used.
+    assert set(details['explanation']) == set(app_db.load_bundled_artifacts()['features'])
     assert details['thresholds'] == {
         'auto_approve_above': app_db.AUTO_APPROVE_THRESHOLD, 'escalate_below': app_db.ESCALATE_THRESHOLD,
         'second_approval_above': None,
