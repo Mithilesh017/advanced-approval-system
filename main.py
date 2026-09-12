@@ -1768,7 +1768,7 @@ def model_info():
 
     conn = get_db_connection()
     try:
-        decided = conn.execute(f"SELECT COUNT(*) AS total {TRAINABLE_DECISIONS_SQL}").fetchone()['total']
+        decided = trainable_decision_count(conn)
     finally:
         conn.close()
 
@@ -1848,13 +1848,36 @@ TRAINABLE_DECISIONS_SQL = (
     "AND Organizations.allow_training_data = 1"
 )
 
+# A spot check is a person's verdict on an approval nobody else ever saw. Without these the model only ever
+# learns from the requests that were hard enough to reach a person, which is not what it decides on.
+SPOT_CHECKED_APPROVALS_SQL = (
+    "FROM SpotChecks JOIN Requests ON Requests.id = SpotChecks.request_id "
+    "JOIN Organizations ON Organizations.id = Requests.organization_id "
+    "WHERE SpotChecks.verdict IS NOT NULL AND Requests.reviewed_by IS NULL "
+    "AND Requests.final_decision = 'APPROVED' AND Organizations.allow_training_data = 1"
+)
+REQUEST_TRAINING_COLUMNS = (
+    "Requests.id, Requests.role, Requests.department, Requests.request_type, Requests.destination, "
+    "Requests.normalized_amount, Requests.organization_id"
+)
+
 def trainable_decisions(conn):
     rows = conn.execute(
-        "SELECT Requests.id, Requests.role, Requests.department, Requests.request_type, Requests.destination, "
-        "Requests.normalized_amount, Requests.final_decision, Requests.organization_id "
-        f"{TRAINABLE_DECISIONS_SQL}"
+        f"SELECT {REQUEST_TRAINING_COLUMNS}, Requests.final_decision {TRAINABLE_DECISIONS_SQL}"
     ).fetchall()
-    return [dict(row) for row in rows]
+    # An approval marked wrong in a spot check teaches the model exactly what it got wrong.
+    checked = conn.execute(
+        f"SELECT {REQUEST_TRAINING_COLUMNS}, "
+        "CASE WHEN SpotChecks.verdict = 'WRONG' THEN 'REJECTED' ELSE 'APPROVED' END AS final_decision "
+        f"{SPOT_CHECKED_APPROVALS_SQL}"
+    ).fetchall()
+    return [dict(row) for row in rows] + [dict(row) for row in checked]
+
+def trainable_decision_count(conn):
+    return sum(
+        conn.execute(f'SELECT COUNT(*) AS total {clause}').fetchone()['total']
+        for clause in (TRAINABLE_DECISIONS_SQL, SPOT_CHECKED_APPROVALS_SQL)
+    )
 
 def run_training_job(job_id, started_by):
     try:
