@@ -254,6 +254,14 @@ ORGANIZATIONS_SINGLE_DEFAULT_INDEX = (
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_single_default ON Organizations (is_default) WHERE is_default = 1'
 )
 
+# The audit log may only be added to. One definition of the guard, used when the database is created
+# and again after the one operation allowed to erase history: closing an organization.
+SQLITE_AUDIT_TRIGGERS = tuple(
+    f"CREATE TRIGGER IF NOT EXISTS audit_events_no_{operation.lower()} BEFORE {operation} ON AuditEvents "
+    "BEGIN SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted'); END"
+    for operation in ('UPDATE', 'DELETE')
+)
+
 AUDIT_EVENT_INDEXES = (
     'CREATE INDEX IF NOT EXISTS idx_audit_events_request ON AuditEvents (request_id)',
     'CREATE INDEX IF NOT EXISTS idx_audit_events_organization ON AuditEvents (organization_id)',
@@ -492,13 +500,8 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        for operation in ('UPDATE', 'DELETE'):
-            cursor.execute(f'''
-                CREATE TRIGGER IF NOT EXISTS audit_events_no_{operation.lower()} BEFORE {operation} ON AuditEvents
-                BEGIN
-                    SELECT RAISE(ABORT, 'Audit events cannot be changed or deleted');
-                END
-            ''')
+        for statement in SQLITE_AUDIT_TRIGGERS:
+            cursor.execute(statement)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS PolicyRules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2137,6 +2140,95 @@ def platform_decision_quality():
     return jsonify({
         **quality, 'readiness': automatic_approval_readiness(quality), 'drift_warnings': monitoring['warnings'],
     })
+
+# ==========================================
+# CLOSING AN ORGANIZATION
+# ==========================================
+# When a company leaves, everything that names a person goes: accounts, receipts, purposes, comments and the
+# history. What stays is the shape of their decisions with nobody's name on it, which is what the AI learns from
+# and which their agreement already covers. A company that never agreed to share data is not trained on either
+# way, because closing them does not change that permission.
+ORGANIZATION_CLOSED = 'Closed'
+CLOSED_MARKER = 'closed'
+
+def erase_audit_events(conn, organization_id):
+    """Lifts the append-only guard for this one deletion, inside the same transaction that puts it back."""
+    if os.getenv('DATABASE_URL'):
+        conn.execute('ALTER TABLE AuditEvents DISABLE TRIGGER audit_events_append_only')
+        conn.execute('DELETE FROM AuditEvents WHERE organization_id = ?', (organization_id,))
+        conn.execute('ALTER TABLE AuditEvents ENABLE TRIGGER audit_events_append_only')
+        return
+    for name in ('audit_events_no_update', 'audit_events_no_delete'):
+        conn.execute(f'DROP TRIGGER IF EXISTS {name}')
+    conn.execute('DELETE FROM AuditEvents WHERE organization_id = ?', (organization_id,))
+    for statement in SQLITE_AUDIT_TRIGGERS:
+        conn.execute(statement)
+
+@app.route('/api/platform/close_organization', methods=['POST'])
+@require_platform_owner
+def close_organization():
+    data = request.get_json(silent=True) or {}
+    organization_id = data.get('id')
+    if isinstance(organization_id, bool) or not isinstance(organization_id, int):
+        return jsonify({'error': 'id must be an organization number.'}), 400
+
+    conn = get_db_connection()
+    try:
+        organization = conn.execute(
+            'SELECT id, name, status, is_default FROM Organizations WHERE id = ?', (organization_id,)
+        ).fetchone()
+        if not organization:
+            return jsonify({'error': 'Organization not found.'}), 404
+        if organization['is_default']:
+            return jsonify({'error': 'The default organization holds the original accounts and cannot be closed.'}), 409
+        if organization['status'] == ORGANIZATION_CLOSED:
+            return jsonify({'error': 'This organization is already closed.'}), 409
+        confirmation = data.get('name')
+        if not isinstance(confirmation, str) or confirmation.strip() != organization['name']:
+            return jsonify({'error': "Type the organization's name exactly as it is written to confirm."}), 400
+
+        counts = {
+            table.lower(): conn.execute(
+                f'SELECT COUNT(*) AS total FROM {table} WHERE organization_id = ?', (organization_id,)
+            ).fetchone()['total']
+            for table in ('Users', 'Requests', 'Receipts', 'PolicyRules', 'AuditEvents')
+        }
+
+        # Everything that names a person.
+        conn.execute('DELETE FROM Receipts WHERE organization_id = ?', (organization_id,))
+        conn.execute('DELETE FROM PolicyRules WHERE organization_id = ?', (organization_id,))
+        conn.execute('DELETE FROM Users WHERE organization_id = ?', (organization_id,))
+        conn.execute(
+            'UPDATE SpotChecks SET reviewed_by = ?, comment = NULL WHERE organization_id = ? AND reviewed_by IS NOT NULL',
+            (CLOSED_MARKER, organization_id)
+        )
+        conn.execute(
+            'UPDATE Requests SET submitted_by = ?, employee_name = NULL, employee_id = NULL, purpose = NULL, '
+            'approver_email = NULL, first_approved_by = NULL WHERE organization_id = ?',
+            (CLOSED_MARKER, organization_id)
+        )
+        # Only where somebody really did decide, so an approval the AI made alone still counts as one.
+        conn.execute(
+            'UPDATE Requests SET reviewed_by = ? WHERE organization_id = ? AND reviewed_by IS NOT NULL',
+            (CLOSED_MARKER, organization_id)
+        )
+        erase_audit_events(conn, organization_id)
+
+        # A new join code kills the old invitation link.
+        conn.execute(
+            'UPDATE Organizations SET status = ?, join_code = ? WHERE id = ?',
+            (ORGANIZATION_CLOSED, secrets.token_urlsafe(9), organization_id)
+        )
+        # The one line that outlives the history it replaced.
+        record_event(conn, 'organization.closed', organization_id=organization_id, actor=g.user['email'], details={
+            'accounts_removed': counts['users'], 'receipts_removed': counts['receipts'],
+            'rules_removed': counts['policyrules'], 'history_entries_removed': counts['auditevents'],
+            'anonymous_requests_kept': counts['requests'],
+        })
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS', 'anonymous_requests_kept': counts['requests']})
 
 @app.route('/api/platform/update_organization', methods=['POST'])
 @require_platform_owner
