@@ -12,8 +12,15 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import OneClassSVM
 
 CATEGORICAL_FEATURES = ['Role', 'Department', 'Request_Type', 'Destination']
-FEATURES = CATEGORICAL_FEATURES + ['Amount_INR']
+# Amount_Ratio is the amount against what is normal where the request came from, so 50,000 rupees can mean
+# "five times their usual" in one company and "an ordinary week" in another.
+NUMERIC_FEATURES = ['Amount_INR', 'Amount_Ratio']
+FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 TRAINING_COLUMNS = ['row_key', 'source'] + FEATURES + ['label']
+# The ratio is worked out again whenever it is needed, so saved models keep the shape they always had.
+STORED_COLUMNS = [column for column in TRAINING_COLUMNS if column != 'Amount_Ratio']
+AMOUNT_RATIO_CAP = 20.0
+TYPICAL_AMOUNT_MIN_ROWS = 5
 HOLDOUT_BUCKETS = 5
 FEEDBACK_WEIGHT = 5.0
 ONE_CLASS_SVM_MAX_ROWS = 10000
@@ -22,6 +29,25 @@ QUALITY_TOLERANCE = 0.002
 
 class TrainingDataMissing(Exception):
     pass
+
+
+def typical_amount(amounts):
+    """The middle amount of a set of requests. The middle, not the average, so one huge request cannot move it."""
+    values = [float(amount) for amount in amounts if amount is not None and float(amount) > 0]
+    return float(np.median(values)) if values else None
+
+
+def amount_ratio(amount, typical):
+    """How big one request is against what is normal. 1.0 when there is nothing to compare it with yet."""
+    if not typical or float(typical) <= 0:
+        return 1.0
+    return float(min(AMOUNT_RATIO_CAP, max(0.0, float(amount) / float(typical))))
+
+
+def with_amount_ratio(frame, typical):
+    frame = frame.copy()
+    frame['Amount_Ratio'] = [amount_ratio(amount, typical) for amount in frame['Amount_INR']]
+    return frame
 
 
 def pack_training_data(frame):
@@ -33,9 +59,10 @@ def pack_training_data(frame):
 
 
 def unpack_training_data(data):
-    if isinstance(data, pd.DataFrame):
-        return data
-    return pd.DataFrame({col: data[col] for col in TRAINING_COLUMNS})
+    frame = data if isinstance(data, pd.DataFrame) else pd.DataFrame({col: data[col] for col in STORED_COLUMNS})
+    if 'Amount_Ratio' not in frame.columns:
+        frame = with_amount_ratio(frame, typical_amount(frame['Amount_INR']))
+    return frame[TRAINING_COLUMNS]
 
 
 def base_training_data_from_csv(csv_path):
@@ -49,6 +76,7 @@ def base_training_data_from_csv(csv_path):
     })
     for col in CATEGORICAL_FEATURES:
         frame[col] = df[col].astype(str)
+    frame = with_amount_ratio(frame, typical_amount(frame['Amount_INR']))
     return frame[TRAINING_COLUMNS]
 
 
@@ -63,7 +91,25 @@ def base_training_data(current_artifacts, csv_path=None):
     )
 
 
+def typical_amount_by_organization(decisions):
+    """What a normal request costs in each organization, falling back to everybody's normal for a new one."""
+    everyone = typical_amount([row['normalized_amount'] for row in decisions])
+    amounts = {}
+    for row in decisions:
+        amounts.setdefault(row.get('organization_id'), []).append(row['normalized_amount'])
+    return {
+        organization_id: (typical_amount(values) if len(values) >= TYPICAL_AMOUNT_MIN_ROWS else everyone)
+        for organization_id, values in amounts.items()
+    }
+
+
 def feedback_training_data(decisions):
+    usable = [
+        row for row in decisions
+        if row.get('normalized_amount') is not None
+        and all(row.get(key) for key in ('role', 'department', 'request_type', 'destination'))
+    ]
+    typical = typical_amount_by_organization(usable)
     records = [
         {
             'row_key': f"request:{row['id']}",
@@ -73,11 +119,10 @@ def feedback_training_data(decisions):
             'Request_Type': str(row['request_type']),
             'Destination': str(row['destination']),
             'Amount_INR': float(row['normalized_amount']),
+            'Amount_Ratio': amount_ratio(row['normalized_amount'], typical.get(row.get('organization_id'))),
             'label': 1 if row['final_decision'] == 'APPROVED' else 0,
         }
-        for row in decisions
-        if row.get('normalized_amount') is not None
-        and all(row.get(key) for key in ('role', 'department', 'request_type', 'destination'))
+        for row in usable
     ]
     return pd.DataFrame(records, columns=TRAINING_COLUMNS)
 
@@ -101,7 +146,8 @@ def encode_features(artifacts, frame):
         if known.any():
             column[known] = encoder.transform(values[known])
         encoded[col] = column
-    encoded['Amount_INR'] = artifacts['scaler'].transform(frame[['Amount_INR']].astype(float)).ravel()
+    numeric = artifacts.get('numeric_features') or ['Amount_INR']
+    encoded[numeric] = artifacts['scaler'].transform(frame[numeric].astype(float))
     return encoded[artifacts['features']]
 
 
@@ -115,10 +161,12 @@ def unknown_categories(artifacts, frame):
     return missing
 
 
-def request_frame(values):
+def request_frame(artifacts, values):
     """One request in the same shape as a row of training data."""
     row = {col: str(values.get(col, '')) for col in CATEGORICAL_FEATURES}
     row['Amount_INR'] = float(values['Amount_INR'])
+    # Without enough of an organization's own requests to know their normal, the base data's normal is used.
+    row['Amount_Ratio'] = amount_ratio(row['Amount_INR'], values.get('typical_amount') or artifacts.get('base_typical_amount'))
     return pd.DataFrame([row])
 
 
@@ -128,7 +176,7 @@ def prepare_request(artifacts, values):
     Scoring and training both go through here, so the two can never drift apart. Returns the encoded
     row and the columns holding a value the model has not seen before.
     """
-    frame = request_frame(values)
+    frame = request_frame(artifacts, values)
     return encode_features(artifacts, frame), unknown_categories(artifacts, frame)
 
 
@@ -173,8 +221,10 @@ def train_ensemble(base, feedback=None):
 
     artifacts = {
         'encoders': {col: LabelEncoder().fit(train[col]) for col in CATEGORICAL_FEATURES},
-        'scaler': StandardScaler().fit(train[['Amount_INR']]),
+        'scaler': StandardScaler().fit(train[NUMERIC_FEATURES]),
         'features': list(FEATURES),
+        'numeric_features': list(NUMERIC_FEATURES),
+        'base_typical_amount': typical_amount(frame[frame['source'] != 'feedback']['Amount_INR']),
     }
     X_train = encode_features(artifacts, train)
     weights = np.where(train['source'] == 'feedback', FEEDBACK_WEIGHT, 1.0)
@@ -207,7 +257,7 @@ def train_ensemble(base, feedback=None):
         feedback_rows=int((frame['source'] == 'feedback').sum()),
     )
     artifacts.update(
-        training_data=pack_training_data(frame[frame['source'] != 'feedback']),
+        training_data=pack_training_data(frame[frame['source'] != 'feedback'][STORED_COLUMNS]),
         form_options=form_options(train),
         metrics=metrics,
         trained_at=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),

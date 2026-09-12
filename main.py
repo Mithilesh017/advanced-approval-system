@@ -1569,6 +1569,20 @@ def join_page(code):
 # ==========================================
 # 4. MACHINE LEARNING API ROUTES
 # ==========================================
+TYPICAL_AMOUNT_SAMPLE = 200
+
+def organization_typical_amount(conn, organization_id):
+    """What a normal request costs in this organization, so the AI can judge a size against their own work."""
+    rows = conn.execute(
+        'SELECT normalized_amount FROM Requests WHERE organization_id = ? AND normalized_amount IS NOT NULL '
+        'ORDER BY id DESC LIMIT ?',
+        (organization_id, TYPICAL_AMOUNT_SAMPLE)
+    ).fetchall()
+    if len(rows) < model_pipeline.TYPICAL_AMOUNT_MIN_ROWS:
+        return None  # Too new to have a normal of their own; the model falls back to the base data.
+    return model_pipeline.typical_amount([row['normalized_amount'] for row in rows])
+
+
 @app.route('/api/predict', methods=['POST'])
 @limiter.limit("20 per minute")
 @require_login
@@ -1626,10 +1640,12 @@ def predict():
         rate = exchange_rates.get(currency, 1.0)
         normalized_inr = amount * rate
 
+        conn = get_db_connection()
         # Training and scoring build the model's columns in the same one place, so they cannot drift apart.
         X_input, unknown_columns = model_pipeline.prepare_request(artifacts, {
             'Role': role, 'Department': department, 'Request_Type': req_type,
             'Destination': destination, 'Amount_INR': normalized_inr,
+            'typical_amount': organization_typical_amount(conn, g.user['organization_id']),
         })
         is_unknown_category = bool(unknown_columns)
 
@@ -1666,8 +1682,6 @@ def predict():
         if approval_mode == 'shadow' and ai_decision == 'APPROVED':
             status = 'ESCALATED_SHADOW'
 
-        # Persist to DB
-        conn = get_db_connection()
         # Company policy rules are checked before anything is saved. A broken rule always sends the request to a
         # person; rules never approve or reject on their own, and the AI's own decision is still recorded.
         violations = policy_violations(conn, g.user['organization_id'], current_email, {
@@ -1837,7 +1851,8 @@ TRAINABLE_DECISIONS_SQL = (
 def trainable_decisions(conn):
     rows = conn.execute(
         "SELECT Requests.id, Requests.role, Requests.department, Requests.request_type, Requests.destination, "
-        f"Requests.normalized_amount, Requests.final_decision {TRAINABLE_DECISIONS_SQL}"
+        "Requests.normalized_amount, Requests.final_decision, Requests.organization_id "
+        f"{TRAINABLE_DECISIONS_SQL}"
     ).fetchall()
     return [dict(row) for row in rows]
 
