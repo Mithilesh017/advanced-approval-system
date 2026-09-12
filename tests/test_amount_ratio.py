@@ -91,7 +91,8 @@ def test_training_data_saved_before_the_ratio_existed_still_loads(app_db):
 
 
 def test_a_retrained_model_uses_the_ratio_and_an_older_one_does_not(app_db):
-    base = model_pipeline.base_training_data(None, 'combined_corporate_approval_data.csv').head(400)
+    # The base data travels inside the model file, which is how a real retrain reads it.
+    base = model_pipeline.base_training_data(app_db.load_bundled_artifacts()).head(400)
     artifacts, _ = model_pipeline.train_ensemble(base)
 
     assert artifacts['features'] == model_pipeline.FEATURES
@@ -140,7 +141,7 @@ def test_submitting_a_request_still_works_while_a_company_is_new(app_db):
 
 def start_training(app_db, monkeypatch, rows=600):
     """Retrains on a small slice of the base data so the test stays quick."""
-    small_base = model_pipeline.base_training_data(None, 'combined_corporate_approval_data.csv').head(rows)
+    small_base = model_pipeline.base_training_data(app_db.load_bundled_artifacts()).head(rows)
     monkeypatch.setattr(app_db.model_pipeline, 'base_training_data', lambda current, csv_path=None: small_base)
     job_id = execute(
         app_db, "INSERT INTO TrainingJobs (status, step, started_by) VALUES ('running', 'queued', 'test') RETURNING id"
@@ -151,6 +152,11 @@ def start_training(app_db, monkeypatch, rows=600):
 
 
 def test_a_retrained_model_that_scores_worse_never_goes_live(app_db, monkeypatch):
+    # Whether a candidate is worse is measured on the holdout; here it simply is, so the outcome is fixed.
+    monkeypatch.setattr(
+        app_db.model_pipeline, 'compare_with_current',
+        lambda candidate, holdout, current: {'accepted': False, 'current': {'roc_auc': 1.0}}
+    )
     job = start_training(app_db, monkeypatch)
 
     assert job['status'] == 'rejected'
