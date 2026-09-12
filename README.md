@@ -1,7 +1,8 @@
 # Advanced Approval Management System (AAMS)
 
-**AI-assisted expense and travel approvals for organizations.** Employees submit requests, a machine-learning ensemble approves the clear-cut ones in real time and escalates anything risky or unfamiliar, administrators review the grey areas, and a Super Admin can retrain the model from those human decisions with a single click.
+**AI-assisted expense and travel approvals, for many companies on one system.** Employees submit requests, a machine-learning ensemble scores each one, the routine ones can be approved in seconds and anything risky, unusual or unfamiliar goes to a person. Every decision a person makes is measured against what the AI would have done, and the model learns from those decisions.
 
+[![Tests](https://github.com/Mithilesh017/advanced-approval-system/actions/workflows/tests.yml/badge.svg)](https://github.com/Mithilesh017/advanced-approval-system/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![Flask](https://img.shields.io/badge/Flask-3.1-000000?logo=flask&logoColor=white)
 ![XGBoost](https://img.shields.io/badge/XGBoost-3.3-EB5E28)
@@ -12,134 +13,196 @@
 
 > [!IMPORTANT]
 > **Proprietary software of [Neuzem](https://neuzem.com). All rights reserved.**
-> This repository is confidential and intended only for people Neuzem has authorized. No license is granted to download, clone, copy, run, modify, deploy or distribute any part of it without prior written permission from Neuzem. See [License](#license).
+> This repository, its source code, trained models and design are the property of Neuzem. No licence is granted to copy, run, modify, deploy or distribute any part of it. See [Licence](#licence).
 
 ---
 
-## Why AAMS
+## The idea
 
-Manual approval queues are slow, and fully automated rules are brittle. AAMS combines both:
+Manual approval queues are slow. Fixed rules are brittle and easy to game. AAMS puts a model between the two and keeps a person in charge of anything that matters:
 
-- **Instant decisions for routine requests.** A trained classifier auto-approves requests that closely match historically approved spending.
-- **Human review where it matters.** Unusual amounts, anomalous patterns, low-confidence scores and never-seen-before categories are escalated to administrators with the reason attached.
-- **A model that keeps learning.** Every manual approval or rejection becomes training data. Retraining runs from the admin console, and a new model only goes live if it performs at least as well as the current one.
+- **Routine requests move immediately.** A request that closely matches spending a company has approved before can be approved without waiting for anyone.
+- **Anything doubtful reaches a person, with the reason attached.** Unusual amounts, anomalous patterns, low confidence, categories the model has never seen, and anything that breaks a company rule.
+- **The AI has to earn its autonomy.** A new company starts in shadow mode, where the AI only recommends and a person decides everything. It is allowed to approve on its own only once that company's own numbers show it is good enough.
+- **Every automatic approval can still be checked.** A random share of them is put in front of a person afterwards, which is the only honest measure of decisions nobody watched.
 
-## Features
+## Many companies, one system
 
-### Employees
-- Submit expense and travel requests with guided dropdowns for role, department, expense type and destination, or enter a value that is not listed
-- Amounts in INR, USD, EUR, GBP or SGD, normalized to INR for scoring
-- Instant outcome: auto-approved, or sent for manual review
-- Track pending, approved and disapproved requests with CSV, PDF and print export
-- Manage profile details and request a password reset
+Each organization is a sealed box. People, requests, receipts, rules and history belong to exactly one organization, and every query is scoped to it — asking for another organization's request returns "not found", not "forbidden", so nothing leaks even by implication.
 
-### Administrators
-- Live dashboard with approval rate, status distribution and expense-type charts
-- Review escalated requests with the AI confidence score and escalation reason
-- Approve, reject or move decisions back to pending, with filters by department, expense type and role
-- Approve or reject employee access requests and remove employee accounts
+What crosses the boundary is the model, and only with permission: a company can agree to let its decisions train the shared AI. That agreement is a per-organization setting, and requests from a company that has not agreed are never used for training.
 
-### Super Admins
-- Everything administrators can do, plus approving administrator accounts
-- **ML Agent console**
-  - One-click retraining with live progress steps
-  - An automatic quality check before any new model goes live
-  - Version history with one-click rollback
-  - An overview of the active model and how many admin decisions it has not learned from yet
-
-### Platform
-- Clean, responsive interface that works from phone to desktop and respects reduced-motion, reduced-transparency and high-contrast preferences
-- Email notifications for access requests, approvals, account setup and password resets
-- Works with local SQLite out of the box and PostgreSQL in production, with tables created and upgraded automatically on startup
-
-## How it works
-
-### Architecture
+**Neuzem** runs the platform from a separate console. The platform owner belongs to no organization and cannot see any organization's requests, receipts or people — only the settings, the counts, and how well decisions are going.
 
 ```mermaid
-flowchart LR
-    subgraph Browser["Browser"]
-        L["Login and access requests<br/>index.html"]
-        E["Employee portal<br/>user.html"]
-        A["Admin and Super Admin portal<br/>admin.html"]
+flowchart TB
+    subgraph Neuzem["Neuzem platform console"]
+        P["Create organizations · switch approval modes<br/>quality and drift · train the shared model"]
     end
-
-    subgraph API["Flask API - main.py"]
-        AUTH["Authentication and roles<br/>JWT in HttpOnly cookies"]
-        PRED["Prediction API"]
-        MLOPS["Model management<br/>retrain, versions, rollback"]
+    subgraph A["Organization A"]
+        A1["Employees · managers · admins"]
     end
+    subgraph B["Organization B"]
+        B1["Employees · managers · admins"]
+    end
+    subgraph C["Organization C"]
+        C1["Employees · managers · admins"]
+    end
+    M[["Shared AI model"]]
 
-    DB[("PostgreSQL or SQLite<br/>Users, Requests, ModelVersions, TrainingJobs")]
-    ML[["ML ensemble<br/>XGBoost, Isolation Forest, One-Class SVM, SHAP"]]
-    MAIL["SMTP or SendGrid"]
-
-    L --> AUTH
-    E --> AUTH
-    A --> AUTH
-    E --> PRED
-    A --> MLOPS
-    AUTH --> DB
-    AUTH --> MAIL
-    PRED --> ML
-    PRED --> DB
-    MLOPS --> ML
-    MLOPS --> DB
+    P -.-> A
+    P -.-> B
+    P -.-> C
+    A1 -- "decisions, if agreed" --> M
+    B1 -- "decisions, if agreed" --> M
+    C1 -- "decisions, if agreed" --> M
+    M -- "scores every request" --> A1
+    M --> B1
+    M --> C1
 ```
 
-### How a request is decided
+## How a request is decided
 
 ```mermaid
 flowchart TD
-    S["Employee submits a request"] --> N["Convert amount to INR"]
-    N --> U{"Role, department, expense type<br/>and destination known to the model?"}
-    U -- No --> EU["Escalated: unrecognized category"]
-    U -- Yes --> AN{"Isolation Forest or One-Class SVM<br/>detects an anomaly?"}
-    AN -- Yes --> EA["Escalated: anomaly detected"]
-    AN -- No --> X{"XGBoost approval score"}
-    X -- "above 80%" --> AP["Approved automatically"]
-    X -- "below 20%" --> EP["Escalated: low confidence"]
-    X -- "20% to 80%" --> EM["Escalated: manual review"]
+    S["Employee submits<br/>amount, purpose, dates, receipts"] --> N["Convert the amount to INR"]
+    N --> U{"Role, department, type and destination<br/>known to the model?"}
+    U -- No --> E1["Needs a person: unfamiliar category"]
+    U -- Yes --> AN{"Anomaly detectors flag it?"}
+    AN -- Yes --> E2["Needs a person: unusual pattern"]
+    AN -- No --> X{"Approval score"}
+    X -- "below 20%" --> E3["Needs a person: low confidence"]
+    X -- "20% to the company's threshold" --> E4["Needs a person: manual review"]
+    X -- "above the threshold" --> SH{"Shadow mode?"}
+    SH -- Yes --> E5["Needs a person: AI recommends approval"]
+    SH -- No --> R{"Breaks a company rule?"}
+    R -- Yes --> E6["Needs a person: rule broken"]
+    R -- No --> L{"Above the second-approval amount?"}
+    L -- Yes --> E7["Needs two people"]
+    L -- No --> AP["Approved automatically"]
+    AP --> SC{"Picked for a spot check?"}
+    SC -- Yes --> CH["An administrator checks it afterwards"]
 ```
 
-Each prediction also produces SHAP values that show which fields pushed the score up or down.
+Each score comes with SHAP values showing which fields pushed it up or down. Administrators see them; employees see only the outcome, so nobody can map the model's boundaries by resubmitting variations of a request.
 
-### How the model learns from admins
+## Who does what
+
+**Employees** submit requests with a business purpose, the expense date and any trip dates, and up to five receipts. They see their own history and outcomes, and can add receipts to a request that is still open.
+
+**Managers** are ordinary employees with people reporting to them. A request that needs a person waits for the submitter's manager, who approves or rejects it from a Team Approvals page and can open only their own team's receipts and history.
+
+**Administrators** see every request in their organization, can decide any of them (useful when a manager is away), reopen a decision, run the spot checks, manage accounts and assign managers.
+
+**Super Admins** do everything administrators do, plus approve administrator accounts, set the approval thresholds and company rules, and download the organization's data.
+
+**Neuzem's platform owner** creates organizations, switches a company between shadow mode and automatic approval, watches decision quality and drift, retrains the shared model, and closes a company that leaves.
+
+| Capability | Employee | Manager | Admin | Super Admin | Neuzem |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| Submit requests, see own history | Yes | Yes | Yes | Yes | |
+| Decide requests waiting for them | | Yes | | | |
+| See and decide every request in the company | | | Yes | Yes | |
+| Reopen a decision | | | Yes | Yes | |
+| Answer spot checks | | | Yes | Yes | |
+| Approve employee accounts, assign managers | | | Yes | Yes | |
+| Approve administrator accounts | | | | Yes | |
+| Set thresholds, rules and the second-approval amount | | | | Yes | |
+| Download the organization's data | | | | Yes | |
+| Create organizations, switch approval mode | | | | | Yes |
+| Retrain the shared model, roll back a version | | | | | Yes |
+| See another organization's requests or people | | | | | **No** |
+
+## People in the loop
+
+**The manager decides first.** Administrators assign a manager to each employee; only a Super Admin sets an administrator's manager. Self-management and reporting loops are refused. Without a manager, requests go to the administrators. Changing, clearing or deleting a manager moves whatever was waiting for them.
+
+**Large amounts need two people.** A Super Admin sets an amount above which a request needs two approvals. Such a request is never approved by the AI alone: the manager approves first, then a different administrator gives the second approval. The same person can never give both, and reopening starts the approvals again.
+
+**Whoever must decide is told by email** — the manager, the administrators, or the second approver. A failed send never affects a decision that was already saved.
+
+**Rejecting and reopening need a reason**, which is saved in the request's history.
+
+## Company rules
+
+Rules are set per organization and are checked before the AI's own decision. A broken rule always sends a request to a person; rules never approve or reject on their own.
+
+| Rule | What it catches |
+| --- | --- |
+| Amount limit | Anything above an amount the company sets, per request type or overall |
+| Duplicate request | The same person asking for the same thing again within a set number of days |
+| Receipt required | No receipt attached above an amount the company sets |
+| Always review | A department, role, type or destination that must always be seen by a person |
+
+## The record
+
+Every decision writes an entry to an append-only history: who did it, when, what changed, the reason they gave, and — for a submission — the model version, the score, the thresholds in force, the rules broken and the SHAP explanation. The database itself refuses updates and deletes on that table, so the history cannot be edited after the fact, by anyone, including the application.
+
+The single exception is closing an organization, described below.
+
+## Measuring the AI
+
+A model that nobody measures is a claim, not a system. Every number here comes from the company's own requests.
+
+**Spot checks.** Nobody sees a request the AI approves alone, so a share of them — 5% by default, which a Super Admin can raise but not lower — is put on a Spot Checks page for an administrator to look at afterwards. They answer "right" or "wrong"; a wrong answer needs a reason. The request itself is not held up.
+
+**Decision quality.** For every request a person decided, what the AI recommended is compared with what the person chose:
+
+- how often they agreed
+- how often the AI would have approved something a person refused — the number that matters most, because in automatic mode those go through unseen
+- how often it asked for a review that turned out to be unnecessary
+- what the spot checks found, how many requests came in, and how long people take to decide
+
+Percentages stay hidden until there are enough decisions to mean something, so a handful of requests never looks like a verdict.
+
+**The quality gate.** A company cannot be switched to automatic approval until its own last 90 days pass: at least 20 decisions made by people, at least 85% agreement, at most 5% that the AI would have let through, and at most 10% of checked automatic approvals found wrong. A company that is not ready is refused with the failing checks named. Neuzem can overrule the gate for a pilot, and the history records that it was forced and what was failing. Going back to shadow mode is never blocked.
+
+**Drift.** The last twelve weeks sit side by side: requests, how many needed a person, how many used a category the model has never seen, how many looked unusual, and the average score. When the newest week stops looking like the weeks before it, the page says so in plain words. A week too small to judge percentages on still reports a sudden rush or a sudden silence.
+
+**Fairness.** Approvals and reviews are grouped by department and by role. A group more than fifteen points away from the company as a whole is named; a group too small to judge is shown but never flagged. A gap is a reason to look, not proof of unfairness, and the page says so.
+
+## How the model learns
 
 ```mermaid
 sequenceDiagram
-    participant SA as Super Admin
+    participant N as Neuzem
     participant API as Flask API
     participant Job as Background job
     participant DB as Database
 
-    SA->>API: Retrain Model Now
-    API->>DB: Record training job
-    API-->>SA: Started
-    API->>Job: Run in background
-    Job->>DB: Load base data and manual admin decisions
-    Job->>Job: Train ensemble on a stable 80/20 split
-    Job->>Job: Compare with the active model on held-out requests
-    alt New model scores at least as well
-        Job->>DB: Save and activate new model version
-    else New model scores lower
-        Job->>DB: Keep current model and record why
-    end
-    loop Every 2 seconds
-        SA->>API: Check progress
+    N->>API: Retrain
+    API->>DB: Record the job
+    API-->>N: Started
+    API->>Job: Run in the background
+    Job->>DB: Base data + decisions people made + spot-check answers<br/>(only from organizations that agreed)
+    Job->>Job: Train the ensemble on a stable split
+    Job->>Job: Score it against the current model on held-out requests
+    alt At least as good
+        Job->>DB: Save and activate the new version
+    else Worse
+        Job->>DB: Keep the current model and record why
     end
 ```
 
-Design choices that make retraining safe to run from a web console:
+- **It learns from people, not from itself.** Automatic approvals are excluded, so the model never reinforces its own mistakes — except where a person spot-checked one, and then it learns exactly what it got wrong. Real decisions are weighted more heavily than base data.
+- **An amount is judged against that company's own normal.** Alongside the rupee amount, each request carries how big it is compared with the middle amount of its organization's recent requests. That is what lets one shared model learn from a small firm and a large one at the same time. A company too new to have a normal falls back to the base data.
+- **Fair comparisons.** Each record is assigned to training or evaluation by a stable hash, so a model is never scored on rows it was trained on.
+- **A worse model never goes live.** Versions are stored in the database, every server process picks up the active one within thirty seconds, and any earlier version can be restored.
+- **New vocabulary is picked up automatically.** A job role or destination a company starts using appears in the next trained model. The request form still offers only the shared base vocabulary, so one company's values are never shown to another.
 
-- **Only human decisions are learned from.** Automatic AI approvals are excluded, so the model never reinforces its own mistakes. Manual decisions are weighted more heavily than base data.
-- **Fair comparisons.** Each record is assigned to training or evaluation by a stable hash, so a model is never scored on data it was trained on.
-- **Versions live in the database.** Retrained models survive redeploys, every server process switches to the active version within 30 seconds, and any earlier version can be restored.
-- **New vocabulary is learned automatically.** When an admin decides a request with a new job role or expense type, the next retrain adds it to the model and to the employee form.
+## Leaving
+
+**Taking the data.** A Super Admin can download one file holding their organization's settings, its people, every request with its decision and scores, what each receipt is, the full history in order, the rules and the spot-check answers — plus the receipt files exactly as they were uploaded, and a plain README describing each part. Passwords, join links and every other organization's data stay out.
+
+**Closing a company.** When a company leaves, Neuzem closes it. Everything that names a person goes: accounts and passwords, receipt files, employee names and IDs, the purpose written on each request, the company's rules, and its whole history — replaced by one line recording who closed it and what was removed. The old join link stops working.
+
+What stays is each decision with nobody's name on it — role, department, request type, destination, amount, outcome — which is what the model learns from and what the company's own agreement covers. Closing does not grant that agreement: a company that never shared its data is still not learned from.
+
+Erasing that history is the one operation allowed past the append-only guard, which is lifted and put back inside the same transaction.
 
 ## Model performance
 
-Bundled model, evaluated on 4,635 held-out records it was not trained on:
+The bundled base model, on 4,635 held-out records it was not trained on:
 
 | Metric | Score |
 | --- | --- |
@@ -147,26 +210,30 @@ Bundled model, evaluated on 4,635 held-out records it was not trained on:
 | Accuracy | 99.1% |
 | F1-score | 0.9954 |
 
-On the same records the confidence thresholds route **92.1%** of requests to automatic approval, **6.0%** to low-confidence escalation and **1.9%** to manual review.
+On the same records the thresholds route **92.1%** to automatic approval, **6.0%** to low-confidence escalation and **1.9%** to manual review.
 
 ![ROC curve of the bundled model](roc_auc_curve.png)
 
-> The base dataset combines synthetic corporate expense records with a public loan-approval dataset mapped to the same schema. These scores describe that benchmark. Accuracy on a specific organization's requests improves as admins make decisions and the model is retrained.
+> That base dataset combines synthetic corporate expense records with a public loan-approval dataset mapped to the same schema, so these scores describe a benchmark, not a promise about any real company. What a specific organization gets is measured on its own decisions on the Decision Quality page, which is the number that counts.
 
-## Roles and permissions
+## Data and privacy
 
-| Capability | Employee | Admin | Super Admin |
-| --- | :---: | :---: | :---: |
-| Submit requests and view own history | Yes | | |
-| View all requests and dashboard | | Yes | Yes |
-| Approve, reject or reopen requests | | Yes | Yes |
-| Approve employee access requests | | Yes | Yes |
-| Remove employee accounts | | Yes | Yes |
-| Approve administrator access requests | | | Yes |
-| Remove administrator accounts | | | Yes |
-| Retrain the model, view versions and roll back | | | Yes |
+- **Receipts live in the database**, not on disk, so they survive redeploys. A file's type is read from its content, never from its name; only PDF, JPG and PNG are accepted, at most five files of 5 MB each. Images open inline, PDFs download, and neither can run as code inside the site.
+- **Receipts open only for the employee, their manager and their administrators.**
+- **Employees see outcomes, not internals.** Scores, escalation reasons and thresholds stay with administrators.
+- **Training data is anonymous by nature.** The model uses role, department, request type, destination and amount. It never sees names, emails, employee IDs or the text of a purpose.
+- **Consent is per organization**, set when the organization is created and changeable later, and it is never turned on by anything the system does on its own.
 
-**Account lifecycle:** a person requests access, an administrator approves it, the person receives a single-use setup link by email, sets a password, and can then log in.
+## Security
+
+- Sessions are JWTs in HttpOnly, SameSite cookies, marked Secure in production; logging out clears them server-side
+- Role, account status and organization are re-read on every request, so removing an account, changing a role or pausing an organization takes effect immediately rather than when the session expires
+- Every organization-scoped query filters by organization, and cross-organization access returns "not found"
+- Account setup and password reset use single-use, expiring links whose tokens are stored only as SHA-256 hashes; passwords are salted and hashed with Werkzeug
+- Rate limiting protects login, registration, password reset, prediction, retraining and data export, and sees real client IPs behind the host's proxy
+- Server-side validation covers emails, currencies, amounts, dates, purposes and uploads; user text is escaped in emails and rendered as plain text in dialogs
+- The audit log is append-only, enforced by database triggers rather than by application code
+- Internal errors are logged on the server; clients receive generic messages
 
 ## Tech stack
 
@@ -174,198 +241,105 @@ On the same records the confidence thresholds route **92.1%** of requests to aut
 | --- | --- |
 | Backend | Flask 3.1, Flask-JWT-Extended, Flask-Limiter, Flask-CORS, Gunicorn |
 | Machine learning | XGBoost, scikit-learn (Isolation Forest, One-Class SVM), SHAP, pandas, NumPy, joblib |
-| Data | PostgreSQL in production, SQLite for local development |
+| Data | PostgreSQL in production, SQLite for local work; the same code path serves both |
 | Frontend | React 18, DataTables, Chart.js, SweetAlert2, Font Awesome |
-| Email | SMTP or the SendGrid HTTP API |
+| Email | SMTP or the SendGrid HTTP API, sent in background threads |
+| Tests | pytest — 276 tests, run against both SQLite and PostgreSQL on every push |
 
-## Project structure
+## What is in the repository
 
 ```text
 advanced-approval-system/
-├── main.py                    # Flask app: auth, requests, prediction and model-management APIs
-├── model_pipeline.py          # Shared training, evaluation and quality-check logic
-├── train_ensemble_model.py    # CLI: build the bundled model from the base dataset
-├── generate_approval_data.py  # CLI: generate the synthetic corporate expense dataset
-├── prepare_real_data.py       # CLI: merge synthetic data with a public loan-approval dataset
-├── email_service.py           # Transactional emails sent in background threads
-├── ensemble_ai_model.pkl      # Bundled model with encoders, base training data and metrics
-├── index.html                 # Login, access requests, account setup and password reset
-├── user.html                  # Employee portal
-├── admin.html                 # Admin and Super Admin portal, including the ML Agent console
-├── styles.css                 # Shared design system
-├── roc_auc_curve.png          # ROC curve of the bundled model
-├── requirements.txt
-└── .env.example
+├── main.py                    # The whole backend: auth, organizations, requests, scoring,
+│                              # rules, receipts, measurement, export and the platform console
+├── model_pipeline.py          # Feature building, training, evaluation and the quality check
+├── email_service.py           # Transactional email
+├── ensemble_ai_model.pkl      # The bundled model with its encoders, base data and metrics
+├── index.html                 # Login, access requests, account setup, password reset
+├── user.html                  # Employee portal, including Team Approvals for managers
+├── admin.html                 # Administrator portal: requests, users, settings, spot checks,
+│                              # decision quality, drift and fairness
+├── platform.html              # Neuzem console: organizations, quality, the AI model
+├── styles.css                 # One shared design system for every page
+└── tests/                     # 276 tests across both databases
 ```
 
-## Development setup (authorized team members only)
-
-> Access to the source code is restricted to Neuzem team members and parties with written permission from Neuzem. The steps below are internal development instructions and do not grant any right to use the software.
-
-### Prerequisites
-- Python 3.11 or newer
-- Repository access granted by Neuzem
-
-### Run locally
-
-From the project folder, create a virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-Activate the virtual environment (`.venv\Scripts\activate` on Windows, `source .venv/bin/activate` on macOS or Linux), then:
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-python main.py
-```
-
-On Windows Command Prompt use `copy .env.example .env` instead of `cp`. Open **http://localhost:5000**.
-
-### Run the tests
-
-```bash
-pip install -r requirements-dev.txt
-python -m pytest
-```
-
-Tests always use a temporary SQLite database with email delivery disabled, whatever your `.env` contains.
-
-On first start the app creates its database tables and a Super Admin account using the credentials from your environment settings. Configure email (SMTP or SendGrid) to receive the account setup links that new users need. Without it, emails are only logged to the console.
-
-### Configuration
-
-Settings are read from environment variables or a `.env` file. See [`.env.example`](.env.example) for a template.
-
-| Variable | When needed | Purpose |
-| --- | --- | --- |
-| `JWT_SECRET_KEY` | Production | Signs login sessions. Without it a random key is generated and sessions reset on every restart. |
-| `JWT_ACCESS_TOKEN_HOURS` | Optional | Session length in hours. Default `8`. |
-| `DATABASE_URL` | Production | PostgreSQL connection string. When unset, a local SQLite file is used. |
-| `SQLITE_PATH` | Optional | Path of the local SQLite file. Default `auth.db`. |
-| `INITIAL_SUPER_ADMIN_EMAIL` | First start | Email of the Super Admin created on first start. No account is created when it is unset. |
-| `INITIAL_SUPER_ADMIN_PASSWORD` or `SUPER_ADMIN_PASSWORD` | First start | Password for that Super Admin account. |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | For email | SMTP delivery. A Gmail app password works. |
-| `SENDGRID_API_KEY` | Optional | Send email through SendGrid's HTTP API, useful on hosts that block SMTP. |
-| `FROM_EMAIL`, `FROM_NAME` | Optional | Sender address and display name. |
-| `APP_BASE_URL` | Production | Public URL used in setup and reset links. |
-| `CORS_ORIGINS` | Optional | Comma-separated origins allowed to call the API. Default `http://localhost:5000`. |
-| `ENVIRONMENT` | Optional | Set to `production` to force secure cookies. This is automatic on Render. |
-
-## Rebuilding the base model (optional)
-
-Day-to-day retraining happens in the **ML Agent** console. The command-line scripts are only needed to rebuild the bundled base model from scratch:
-
-```bash
-python generate_approval_data.py
-python prepare_real_data.py
-python train_ensemble_model.py
-```
-
-- `generate_approval_data.py` writes `corporate_approval_data.csv` with 20,000 synthetic requests.
-- `prepare_real_data.py` expects a public loan-approval dataset at `Datasets/HuggingFace Datasets/master-loan-approval-data.csv` (not included) and writes `combined_corporate_approval_data.csv`.
-- `train_ensemble_model.py` writes `ensemble_ai_model.pkl` and, if `matplotlib` is installed, `roc_auc_curve.png`.
-
-## Deployment
-
-Production deployments are managed by Neuzem. For internal reference, AAMS runs on any Python web host, such as Render with a managed PostgreSQL database.
-
-1. Create a PostgreSQL database and copy its connection string.
-2. Create a web service from this repository.
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `gunicorn main:app`
-3. Set the environment variables: `JWT_SECRET_KEY`, `DATABASE_URL`, `APP_BASE_URL`, `CORS_ORIGINS`, your email settings, and the Super Admin credentials.
-4. Deploy. Database tables are created and upgraded automatically on startup.
-
-Retrained model versions are stored in the database, so they persist across deployments.
-
-## API reference
+## What the API covers
 
 <details>
-<summary>Authentication and accounts</summary>
+<summary>Accounts and sessions</summary>
 
-| Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| POST | `/api/auth/login` | Public, 5/min | Log in and receive a session cookie |
-| POST | `/api/auth/logout` | Public | Clear the session cookie |
-| POST | `/api/auth/request_access` | Public, 5/hour | Request an employee or administrator account |
-| POST | `/api/auth/setup_password` | Setup link, 10/hour | Set the first password from an emailed setup link |
-| POST | `/api/auth/request_password_reset` | Public, 3/hour | Email a reset link, or a fresh setup link if setup is incomplete |
-| POST | `/api/auth/reset_password` | Reset link | Set a new password |
-| GET | `/api/auth/reject_reset` | Reset link | Cancel a password reset request |
-| GET | `/api/auth/get_profile` | Signed in | Current user's profile |
-| POST | `/api/auth/update_profile` | Signed in | Update name and employee ID |
+| Endpoint | Access |
+| --- | --- |
+| `POST /api/auth/login`, `POST /api/auth/logout` | Public |
+| `POST /api/auth/request_access`, `GET /api/auth/join_info` | Public, via an organization's join link |
+| `POST /api/auth/setup_password`, `POST /api/auth/request_password_reset`, `POST /api/auth/reset_password`, `GET /api/auth/reject_reset` | Emailed single-use links |
+| `GET /api/auth/get_profile`, `POST /api/auth/update_profile` | Signed in |
+| `GET /api/auth/users`, `GET /api/auth/pending_users`, `POST /api/auth/approve_user`, `POST /api/auth/reject_user`, `POST /api/auth/delete_user`, `POST /api/auth/set_manager` | Admin, Super Admin for administrators |
 
 </details>
 
 <details>
-<summary>Requests and predictions</summary>
+<summary>Requests, receipts and decisions</summary>
 
-| Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| POST | `/api/predict` | Signed in, 20/min | Score and record a new request |
-| GET | `/api/model/form_options` | Signed in | Values the model recognizes, used by the request form |
-| GET | `/api/auth/my_requests` | Signed in | Current user's requests |
-| GET | `/api/auth/all_requests` | Admin | All requests |
-| GET | `/api/auth/pending_approval_requests` | Admin | Escalated requests |
-| POST | `/api/auth/approve_request` | Admin | Approve a request |
-| POST | `/api/auth/reject_request` | Admin | Reject a request |
-| POST | `/api/auth/reopen_request` | Admin | Move a decided request back to pending |
-
-</details>
-
-<details>
-<summary>User management</summary>
-
-| Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| GET | `/api/auth/users` | Admin | All user accounts |
-| GET | `/api/auth/pending_users` | Admin | Accounts awaiting approval |
-| POST | `/api/auth/approve_user` | Admin (Super Admin for administrators) | Approve an access request and email a setup link |
-| POST | `/api/auth/reject_user` | Admin (Super Admin for administrators) | Reject an access request |
-| POST | `/api/auth/delete_user` | Admin (Super Admin for administrators) | Remove an account |
+| Endpoint | Access |
+| --- | --- |
+| `POST /api/predict` | Signed in |
+| `GET /api/model/form_options` | Signed in |
+| `GET /api/auth/my_requests` | Own requests |
+| `GET /api/auth/team_requests` | Managers |
+| `GET /api/auth/all_requests`, `GET /api/auth/pending_approval_requests` | Admin |
+| `POST /api/auth/approve_request`, `POST /api/auth/reject_request` | The assigned manager or an admin |
+| `POST /api/auth/reopen_request` | Admin |
+| `GET /api/auth/request_history` | Admin and the submitter's manager |
+| `POST /api/auth/add_receipts`, `GET /api/auth/request_receipts`, `GET /api/auth/receipt` | The employee, their manager and their admins |
 
 </details>
 
 <details>
-<summary>Model management</summary>
+<summary>Company settings and measurement</summary>
 
-| Method | Endpoint | Access | Description |
-| --- | --- | --- | --- |
-| GET | `/api/model/info` | Super Admin | Active model, quality score and pending admin decisions |
-| POST | `/api/model/retrain` | Super Admin, 10/hour | Start a background retraining job |
-| GET | `/api/model/jobs/latest` | Super Admin | Progress and result of the latest job |
-| GET | `/api/model/versions` | Super Admin | Stored model versions and the bundled original |
-| POST | `/api/model/activate` | Super Admin | Switch to a stored version, or `null` for the original model |
+| Endpoint | Access |
+| --- | --- |
+| `GET /api/auth/organization` | Signed in; settings only for admins |
+| `POST /api/auth/update_approval_settings` | Super Admin |
+| `GET /api/auth/policy_rules`, `POST /api/auth/create_policy_rule`, `POST /api/auth/update_policy_rule` | Super Admin |
+| `GET /api/auth/spot_checks`, `POST /api/auth/review_spot_check` | Admin |
+| `GET /api/auth/decision_quality`, `GET /api/auth/monitoring`, `GET /api/auth/fairness` | Admin |
+| `GET /api/auth/export` | Super Admin |
 
 </details>
 
-## Security
+<details>
+<summary>The Neuzem platform console</summary>
 
-- Sessions use JWTs in HttpOnly, SameSite cookies, marked Secure in production, and logging out clears them on the server
-- Every administrative action is authorized on the server by role. Administrators cannot manage other administrators, and nobody can delete their own account.
-- Account setup and password reset use single-use, expiring links whose tokens are stored only as SHA-256 hashes
-- Passwords are salted and hashed with Werkzeug and must be at least 8 characters
-- Rate limiting protects login, registration, password reset, prediction and retraining, and it sees real client IPs behind Render's proxy
-- Server-side validation covers email format, currencies and amounts. User-supplied text is escaped in emails and rendered as plain text in dialogs.
-- Internal errors are logged on the server, and clients only receive generic messages
+| Endpoint | Access |
+| --- | --- |
+| `GET /api/platform/organizations`, `POST /api/platform/create_organization`, `POST /api/platform/update_organization`, `POST /api/platform/close_organization` | Platform owner |
+| `GET /api/platform/decision_quality` | Platform owner — numbers only, never the requests behind them |
+| `GET /api/platform/model/info`, `POST /api/platform/model/retrain`, `GET /api/platform/model/jobs/latest`, `GET /api/platform/model/versions`, `POST /api/platform/model/activate` | Platform owner |
+
+</details>
 
 ## Known limitations
 
-- Exchange rates are fixed values in `main.py` rather than a live feed.
-- The frontend compiles JSX in the browser for zero-build simplicity. A bundler would improve load time for large deployments.
-- The automated test suite is small so far and covers database setup and organization assignment.
+- Exchange rates are fixed values in the code rather than a live feed.
+- The frontend compiles JSX in the browser for zero-build simplicity. A bundler would load faster for large deployments.
+- Retraining runs in a background thread inside the web process. That is fine at this size; a busy platform would want a separate worker.
+- Single sign-on is not supported. Accounts are email and password, with approval by an administrator.
 
-## License
+## Licence
 
 **Proprietary. Copyright © 2026 Neuzem. All rights reserved.**
 
-This software, including its source code, trained models, documentation and design, is confidential and the exclusive property of Neuzem. No license or right is granted, by implication or otherwise, to download, clone, copy, install, run, modify, deploy, sublicense or distribute any part of it without prior written permission from Neuzem.
+This software — its source code, trained models, datasets, documentation and design — is the exclusive property of Neuzem. No licence or right is granted, by implication, estoppel or otherwise, to copy, clone, install, run, modify, merge, publish, sublicense, sell or distribute any part of it, or to create derivative works from it, without prior written permission from Neuzem.
 
-For demonstrations, evaluations or licensing enquiries, contact Neuzem through [neuzem.com](https://neuzem.com).
+Viewing this repository does not grant permission to use it. Unauthorized use, reproduction or distribution may result in civil and criminal liability.
+
+For demonstrations, evaluations or licensing enquiries, contact Neuzem at [neuzem.com](https://neuzem.com).
+
+See [LICENSE](LICENSE) for the full notice.
 
 ## Ownership
 
-Developed by **Mithilesh** ([@Mithilesh017](https://github.com/Mithilesh017)) for **[Neuzem](https://neuzem.com)**.
+Built by **Mithilesh** ([@Mithilesh017](https://github.com/Mithilesh017)) for **[Neuzem](https://neuzem.com)**.
