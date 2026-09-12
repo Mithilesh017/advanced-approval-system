@@ -17,7 +17,6 @@ import model_pipeline
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
-import pandas as pd
 import joblib
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, set_access_cookies, unset_jwt_cookies, get_jwt
 from flask_limiter import Limiter
@@ -1588,9 +1587,6 @@ def predict():
         xgb_model = artifacts['xgboost_model']
         iso_forest = artifacts['isolation_forest']
         oc_svm = artifacts['one_class_svm']
-        encoders = artifacts['encoders']
-        scaler = artifacts['scaler']
-        features = artifacts['features']
         
         # Extract inputs
         role = data.get('Role')
@@ -1630,30 +1626,12 @@ def predict():
         rate = exchange_rates.get(currency, 1.0)
         normalized_inr = amount * rate
 
-        # Prepare DataFrame for preprocessing
-        input_data = pd.DataFrame({
-            'Role': [role],
-            'Department': [department],
-            'Request_Type': [req_type],
-            'Destination': [destination],
-            'Amount_INR': [normalized_inr]
+        # Training and scoring build the model's columns in the same one place, so they cannot drift apart.
+        X_input, unknown_columns = model_pipeline.prepare_request(artifacts, {
+            'Role': role, 'Department': department, 'Request_Type': req_type,
+            'Destination': destination, 'Amount_INR': normalized_inr,
         })
-
-        is_unknown_category = False
-
-        # Map categorical text fields with OOV fallback
-        for col in ['Role', 'Department', 'Request_Type', 'Destination']:
-            if input_data[col].iloc[0] in encoders[col].classes_:
-                input_data[col] = encoders[col].transform(input_data[col])
-            else:
-                is_unknown_category = True
-                input_data[col] = 0  # Safe fallback to 0
-
-        # Scale the normalized amount
-        input_data['Amount_INR'] = scaler.transform(input_data[['Amount_INR']])
-
-        # Reorder columns to match feature order used in training
-        X_input = input_data[features]
+        is_unknown_category = bool(unknown_columns)
 
         # XGBoost Probabilities
         xgb_prob = float(xgb_model.predict_proba(X_input)[0][1])
@@ -1665,7 +1643,7 @@ def predict():
 
         # SHAP values show administrators which fields pushed the score up or down.
         shap_values = artifacts['shap_explainer'].shap_values(X_input)
-        shap_impact = dict(zip(features, [float(v) for v in shap_values[0]]))
+        shap_impact = dict(zip(X_input.columns, [float(v) for v in shap_values[0]]))
         
         auto_approve_above = organization_auto_approve_threshold(g.user)
 

@@ -105,6 +105,33 @@ def encode_features(artifacts, frame):
     return encoded[artifacts['features']]
 
 
+def unknown_categories(artifacts, frame):
+    """The categorical columns holding a value this model was never trained on."""
+    missing = []
+    for col in CATEGORICAL_FEATURES:
+        values = frame[col].astype(str)
+        if not values.isin(artifacts['encoders'][col].classes_).all():
+            missing.append(col)
+    return missing
+
+
+def request_frame(values):
+    """One request in the same shape as a row of training data."""
+    row = {col: str(values.get(col, '')) for col in CATEGORICAL_FEATURES}
+    row['Amount_INR'] = float(values['Amount_INR'])
+    return pd.DataFrame([row])
+
+
+def prepare_request(artifacts, values):
+    """Turns one request into exactly the columns the model was trained on.
+
+    Scoring and training both go through here, so the two can never drift apart. Returns the encoded
+    row and the columns holding a value the model has not seen before.
+    """
+    frame = request_frame(values)
+    return encode_features(artifacts, frame), unknown_categories(artifacts, frame)
+
+
 def evaluate(artifacts, frame):
     labels = frame['label'].to_numpy()
     if len(frame) == 0 or len(np.unique(labels)) < 2:
