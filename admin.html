@@ -174,6 +174,7 @@
       const [allRequests, setAllRequests] = useState([]);
       const [user, setUser] = useState(JSON.parse(localStorage.getItem('ams_user')) || {email: 'admin@gmail.com'});
       const [organization, setOrganization] = useState(null);
+      const [spotChecksWaiting, setSpotChecksWaiting] = useState(0);
 
       const loadData = async () => {
         try {
@@ -222,9 +223,15 @@
         .then(data => { if (data) setOrganization(data); })
         .catch(() => {});
 
+      const loadSpotChecks = () => fetch('/api/auth/spot_checks', { credentials: 'include' })
+        .then(res => (isSessionExpired(res) || !res.ok) ? null : res.json())
+        .then(data => { if (data) setSpotChecksWaiting(data.waiting); })
+        .catch(() => {});
+
       useEffect(() => {
         loadData();
         loadOrganization();
+        loadSpotChecks();
       }, []);
 
       const pendingCount = allRequests.filter(r => r.status === 'Pending').length;
@@ -292,6 +299,12 @@
                 </button>
               </li>
               <li>
+                <button className={view === 'spotchecks' ? 'active' : ''} onClick={() => setView('spotchecks')}>
+                  <i className="fas fa-clipboard-check"></i> Spot Checks
+                  {spotChecksWaiting > 0 && <span className="count warning">{spotChecksWaiting}</span>}
+                </button>
+              </li>
+              <li>
                 <button className={view === 'users' ? 'active' : ''} onClick={() => setView('users')}><i className="fas fa-users-cog"></i> Manage Users</button>
               </li>
               {user.role === 'SuperAdmin' && (
@@ -317,6 +330,7 @@
                 {view === 'pending' && <><i className="fas fa-clock"></i> Pending Requests</>}
                 {view === 'approved' && <><i className="fas fa-check-circle"></i> Approved Requests</>}
                 {view === 'rejected' && <><i className="fas fa-times-circle"></i> Disapproved Requests</>}
+                {view === 'spotchecks' && <><i className="fas fa-clipboard-check"></i> Spot Checks</>}
                 {view === 'users' && <><i className="fas fa-users-cog"></i> Manage Users</>}
                 {view === 'settings' && <><i className="fas fa-sliders"></i> Approval Settings</>}
                 {view === 'profile' && <><i className="fas fa-user-circle"></i> My Profile</>}
@@ -338,6 +352,7 @@
                     currentUserEmail={user.email}
                 />
             }
+            {view === 'spotchecks' && <SpotChecksView onReviewed={loadSpotChecks} />}
             {view === 'users' && <UsersView userRole={user.role} organization={organization} />}
             {view === 'profile' && <ProfileView user={user} />}
             {user.role === 'SuperAdmin' && view === 'settings' && <SettingsView organization={organization} onSaved={loadOrganization} />}
@@ -1272,12 +1287,166 @@
       );
     }
 
+    const SPOT_CHECK_VERDICTS = {
+      CORRECT: { label: 'Approval was right', title: 'Was this approval right?', inputLabel: 'Note (optional)', confirm: 'Yes, it was right', reasonRequired: false },
+      WRONG: { label: 'Should have been reviewed', title: 'What was wrong with this approval?', inputLabel: 'What was wrong (required)', confirm: 'Save', reasonRequired: true }
+    };
+
+    function SpotChecksView({ onReviewed }) {
+      const [data, setData] = useState(null);
+
+      const load = async () => {
+        try {
+          const res = await fetch('/api/auth/spot_checks', { credentials: 'include' });
+          if (isSessionExpired(res)) return;
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(body.error || 'The spot checks could not be loaded.');
+          setData(body);
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Spot Checks Unavailable', text: err.message });
+          setData({ checks: [], waiting: 0 });
+        }
+      };
+
+      useEffect(() => { load(); }, []);
+
+      const review = async (check, verdict) => {
+        const prompt = SPOT_CHECK_VERDICTS[verdict];
+        const answer = await Swal.fire({
+          title: prompt.title,
+          input: 'textarea',
+          inputLabel: prompt.inputLabel,
+          inputAttributes: { maxlength: '1000' },
+          showCancelButton: true,
+          confirmButtonText: prompt.confirm,
+          inputValidator: (value) => (prompt.reasonRequired && !value.trim() ? 'Please say what was wrong. It is saved in the request history.' : undefined)
+        });
+        if (!answer.isConfirmed) return;
+
+        try {
+          const res = await fetch('/api/auth/review_spot_check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: check.id, verdict, comment: answer.value.trim() }),
+            credentials: 'include'
+          });
+          if (isSessionExpired(res)) return;
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(body.error || 'The spot check could not be saved.');
+          await load();
+          if (onReviewed) onReviewed();
+          Swal.fire({ icon: 'success', title: 'Spot Check Saved', timer: 1500, showConfirmButton: false });
+        } catch (err) {
+          Swal.fire({ icon: 'error', title: 'Save Failed', text: err.message });
+        }
+      };
+
+      if (data === null) {
+        return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading spot checks...</div></div>;
+      }
+
+      const waiting = data.checks.filter(check => !check.verdict);
+      const done = data.checks.filter(check => check.verdict);
+
+      const detailsCell = (check) => (
+        <td>
+          <div>{check.request_type} · {check.destination}</div>
+          {check.purpose && <div className="cell-secondary cell-purpose" title={check.purpose}>{check.purpose}</div>}
+          {check.expense_date && <div className="cell-secondary">{formatRequestDates(check.expense_date, check.end_date)}</div>}
+        </td>
+      );
+
+      return (
+        <>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-clipboard-check"></i> Spot Checks</h3>
+          <p className="panel-subtitle">
+            Nobody sees a request the AI approves on its own, so {data.spot_check_percent}% of them are picked at random for you to
+            look at afterwards. Your answers are the only real measure of how good those approvals are, and they train the next model.
+            Saying an approval was wrong does not undo it: reopen the request from the Approved list if the money should not be paid.
+          </p>
+
+          {waiting.length === 0 ? (
+            <div className="empty-state is-neutral"><i className="fas fa-clipboard-check"></i>No approvals are waiting to be checked.</div>
+          ) : (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr><th>Request</th><th>Employee</th><th>Details</th><th>Amount</th><th>AI score</th><th>Your answer</th></tr>
+                </thead>
+                <tbody>
+                  {waiting.map(check => (
+                    <tr key={check.id}>
+                      <td className="cell-primary">REQ_{String(check.request_id).padStart(4, '0')}</td>
+                      <td>
+                        <div className="cell-primary">{check.employee_name || check.submitted_by}</div>
+                        <div className="cell-secondary">{check.submitted_by}</div>
+                      </td>
+                      {detailsCell(check)}
+                      <td className="cell-nowrap">
+                        <div>{check.amount} {check.currency}</div>
+                        {check.receipt_count > 0 && (
+                          <div className="cell-secondary"><i className="fas fa-paperclip"></i> {check.receipt_count} receipt{check.receipt_count === 1 ? '' : 's'}</div>
+                        )}
+                      </td>
+                      <td className="cell-nowrap">{check.xgb_score == null ? '—' : `${Math.round(check.xgb_score * 1000) / 10}%`}</td>
+                      <td className="cell-nowrap">
+                        <div className="cell-actions">
+                          <button type="button" className="btn btn-primary btn-sm" onClick={() => review(check, 'CORRECT')}><i className="fas fa-check"></i> Right</button>
+                          <button type="button" className="btn btn-tinted-danger btn-sm" onClick={() => review(check, 'WRONG')}><i className="fas fa-flag"></i> Wrong</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {done.length > 0 && (
+          <div className="panel">
+            <h3 className="panel-title"><i className="fas fa-clock-rotate-left"></i> Checks Already Done</h3>
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr><th>Request</th><th>Details</th><th>Amount</th><th>Answer</th><th>Checked by</th></tr>
+                </thead>
+                <tbody>
+                  {done.map(check => (
+                    <tr key={check.id}>
+                      <td className="cell-primary">REQ_{String(check.request_id).padStart(4, '0')}</td>
+                      {detailsCell(check)}
+                      <td className="cell-nowrap">{check.amount} {check.currency}</td>
+                      <td>
+                        <span className={`badge ${check.verdict === 'CORRECT' ? 'badge-green' : 'badge-red'}`}>
+                          {check.verdict === 'CORRECT' ? 'Approval was right' : 'Should have been reviewed'}
+                        </span>
+                        {check.comment && <div className="cell-secondary">{check.comment}</div>}
+                      </td>
+                      <td>
+                        <div>{check.reviewed_by}</div>
+                        {check.reviewed_at && <div className="cell-secondary">{formatHistoryTime(check.reviewed_at)}</div>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        </>
+      );
+    }
+
     function SettingsView({ organization, onSaved }) {
       const settings = organization && organization.approval_settings;
       const [percent, setPercent] = useState('');
       const [secondApproval, setSecondApproval] = useState('');
+      const [spotCheckPercent, setSpotCheckPercent] = useState('');
       const [saving, setSaving] = useState(false);
       const [savingSecond, setSavingSecond] = useState(false);
+      const [savingSpotCheck, setSavingSpotCheck] = useState(false);
 
       useEffect(() => {
         if (settings) setPercent(String(Math.round(settings.auto_approve_above * 100)));
@@ -1286,6 +1455,10 @@
       useEffect(() => {
         if (settings) setSecondApproval(settings.second_approval_above == null ? '' : String(settings.second_approval_above));
       }, [settings && settings.second_approval_above]);
+
+      useEffect(() => {
+        if (settings) setSpotCheckPercent(String(settings.spot_check_percent));
+      }, [settings && settings.spot_check_percent]);
 
       if (!settings) {
         return <div className="panel"><div className="loading-inline"><i className="fas fa-spinner fa-spin"></i> Loading approval settings...</div></div>;
@@ -1324,6 +1497,18 @@
           return;
         }
         await saveSettings({ auto_approve_above: value / 100 }, setSaving);
+      };
+
+      const handleSaveSpotCheck = async (e) => {
+        e.preventDefault();
+        const value = Number(spotCheckPercent);
+        const lowest = settings.minimum_spot_check_percent;
+        const highest = settings.maximum_spot_check_percent;
+        if (!Number.isInteger(value) || value < lowest || value > highest) {
+          Swal.fire({ icon: 'error', title: 'Invalid Share', text: `Enter a whole number from ${lowest} to ${highest}.` });
+          return;
+        }
+        await saveSettings({ spot_check_percent: value }, setSavingSpotCheck);
       };
 
       const handleSaveSecondApproval = async (e) => {
@@ -1386,6 +1571,27 @@
             </div>
             <button type="submit" className="btn btn-primary" disabled={savingSecond}>
               {savingSecond ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Amount</span>}
+            </button>
+          </form>
+        </div>
+        <div className="panel">
+          <h3 className="panel-title"><i className="fas fa-clipboard-check"></i> Spot Checks on Automatic Approvals</h3>
+          <p className="panel-subtitle">
+            Requests the AI approves on its own are seen by nobody. This share of them is picked at random and put on your
+            Spot Checks page for a person to look at afterwards. Checking more costs a little time and tells you far more
+            about how well the AI is doing.
+          </p>
+          <form onSubmit={handleSaveSpotCheck} className="profile-form">
+            <div className="form-group">
+              <label htmlFor="spot-check-percent">Share of automatic approvals to check (%)</label>
+              <input id="spot-check-percent" type="number" min={settings.minimum_spot_check_percent} max={settings.maximum_spot_check_percent}
+                     step="1" value={spotCheckPercent} onChange={e => setSpotCheckPercent(e.target.value)} required />
+              <small className="field-hint">
+                You can raise this up to {settings.maximum_spot_check_percent}%. It cannot go below {settings.minimum_spot_check_percent}%.
+              </small>
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={savingSpotCheck}>
+              {savingSpotCheck ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Share</span>}
             </button>
           </form>
         </div>

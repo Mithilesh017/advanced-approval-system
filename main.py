@@ -82,7 +82,7 @@ def require_login(fn):
             user = conn.execute(
                 'SELECT Users.id, Users.email, Users.role, Users.status, Users.organization_id, Users.manager_email, '
                 'Organizations.status AS organization_status, Organizations.approval_mode, Organizations.auto_approve_above, '
-                'Organizations.second_approval_above '
+                'Organizations.second_approval_above, Organizations.spot_check_percent '
                 'FROM Users JOIN Organizations ON Organizations.id = Users.organization_id WHERE Users.email = ?',
                 (get_jwt_identity(),)
             ).fetchone()
@@ -392,6 +392,19 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS SpotChecks (
+                id SERIAL PRIMARY KEY,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL UNIQUE REFERENCES Requests(id),
+                verdict TEXT,
+                reviewed_by TEXT,
+                reviewed_at TIMESTAMP,
+                comment TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_spot_checks_organization ON SpotChecks (organization_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -513,6 +526,19 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_receipts_request ON Receipts (request_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS SpotChecks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL REFERENCES Organizations(id),
+                request_id INTEGER NOT NULL UNIQUE REFERENCES Requests(id),
+                verdict TEXT,
+                reviewed_by TEXT,
+                reviewed_at DATETIME,
+                comment TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_spot_checks_organization ON SpotChecks (organization_id)')
         for statement in AUDIT_EVENT_INDEXES:
             cursor.execute(statement)
         conn.commit()
@@ -553,6 +579,7 @@ def check_and_add_columns():
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS approval_mode TEXT')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS auto_approve_above DOUBLE PRECISION')
         cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS second_approval_above DOUBLE PRECISION')
+        cursor.execute('ALTER TABLE Organizations ADD COLUMN IF NOT EXISTS spot_check_percent INTEGER')
         cursor.execute('ALTER TABLE Users ADD COLUMN IF NOT EXISTS manager_email TEXT')
         conn.commit()
         conn.close()
@@ -588,7 +615,8 @@ def check_and_add_columns():
 
     cursor.execute("PRAGMA table_info(Organizations)")
     organization_columns = {col[1] for col in cursor.fetchall()}
-    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL'), ('second_approval_above', 'REAL')):
+    for column, column_type in (('approval_mode', 'TEXT'), ('auto_approve_above', 'REAL'), ('second_approval_above', 'REAL'),
+                                ('spot_check_percent', 'INTEGER')):
         if column not in organization_columns:
             cursor.execute(f"ALTER TABLE Organizations ADD COLUMN {column} {column_type}")
 
@@ -762,6 +790,26 @@ def organization_second_approval_amount(organization):
 def needs_second_approval(organization, amount_inr):
     above = organization_second_approval_amount(organization)
     return above is not None and float(amount_inr or 0) >= above
+
+
+# ==========================================
+# SPOT CHECKS ON AUTOMATIC APPROVALS
+# ==========================================
+# Nobody looks at a request the AI approves on its own, so a random few are checked afterwards by a person.
+# Their verdicts are the only honest measure of how good those approvals really are.
+SPOT_CHECK_MIN_PERCENT = 5
+SPOT_CHECK_MAX_PERCENT = 100
+SPOT_CHECK_VERDICTS = ('CORRECT', 'WRONG')
+
+def organization_spot_check_percent(organization):
+    value = organization.get('spot_check_percent')
+    if value is None:
+        return SPOT_CHECK_MIN_PERCENT
+    return max(SPOT_CHECK_MIN_PERCENT, min(SPOT_CHECK_MAX_PERCENT, int(value)))
+
+def spot_check_selected(percent):
+    """True for a random share of automatic approvals. Tests replace this to choose exactly which ones."""
+    return percent > 0 and secrets.randbelow(100) < percent
 
 
 # ==========================================
@@ -1381,6 +1429,14 @@ def predict():
                 'explanation': shap_impact,
             }
         )
+        if status == 'APPROVED' and approval_mode == 'automatic':
+            spot_check_percent = organization_spot_check_percent(g.user)
+            if spot_check_selected(spot_check_percent):
+                conn.execute(
+                    'INSERT INTO SpotChecks (organization_id, request_id) VALUES (?, ?)', (g.user['organization_id'], request_id)
+                )
+                record_event(conn, 'spotcheck.sampled', organization_id=g.user['organization_id'], request_id=request_id,
+                             details={'percent': spot_check_percent})
         save_receipts(conn, g.user['organization_id'], request_id, current_email, receipts)
         # Whoever must decide is told once the request is safely saved.
         send_notice = waiting_notice(conn, g.user['organization_id'], request_id, approver_email) if status.startswith('ESCALATED') else None
@@ -1891,6 +1947,9 @@ def current_organization():
             'maximum_auto_approve_above': AUTO_APPROVE_THRESHOLD_MAX,
             'second_approval_above': organization_second_approval_amount(g.user),
             'maximum_second_approval_above': SECOND_APPROVAL_MAX_INR,
+            'spot_check_percent': organization_spot_check_percent(g.user),
+            'minimum_spot_check_percent': SPOT_CHECK_MIN_PERCENT,
+            'maximum_spot_check_percent': SPOT_CHECK_MAX_PERCENT,
         }
     return jsonify(body)
 
@@ -1921,6 +1980,15 @@ def update_approval_settings():
             }), 400
         changes['second_approval_above'] = (organization_second_approval_amount(g.user),
                                             None if value is None else round(float(value), 2))
+
+    if 'spot_check_percent' in data:
+        value = data['spot_check_percent']
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or not SPOT_CHECK_MIN_PERCENT <= value <= SPOT_CHECK_MAX_PERCENT):
+            return jsonify({
+                'error': f'The share of approvals to check must be a whole number between {SPOT_CHECK_MIN_PERCENT}% and {SPOT_CHECK_MAX_PERCENT}%.'
+            }), 400
+        changes['spot_check_percent'] = (organization_spot_check_percent(g.user), value)
 
     if not changes:
         return jsonify({'error': 'There is nothing to change.'}), 400
@@ -2005,6 +2073,71 @@ def team_requests():
     finally:
         conn.close()
     return jsonify({'requests': [to_json_row(row) for row in rows]})
+
+SPOT_CHECKS_LISTED = 100
+
+@app.route('/api/auth/spot_checks', methods=['GET'])
+@require_role('Admin')
+def spot_checks():
+    # The approvals nobody saw, picked at random for a person to look at afterwards.
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            'SELECT SpotChecks.id, SpotChecks.verdict, SpotChecks.reviewed_by, SpotChecks.reviewed_at, SpotChecks.comment, '
+            'SpotChecks.created_at, Requests.id AS request_id, Requests.submitted_by, Requests.employee_name, '
+            'Requests.request_type, Requests.destination, Requests.amount, Requests.currency, Requests.purpose, '
+            'Requests.expense_date, Requests.end_date, Requests.xgb_score, Requests.final_decision, '
+            f'{RECEIPT_COUNT_SQL} '
+            'FROM SpotChecks JOIN Requests ON Requests.id = SpotChecks.request_id '
+            'WHERE SpotChecks.organization_id = ? ORDER BY SpotChecks.id DESC LIMIT ?',
+            (g.user['organization_id'], SPOT_CHECKS_LISTED)
+        ).fetchall()
+    finally:
+        conn.close()
+    checks = [to_json_row(row) for row in rows]
+    return jsonify({
+        'checks': checks,
+        'waiting': sum(1 for check in checks if check['verdict'] is None),
+        'spot_check_percent': organization_spot_check_percent(g.user),
+    })
+
+@app.route('/api/auth/review_spot_check', methods=['POST'])
+@require_role('Admin')
+def review_spot_check():
+    data = request.get_json(silent=True) or {}
+    check_id = data.get('id')
+    verdict = data.get('verdict')
+    if not check_id or verdict not in SPOT_CHECK_VERDICTS:
+        return jsonify({'error': 'Say whether the automatic approval was right or wrong.'}), 400
+    comment = data.get('comment')
+    if comment is not None and not isinstance(comment, str):
+        return jsonify({'error': 'The comment must be text.'}), 400
+    comment = (comment or '').strip()[:COMMENT_MAX_LENGTH] or None
+    if verdict == 'WRONG' and not comment:
+        return jsonify({'error': 'Please say what was wrong with this approval. It is saved in the request history.'}), 400
+
+    conn = get_db_connection()
+    try:
+        check = conn.execute(
+            'SELECT id, request_id, verdict FROM SpotChecks WHERE id = ? AND organization_id = ?',
+            (check_id, g.user['organization_id'])
+        ).fetchone()
+        if not check:
+            return jsonify({'error': 'Spot check not found.'}), 404
+        # Matching the empty verdict stops two administrators checking the same approval at once.
+        cursor = conn.execute(
+            'UPDATE SpotChecks SET verdict = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, comment = ? '
+            'WHERE id = ? AND organization_id = ? AND verdict IS NULL',
+            (verdict, g.user['email'], comment, check['id'], g.user['organization_id'])
+        )
+        if not cursor.rowcount:
+            return jsonify({'error': 'This spot check has already been done.'}), 409
+        record_event(conn, 'spotcheck.reviewed', organization_id=g.user['organization_id'], request_id=check['request_id'],
+                     actor=g.user['email'], comment=comment, details={'verdict': verdict})
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'status': 'SUCCESS'})
 
 @app.route('/api/auth/request_access', methods=['POST'])
 @limiter.limit("5 per hour")

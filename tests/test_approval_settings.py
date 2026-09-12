@@ -69,6 +69,9 @@ def test_admins_see_approval_settings_but_employees_do_not(app_db):
         'approval_mode': 'automatic', 'auto_approve_above': 0.8,
         'minimum_auto_approve_above': 0.8, 'maximum_auto_approve_above': 0.99,
         'second_approval_above': None, 'maximum_second_approval_above': app_db.SECOND_APPROVAL_MAX_INR,
+        'spot_check_percent': app_db.SPOT_CHECK_MIN_PERCENT,
+        'minimum_spot_check_percent': app_db.SPOT_CHECK_MIN_PERCENT,
+        'maximum_spot_check_percent': app_db.SPOT_CHECK_MAX_PERCENT,
     }
     assert 'approval_settings' not in session(app_db, 'staff@example.com').get('/api/auth/organization').get_json()
 
