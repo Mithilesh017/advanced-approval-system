@@ -45,10 +45,17 @@
 
     let sessionExpiredNotified = false;
     const isSessionExpired = (res) => {
-      if (res.status !== 401 && res.status !== 422) return false;
+      // A paused organization is refused on every call, so it ends the session just like an expired login.
+      const paused = res.status === 403 && res.headers.get('X-Organization-Paused') === '1';
+      if (res.status !== 401 && res.status !== 422 && !paused) return false;
       if (!sessionExpiredNotified) {
         sessionExpiredNotified = true;
-        Swal.fire({ icon: 'warning', title: 'Session Expired', text: 'Please log in again to continue.', allowOutsideClick: false }).then(signOut);
+        Swal.fire({
+          icon: 'warning',
+          title: paused ? 'Access Paused' : 'Session Expired',
+          text: paused ? "Your organization's access is paused. Please contact your administrator." : 'Please log in again to continue.',
+          allowOutsideClick: false
+        }).then(signOut);
       }
       return true;
     };
