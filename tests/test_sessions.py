@@ -56,7 +56,9 @@ def test_role_change_takes_effect_immediately(client, app_db):
     assert client.get('/api/auth/all_requests').status_code == 200
 
     execute(app_db, "UPDATE Users SET role = 'User' WHERE email = ?", ('manager@example.com',))
-    assert client.get('/api/auth/all_requests').status_code == 403
+    refused = client.get('/api/auth/all_requests')
+    assert refused.status_code == 403
+    assert 'X-Organization-Paused' not in refused.headers  # An ordinary refusal must not sign the person out.
 
 
 def test_session_for_a_different_organization_is_rejected(client, app_db):
@@ -87,6 +89,8 @@ def test_paused_organization_blocks_open_sessions_and_new_logins(app_db):
     response = open_session.get('/api/auth/my_requests')
     assert response.status_code == 403
     assert 'paused' in response.get_json()['error']
+    # The portals read this header to show the paused message and sign the person out.
+    assert response.headers.get('X-Organization-Paused') == '1'
 
     new_login = app_db.app.test_client().post('/api/auth/login', json={'email': 'staff@paused.test', 'password': PASSWORD})
     assert new_login.status_code == 403

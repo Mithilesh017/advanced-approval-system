@@ -93,7 +93,8 @@ def require_login(fn):
         if not user or user['status'] != 'Active' or user['organization_id'] != get_jwt().get('organization_id'):
             return jsonify({'error': SESSION_INVALID_MESSAGE}), 401
         if user['organization_status'] != 'Active':
-            return jsonify({'error': ORGANIZATION_PAUSED_MESSAGE}), 403
+            # The header lets the portals tell a paused organization apart from an ordinary refusal and sign people out.
+            return jsonify({'error': ORGANIZATION_PAUSED_MESSAGE}), 403, {'X-Organization-Paused': '1'}
         g.user = dict(user)
         return fn(*args, **kwargs)
     return decorator
@@ -1906,10 +1907,12 @@ def run_training_job(job_id, started_by):
         candidate['metrics'] = metrics
         new_score, old_score = metrics['roc_auc'], metrics['previous_roc_auc']
 
+        # A holdout with only one kind of answer gives no score, and the message must not fail over that.
+        new_text = f"scored {new_score:.1%}" if new_score is not None else "could not be scored"
         if not comparison['accepted']:
             update_training_job(
                 job_id, status='rejected', step='done', metrics=json.dumps(metrics), finished_at=utc_now_text(),
-                message=f"The retrained model scored {new_score:.1%} while the current model scores {old_score:.1%}, so the current model stays active."
+                message=f"The retrained model {new_text} while the current model scores {old_score:.1%}, so the current model stays active."
             )
             return
 
@@ -1931,10 +1934,11 @@ def run_training_job(job_id, started_by):
         get_active_model(force=True)
 
         previous_text = f" (previous model: {old_score:.1%})" if old_score is not None else ""
+        score_text = f" with a quality score of {new_score:.1%}" if new_score is not None else ""
         update_training_job(
             job_id, status='succeeded', step='done', metrics=json.dumps(metrics), model_version_id=version_id,
             finished_at=utc_now_text(),
-            message=f"Version {version_id} is now scoring new requests with a quality score of {new_score:.1%}{previous_text}."
+            message=f"Version {version_id} is now scoring new requests{score_text}{previous_text}."
         )
     except model_pipeline.TrainingDataMissing as exc:
         update_training_job(job_id, status='failed', step='done', message=str(exc), finished_at=utc_now_text())
@@ -2259,9 +2263,13 @@ def platform_update_organization():
 
     conn = get_db_connection()
     try:
-        organization = conn.execute('SELECT is_default FROM Organizations WHERE id = ?', (organization_id,)).fetchone()
+        organization = conn.execute('SELECT is_default, status FROM Organizations WHERE id = ?', (organization_id,)).fetchone()
         if not organization:
             return jsonify({'error': 'Organization not found.'}), 404
+        # A company that has left cannot be reopened or agree to anything new; it can only stop sharing its data.
+        if organization['status'] == ORGANIZATION_CLOSED and any(
+                column != 'allow_training_data' or value for column, value in changes.items()):
+            return jsonify({'error': 'This organization is closed. Its data sharing can be turned off, but nothing else can change.'}), 409
         if organization['is_default'] and changes.get('status') == 'Paused':
             return jsonify({'error': 'The default organization holds the original accounts and cannot be paused.'}), 409
         # An organization only stops using shadow mode once its own decisions show the AI can be trusted.
@@ -2680,9 +2688,12 @@ def organization_decision_quality():
     conn = get_db_connection()
     try:
         quality = decision_quality(conn, g.user['organization_id'], days)
+        # Readiness is judged on the same window as Neuzem's gate, whichever period is on screen.
+        gate_quality = quality if days == AUTOMATIC_APPROVAL_WINDOW else decision_quality(
+            conn, g.user['organization_id'], AUTOMATIC_APPROVAL_WINDOW)
     finally:
         conn.close()
-    return jsonify({**quality, 'readiness': automatic_approval_readiness(quality)})
+    return jsonify({**quality, 'readiness': automatic_approval_readiness(gate_quality)})
 
 @app.route('/api/auth/monitoring', methods=['GET'])
 @require_role('Admin')

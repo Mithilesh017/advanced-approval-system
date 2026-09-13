@@ -17,8 +17,8 @@ def session(app_db, email):
     return client
 
 
-def add(app_db, organization_id, ai_decision, final_decision, reviewed_by='boss@example.com'):
-    created = datetime.utcnow() - timedelta(days=1)
+def add(app_db, organization_id, ai_decision, final_decision, reviewed_by='boss@example.com', days_ago=1):
+    created = datetime.utcnow() - timedelta(days=days_ago)
     rows = execute(
         app_db,
         'INSERT INTO Requests (role, department, request_type, destination, amount, currency, normalized_amount, '
@@ -122,6 +122,22 @@ def test_a_company_sees_the_same_checklist_as_neuzem(app_db, acme):
     readiness = session(app_db, 'boss@acme.test').get(QUALITY, query_string={'days': 90}).get_json()['readiness']
     assert readiness['ready'] is True
     assert [check['name'] for check in readiness['checks']] == ['decisions', 'agreement', 'missed_problems']
+
+
+@pytest.mark.parametrize('days', [30, 365])
+def test_the_company_checklist_uses_the_gate_window_whatever_period_is_shown(app_db, owner, acme, days):
+    create_user(app_db, 'boss@acme.test', role='SuperAdmin', organization_id=acme)
+    for _ in range(20):
+        add(app_db, acme, 'APPROVED', 'APPROVED', days_ago=45)  # Inside Neuzem's 90 days, outside the last 30.
+    for _ in range(5):
+        add(app_db, acme, 'APPROVED', 'REJECTED', days_ago=200)  # Outside 90 days, inside the last year.
+
+    report = session(app_db, 'boss@acme.test').get(QUALITY, query_string={'days': days}).get_json()
+    gate = owner.get(PLATFORM_QUALITY, query_string={'organization_id': acme}).get_json()['readiness']
+
+    assert report['days'] == days
+    assert report['readiness'] == gate
+    assert report['readiness']['days'] == 90 and report['readiness']['ready'] is True
 
 
 def test_the_numbers_belong_to_one_organization_only(app_db, owner, acme):

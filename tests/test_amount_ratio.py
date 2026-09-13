@@ -165,6 +165,30 @@ def test_a_retrained_model_that_scores_worse_never_goes_live(app_db, monkeypatch
     assert app_db.get_active_model(force=True)[1] is None
 
 
+@pytest.mark.parametrize('accepted, status, wording', [
+    (True, 'succeeded', 'is now scoring new requests.'),
+    (False, 'rejected', 'could not be scored'),
+])
+def test_a_retrain_without_a_quality_score_still_reports_what_happened(app_db, monkeypatch, accepted, status, wording):
+    # A holdout holding only one kind of answer gives no score, and the job must still say what really happened.
+    train = model_pipeline.train_ensemble
+
+    def unscored(base, feedback=None):
+        candidate, holdout = train(base, feedback)
+        candidate['metrics']['roc_auc'] = None
+        return candidate, holdout
+
+    monkeypatch.setattr(app_db.model_pipeline, 'train_ensemble', unscored)
+    monkeypatch.setattr(
+        app_db.model_pipeline, 'compare_with_current',
+        lambda candidate, holdout, current: {'accepted': accepted, 'current': None if accepted else {'roc_auc': 1.0}}
+    )
+    job = start_training(app_db, monkeypatch)
+
+    assert job['status'] == status, job['message']
+    assert wording in job['message']
+
+
 def test_a_freshly_trained_model_is_saved_loaded_and_scores_with_the_ratio(app_db, monkeypatch):
     """The whole way round: train, store, load again, and score a live request."""
     # Whether a candidate is good enough is decided by compare_with_current and checked in the test above.
