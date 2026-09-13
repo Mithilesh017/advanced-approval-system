@@ -6,7 +6,7 @@
   <title>HR Admin Portal - AI Approval</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400..700&family=JetBrains+Mono:wght@400..700&display=swap">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11.26.25"></script>
   
@@ -410,7 +410,7 @@
 
       useEffect(() => {
         Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
-        Chart.defaults.color = '#6e6e73';
+        Chart.defaults.color = '#949ba4';
         const legendStyle = { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle', boxWidth: 8, boxHeight: 8, padding: 16 } };
 
         const ctxPie = pieRef.current.getContext('2d');
@@ -418,7 +418,7 @@
           type: 'doughnut',
           data: {
             labels: ['Approved', 'Pending', 'Disapproved'],
-            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#34c759', '#ff9f0a', '#ff3b30'], borderWidth: 0, spacing: 2, borderRadius: 4 }]
+            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#30d158', '#ff9f0a', '#ff453a'], borderWidth: 0, spacing: 2, borderRadius: 4 }]
           },
           options: { responsive: true, maintainAspectRatio: false, cutout: '68%', plugins: { legend: legendStyle } }
         });
@@ -429,7 +429,7 @@
           data: {
             labels: barLabels.length > 0 ? barLabels : ['No Data'],
             datasets: [
-              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#34c759', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 },
+              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#30d158', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 },
               { label: 'Pending', data: barLabels.length > 0 ? barPending : [0], backgroundColor: '#ff9f0a', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 }
             ]
           },
@@ -438,7 +438,7 @@
             maintainAspectRatio: false,
             indexAxis: 'y',
             scales: {
-              x: { stacked: true, beginAtZero: true, grid: { color: 'rgba(60, 60, 67, 0.08)' }, border: { display: false }, ticks: { precision: 0 } },
+              x: { stacked: true, beginAtZero: true, grid: { color: 'rgba(232, 234, 237, 0.08)' }, border: { display: false }, ticks: { precision: 0 } },
               y: { stacked: true, grid: { display: false }, border: { display: false } }
             },
             plugins: { legend: legendStyle }
