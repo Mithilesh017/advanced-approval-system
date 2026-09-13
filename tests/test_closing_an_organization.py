@@ -8,6 +8,7 @@ from conftest import (
 )
 
 CLOSE = '/api/platform/close_organization'
+UPDATE = '/api/platform/update_organization'
 
 
 def session(app_db, email):
@@ -166,3 +167,27 @@ def test_the_old_join_link_stops_working(app_db, owner, acme):
 
     assert after['join_code'] != before['join_code']
     assert app_db.app.test_client().get(f"/api/auth/join_info?code={before['join_code']}").status_code == 404
+
+
+@pytest.mark.parametrize('change', [
+    {'status': 'Active'},
+    {'status': 'Paused'},
+    {'approval_mode': 'shadow'},
+    {'approval_mode': 'automatic', 'force': True},
+    {'allow_training_data': True},
+])
+def test_a_closed_organization_cannot_be_reopened_or_changed(app_db, owner, acme, change):
+    execute(app_db, 'UPDATE Organizations SET allow_training_data = 0 WHERE id = ?', (acme['id'],))
+    close(owner, acme)
+    settings = 'SELECT status, approval_mode, allow_training_data, join_code FROM Organizations WHERE id = ?'
+    before = query(app_db, settings, (acme['id'],))
+
+    assert owner.post(UPDATE, json={'id': acme['id'], **change}).status_code == 409
+    assert query(app_db, settings, (acme['id'],)) == before
+
+
+def test_a_closed_organization_can_still_stop_sharing_its_data(app_db, owner, acme):
+    close(owner, acme)
+
+    assert owner.post(UPDATE, json={'id': acme['id'], 'allow_training_data': False}).status_code == 200
+    assert query(app_db, 'SELECT allow_training_data FROM Organizations WHERE id = ?', (acme['id'],)) == [{'allow_training_data': 0}]

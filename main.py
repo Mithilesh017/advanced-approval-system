@@ -2263,9 +2263,13 @@ def platform_update_organization():
 
     conn = get_db_connection()
     try:
-        organization = conn.execute('SELECT is_default FROM Organizations WHERE id = ?', (organization_id,)).fetchone()
+        organization = conn.execute('SELECT is_default, status FROM Organizations WHERE id = ?', (organization_id,)).fetchone()
         if not organization:
             return jsonify({'error': 'Organization not found.'}), 404
+        # A company that has left cannot be reopened or agree to anything new; it can only stop sharing its data.
+        if organization['status'] == ORGANIZATION_CLOSED and any(
+                column != 'allow_training_data' or value for column, value in changes.items()):
+            return jsonify({'error': 'This organization is closed. Its data sharing can be turned off, but nothing else can change.'}), 409
         if organization['is_default'] and changes.get('status') == 'Paused':
             return jsonify({'error': 'The default organization holds the original accounts and cannot be paused.'}), 409
         # An organization only stops using shadow mode once its own decisions show the AI can be trusted.
