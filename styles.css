@@ -298,6 +298,29 @@ button { -webkit-tap-highlight-color: transparent; }
 .join-link-row { display: flex; gap: 8px; margin-top: 10px; }
 .join-link-row input { flex: 1; min-width: 0; height: 32px; font-size: var(--text-sm); }
 
+/* ---------- NeuZem credit ---------- */
+
+.brand-credit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--label-4);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color 160ms var(--ease-standard);
+}
+
+.brand-credit img { display: block; width: auto; height: 14px; opacity: 0.85; transition: opacity 160ms var(--ease-standard); }
+.brand-credit:hover { color: var(--label-3); }
+.brand-credit:hover img { opacity: 1; }
+
+.login-stack { width: 100%; max-width: 420px; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+.sidebar-credit { margin-top: auto; padding: 18px 10px 0; justify-content: flex-start; }
+.page-credit { display: flex; justify-content: center; padding-top: 8px; }
+
 /* ---------- Platform (Neuzem) ---------- */
 
 .platform-page { max-width: 1180px; margin: 0 auto; padding: 0 var(--content-padding) 56px; }
@@ -1617,6 +1640,8 @@ table.dataTable td.dataTables_empty { padding: 36px 14px !important; text-align:
   .sidebar-header { padding: 0; }
   .brand-name, .nav-label, .sidebar-user-meta { display: none; }
   .sidebar-user { padding: 0; margin: 0; background: transparent; box-shadow: none; }
+  .sidebar-credit { margin: 0 0 0 auto; padding: 0 6px; }
+  .sidebar-credit span { display: none; }
   .avatar-circle { width: 32px; height: 32px; font-size: 0.875rem; }
   .nav-menu { flex-direction: row; gap: 4px; }
   .nav-menu li button { min-height: 36px; white-space: nowrap; }
