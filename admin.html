@@ -333,7 +333,7 @@
                 </button>
               </li>
             </ul>
-            <a className="brand-credit sidebar-credit" href="https://www.neuzem.com" target="_blank" rel="noopener" aria-label="A product of NeuZem"><span>A product of</span><img src="brand/neuzem-wordmark-white.png" alt="NeuZem" /></a>
+            <a className="brand-credit sidebar-credit" href="https://www.neuzem.com" target="_blank" rel="noopener" aria-label="A product of NeuZem"><span>A product of</span><img src="brand/neuzem-wordmark-dark.png" alt="NeuZem" /></a>
           </div>
           
           <div className="main-content">
@@ -354,7 +354,9 @@
 
             {view === 'dashboard' && <DashboardView 
                 requests={allRequests} 
-                userEmail={user.email.split('@')[0]} 
+                userEmail={user.email.split('@')[0]}
+                currentEmail={user.email}
+                organizationName={organization && organization.name}
                 setView={setView} 
                 userRole={user.role}
             />}
@@ -376,10 +378,11 @@
       );
     }
 
-    function DashboardView({ requests, userEmail, setView, userRole }) {
+    function DashboardView({ requests, userEmail, currentEmail, organizationName, setView, userRole }) {
       const pieRef = useRef(null);
       const barRef = useRef(null);
       const [activeUsers, setActiveUsers] = useState(null);
+      const [displayName, setDisplayName] = useState('');
 
       useEffect(() => {
         fetch('/api/auth/users', { credentials: 'include' })
@@ -388,6 +391,8 @@
             if (Array.isArray(data)) {
               const visible = userRole === 'SuperAdmin' ? data : data.filter(u => u.role !== 'SuperAdmin');
               setActiveUsers(visible.filter(u => u.status === 'Active').length);
+              const me = data.find(u => u.email === currentEmail);
+              if (me && me.name) setDisplayName(me.name.trim().split(/\s+/)[0]);
             }
           })
           .catch(() => {});
@@ -418,7 +423,7 @@
 
       useEffect(() => {
         Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
-        Chart.defaults.color = '#949ba4';
+        Chart.defaults.color = '#62656d';
         const legendStyle = { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle', boxWidth: 8, boxHeight: 8, padding: 16 } };
 
         const ctxPie = pieRef.current.getContext('2d');
@@ -426,7 +431,7 @@
           type: 'doughnut',
           data: {
             labels: ['Approved', 'Pending', 'Disapproved'],
-            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#30d158', '#ff9f0a', '#ff453a'], borderWidth: 0, spacing: 2, borderRadius: 4 }]
+            datasets: [{ data: [approved, pending, rejected], backgroundColor: ['#1f9d55', '#e0a23a', '#d0534f'], borderWidth: 0, spacing: 2, borderRadius: 3 }]
           },
           options: { responsive: true, maintainAspectRatio: false, cutout: '68%', plugins: { legend: legendStyle } }
         });
@@ -437,8 +442,8 @@
           data: {
             labels: barLabels.length > 0 ? barLabels : ['No Data'],
             datasets: [
-              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#30d158', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 },
-              { label: 'Pending', data: barLabels.length > 0 ? barPending : [0], backgroundColor: '#ff9f0a', borderRadius: 6, borderSkipped: false, maxBarThickness: 26 }
+              { label: 'Approved', data: barLabels.length > 0 ? barApproved : [0], backgroundColor: '#1f9d55', borderRadius: 4, borderSkipped: false, maxBarThickness: 26 },
+              { label: 'Pending', data: barLabels.length > 0 ? barPending : [0], backgroundColor: '#e0a23a', borderRadius: 4, borderSkipped: false, maxBarThickness: 26 }
             ]
           },
           options: {
@@ -446,7 +451,7 @@
             maintainAspectRatio: false,
             indexAxis: 'y',
             scales: {
-              x: { stacked: true, beginAtZero: true, grid: { color: 'rgba(232, 234, 237, 0.08)' }, border: { display: false }, ticks: { precision: 0 } },
+              x: { stacked: true, beginAtZero: true, grid: { color: 'rgba(17, 17, 19, 0.06)' }, border: { display: false }, ticks: { precision: 0 } },
               y: { stacked: true, grid: { display: false }, border: { display: false } }
             },
             plugins: { legend: legendStyle }
@@ -462,11 +467,11 @@
             <div className="dash-banner-left">
               <div className="dash-banner-icon"><i className="fas fa-user-circle"></i></div>
               <div>
-                <h3>Welcome Admin!</h3>
-                <p>You have admin access. Managing {total} total requests across {departments} departments.</p>
+                <h3>Welcome back{displayName ? `, ${displayName}` : ''}</h3>
+                <p>{total} request{total === 1 ? '' : 's'} across {departments} department{departments === 1 ? '' : 's'}{pending ? `, ${pending} waiting for a decision.` : '. Nothing is waiting for a decision.'}</p>
                 <div className="dash-banner-tags">
-                  <span><i className="fas fa-user-shield"></i> Administrator</span>
-                  <span><i className="fas fa-clock"></i> Session: Active</span>
+                  {organizationName && <span><i className="fas fa-building"></i> {organizationName}</span>}
+                  <span><i className="fas fa-user-shield"></i> {userRole === 'SuperAdmin' ? 'Super Admin' : 'Administrator'}</span>
                 </div>
               </div>
             </div>
@@ -1869,7 +1874,7 @@
                 {shadow ? ' It takes effect once your organization uses automatic approval.' : ''}
               </small>
             </div>
-            <button type="submit" className="btn btn-primary" disabled={saving}>
+            <button type="submit" className="btn btn-secondary" disabled={saving}>
               {saving ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Settings</span>}
             </button>
           </form>
@@ -1890,7 +1895,7 @@
                 Amounts are compared in rupees, after other currencies are converted. Leave the box empty to turn this off.
               </small>
             </div>
-            <button type="submit" className="btn btn-primary" disabled={savingSecond}>
+            <button type="submit" className="btn btn-secondary" disabled={savingSecond}>
               {savingSecond ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Amount</span>}
             </button>
           </form>
@@ -1911,7 +1916,7 @@
                 You can raise this up to {settings.maximum_spot_check_percent}%. It cannot go below {settings.minimum_spot_check_percent}%.
               </small>
             </div>
-            <button type="submit" className="btn btn-primary" disabled={savingSpotCheck}>
+            <button type="submit" className="btn btn-secondary" disabled={savingSpotCheck}>
               {savingSpotCheck ? <span><i className="fas fa-spinner fa-spin"></i> Saving...</span> : <span><i className="fas fa-save"></i> Save Share</span>}
             </button>
           </form>
